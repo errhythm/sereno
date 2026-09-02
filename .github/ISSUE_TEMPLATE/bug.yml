@@ -1,0 +1,89 @@
+name: Bug report
+description: Something in Sereno does not work as described.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you paste anything:** Sereno reads your Slack messages, so a careless
+        report can leak a colleague's message or your access token into a public issue.
+
+        The log command below redacts message text, names and permalinks by design, and
+        never prints the token. Read what you paste anyway, and replace anything private
+        with `[redacted]`.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, and what Sereno did instead of what you expected.
+      placeholder: |
+        A colleague asked me something directly in a channel and it never appeared as a
+        task. Refreshing did not bring it in.
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      description: Apple menu, About This Mac.
+      placeholder: "26.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: slack-connected
+    attributes:
+      label: Is Slack connected?
+      description: >
+        Sereno Settings shows this. With Slack disconnected the app deliberately shows
+        sample messages rather than an empty list, so "these are not my messages" usually
+        means it is not connected.
+      options:
+        - Connected, and the list shows my real Slack messages
+        - Not connected, so I am seeing the built-in sample messages
+        - Connected, but the list still shows sample messages
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: apple-intelligence
+    attributes:
+      label: What does Sereno say about Apple Intelligence?
+      description: If a banner appears at the top of the list, pick the sentence it shows.
+      options:
+        - No banner, ranking works
+        - This Mac cannot run Apple Intelligence.
+        - Turn on Apple Intelligence in System Settings, Apple Intelligence and Siri.
+        - Apple Intelligence is still downloading. Try again when it finishes.
+        - Apple Intelligence is unavailable on this Mac.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: |
+        Reproduce the problem, then run this in Terminal and paste the result.
+        `log` is a zsh builtin, so the full path matters.
+
+        ```
+        /usr/bin/log show --last 10m --predicate 'subsystem == "com.rhystart.sereno"' --style compact
+        ```
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before submitting
+      options:
+        - label: I read the log output above and it contains no message text, names or tokens.
+          required: true
+        - label: I searched existing issues for this.
+          required: false
