@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Sereno</title>
+  <!-- The S is a falling star's trail: bright head, tail fading into the night.
+       Sereno was the night watchman who called "y sereno" when the sky was clear,
+       so the mark is that clear sky, and the trail matches the app's header animation.
+       Drawn with ~64pt of margin because macOS expects app icons to sit inside their
+       canvas rather than bleed to the edge. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#1C0720"/>
+      <stop offset="1" stop-color="#4A154B"/>
+    </linearGradient>
+
+    <!-- Only the last stretch of tail fades. The rest stays bright so the S reads
+         confidently at 16pt, where a soft gradient turns to grey mush. -->
+    <linearGradient id="trail" x1="0.20" y1="0.88" x2="0.78" y2="0.18">
+      <stop offset="0.00" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="0.22" stop-color="#FFEFD6" stop-opacity="0.72"/>
+      <stop offset="0.55" stop-color="#FFF8EC" stop-opacity="0.97"/>
+      <stop offset="1.00" stop-color="#FFFFFF" stop-opacity="1"/>
+    </linearGradient>
+
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#FFF3DC" stop-opacity="0.55"/>
+      <stop offset="0.45" stop-color="#FFE9C7" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFE9C7" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- A real squircle. A plain circle read as a bubble, and a small-radius rect
+         reads as Windows, so the corner radius is ~24% of the body. -->
+    <clipPath id="squircle">
+      <rect x="64" y="64" width="896" height="896" rx="216" ry="216"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <rect x="64" y="64" width="896" height="896" fill="url(#sky)"/>
+
+    <!-- Field stars, kept clear of the trail so nothing muddies the letter. -->
+    <g fill="#FFFFFF">
+      <circle cx="196" cy="212" r="4.5" opacity="0.50"/>
+      <circle cx="292" cy="150" r="3" opacity="0.30"/>
+      <circle cx="146" cy="368" r="3.5" opacity="0.36"/>
+      <circle cx="242" cy="462" r="2.5" opacity="0.24"/>
+      <circle cx="864" cy="256" r="4" opacity="0.40"/>
+      <circle cx="892" cy="436" r="3" opacity="0.28"/>
+      <circle cx="800" cy="158" r="2.5" opacity="0.22"/>
+      <circle cx="168" cy="662" r="3.5" opacity="0.32"/>
+      <circle cx="872" cy="690" r="4.5" opacity="0.38"/>
+      <circle cx="796" cy="852" r="3" opacity="0.26"/>
+      <circle cx="336" cy="866" r="3.5" opacity="0.32"/>
+      <circle cx="524" cy="898" r="2.5" opacity="0.22"/>
+      <circle cx="656" cy="928" r="3" opacity="0.26"/>
+      <circle cx="132" cy="820" r="2.5" opacity="0.20"/>
+    </g>
+
+    <!-- Soft halo behind the head, small enough not to wash out the corner. -->
+    <circle cx="672" cy="336" r="118" fill="url(#glow)"/>
+
+    <!-- The S. Stroked, so the gradient does the tapering for us. -->
+    <path d="M 672 336
+             C 672 244 460 226 406 326
+             C 356 420 462 480 520 514
+             C 598 558 644 610 620 690
+             C 594 778 420 792 348 718"
+          fill="none"
+          stroke="url(#trail)"
+          stroke-width="78"
+          stroke-linecap="round"/>
+
+    <!-- Star sits exactly on the stroke's start point, so it leads the trail
+         instead of looking stuck onto the letter. -->
+    <circle cx="672" cy="336" r="34" fill="#FFFFFF"/>
+    <path d="M672 268 L681 327 L740 336 L681 345 L672 404 L663 345 L604 336 L663 327 Z"
+          fill="#FFFFFF"/>
+  </g>
+</svg>

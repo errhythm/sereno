@@ -1,0 +1,25 @@
+import Foundation
+import FoundationModels
+
+let model = SystemLanguageModel.default
+print("availability:", model.availability)
+guard case .available = model.availability else { exit(1) }
+
+let item = DynamicGenerationSchema(name: "Item", properties: [
+    .init(name: "action", description: "What I must do, imperative, under 12 words", schema: .init(type: String.self)),
+    .init(name: "priority", description: "1 is most urgent, 5 least", schema: .init(name: "priority", anyOf: ["1", "2", "3", "4", "5"])),
+])
+let root = DynamicGenerationSchema(name: "Triage", properties: [
+    .init(name: "items", schema: .init(arrayOf: DynamicGenerationSchema(referenceTo: "Item"))),
+])
+let schema = try GenerationSchema(root: root, dependencies: [item])
+
+let session = LanguageModelSession(instructions: "Turn unanswered Slack messages into a prioritised action list.")
+let resp = try await session.respond(
+    to: "1. Ayesha: 'can you approve the PR before standup?'\n2. Tanvir: 'lunch?'",
+    schema: schema)
+let items = try resp.content.value([GeneratedContent].self, forProperty: "items")
+for i in items {
+    print("-", try i.value(String.self, forProperty: "action"),
+          "| p", try i.value(String.self, forProperty: "priority"))
+}

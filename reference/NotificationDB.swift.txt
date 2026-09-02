@@ -1,0 +1,186 @@
+import Foundation
+import SQLite3
+import Darwin
+
+private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+enum NotificationDB {
+    private static let slackIdentifier = "com.tinyspeck.slackmacgap"
+
+    static func slackNotices(since: Date) throws -> [SlackNotice] {
+        let source = try notificationDatabaseURL()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Sereno-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // ponytail: SQLite needs its WAL sidecars copied with the database snapshot.
+        let copiedDatabase = try copyDatabase(at: source, to: directory)
+        return try readSlackNotices(from: copiedDatabase, since: since)
+    }
+
+    static func demo() throws {
+        let date = Date(timeIntervalSinceReferenceDate: 42)
+        let source: [String: Any] = [
+            "req": [
+                "titl": "Ada",
+                "subt": "#builds",
+                "body": "Ship it",
+                "usda": ["team_id": "T1", "channel_id": "C1", "message_ts": "123.45"]
+            ]
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: source, format: .binary, options: 0)
+        let decoded = decodePayload(data)
+        assert(decoded?.sender == "Ada")
+        assert(decoded?.channel == "#builds")
+        assert(decoded?.body == "Ship it")
+        assert(decoded?.deepLink?.absoluteString == "slack://channel?team=T1&id=C1&message=123.45")
+        assert(date == Date(timeIntervalSince1970: 978_307_242))
+    }
+
+    private static func notificationDatabaseURL() throws -> URL {
+        let fileManager = FileManager.default
+        let primary = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Group Containers/group.com.apple.usernoted/db2/db")
+        if fileManager.fileExists(atPath: primary.path) { return primary }
+
+        if let userDirectory = darwinUserDirectory() {
+            let fallback = URL(fileURLWithPath: userDirectory, isDirectory: true)
+                .appendingPathComponent("com.apple.notificationcenter/db2/db")
+            if fileManager.fileExists(atPath: fallback.path) { return fallback }
+        }
+
+        throw accessError("Notification Center database was not found. Grant Sereno Full Disk Access, then try again.")
+    }
+
+    private static func darwinUserDirectory() -> String? {
+        let count = confstr(_CS_DARWIN_USER_DIR, nil, 0)
+        guard count > 1 else { return nil }
+        var buffer = [CChar](repeating: 0, count: Int(count))
+        guard confstr(_CS_DARWIN_USER_DIR, &buffer, count) == count else { return nil }
+        return String(cString: buffer)
+    }
+
+    private static func copyDatabase(at source: URL, to directory: URL) throws -> URL {
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            let destination = directory.appendingPathComponent("db")
+            try fileManager.copyItem(at: source, to: destination)
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = URL(fileURLWithPath: source.path + suffix)
+                if fileManager.fileExists(atPath: sidecar.path) {
+                    try fileManager.copyItem(at: sidecar, to: URL(fileURLWithPath: destination.path + suffix))
+                }
+            }
+            return destination
+        } catch {
+            throw accessError("Unable to copy the Notification Center database. Grant Sereno Full Disk Access and try again. (\(error.localizedDescription))")
+        }
+    }
+
+    private static func readSlackNotices(from url: URL, since: Date) throws -> [SlackNotice] {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let database else {
+            defer { sqlite3_close(database) }
+            throw accessError("Unable to read the Notification Center database. Grant Sereno Full Disk Access and try again.")
+        }
+        defer { sqlite3_close(database) }
+
+        let columns = try recordColumns(in: database)
+        let required = ["delivered_date", "data"]
+        guard required.allSatisfy(columns.contains) else { return [] }
+
+        let identifierColumn = columns.contains("identifier") ? "record.\"identifier\"" : "record.rowid"
+        let sql: String
+        if columns.contains("app_identifier") {
+            sql = "SELECT \(identifierColumn), record.data, record.delivered_date FROM record WHERE record.app_identifier = ? AND record.delivered_date > ? ORDER BY record.delivered_date DESC"
+        } else {
+            let appColumns = try tableColumns(in: database, table: "app")
+            guard columns.contains("app_id"),
+                  appColumns.contains("app_id"),
+                  appColumns.contains("identifier") else { return [] }
+            sql = "SELECT \(identifierColumn), record.data, record.delivered_date FROM record JOIN app ON app.app_id = record.app_id WHERE app.identifier = ? AND record.delivered_date > ? ORDER BY record.delivered_date DESC"
+        }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw sqliteError(database)
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, slackIdentifier, -1, sqliteTransient)
+        sqlite3_bind_double(statement, 2, since.timeIntervalSinceReferenceDate)
+
+        var notices: [SlackNotice] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { break }
+            guard result == SQLITE_ROW else { throw sqliteError(database) }
+            guard let bytes = sqlite3_column_blob(statement, 1), sqlite3_column_bytes(statement, 1) > 0 else { continue }
+            let payload = Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 1)))
+            guard let decoded = decodePayload(payload) else { continue }
+            let identifier = sqlite3_column_text(statement, 0).map { String(cString: $0) }
+                ?? String(sqlite3_column_int64(statement, 0))
+            let delivered = Date(timeIntervalSinceReferenceDate: sqlite3_column_double(statement, 2))
+            notices.append(SlackNotice(id: identifier, sender: decoded.sender, channel: decoded.channel,
+                                       body: decoded.body, date: delivered, deepLink: decoded.deepLink))
+        }
+        return notices
+    }
+
+    private static func recordColumns(in database: OpaquePointer) throws -> Set<String> {
+        try tableColumns(in: database, table: "record")
+    }
+
+    private static func tableColumns(in database: OpaquePointer, table: String) throws -> Set<String> {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA table_info(\(table))", -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw sqliteError(database)
+        }
+        defer { sqlite3_finalize(statement) }
+        var columns = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(statement, 1) { columns.insert(String(cString: name)) }
+        }
+        return columns
+    }
+
+    private static func decodePayload(_ data: Data) -> (sender: String, channel: String?, body: String, deepLink: URL?)? {
+        guard let root = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else { return nil }
+        // UNVERIFIED KEYS: corrected by lead after live probe
+        let request = root["req"] as? [String: Any] ?? root
+        guard let sender = request["titl"] as? String,
+              let body = request["body"] as? String else { return nil }
+        let channel = request["subt"] as? String
+        let rawUserInfo = request["usda"] ?? root["usda"] ?? request["userInfo"] ?? root["userInfo"]
+        let userInfo: [String: Any]?
+        if let dictionary = rawUserInfo as? [String: Any] {
+            userInfo = dictionary
+        } else if let nestedData = rawUserInfo as? Data {
+            userInfo = (try? PropertyListSerialization.propertyList(from: nestedData, options: [], format: nil)) as? [String: Any]
+        } else {
+            userInfo = nil
+        }
+        let team = userInfo?["team_id"] as? String ?? userInfo?["team"] as? String ?? userInfo?["teamID"] as? String
+        let channelID = userInfo?["channel_id"] as? String ?? userInfo?["channel"] as? String ?? userInfo?["channelID"] as? String
+        let timestamp = userInfo?["message_ts"] as? String ?? userInfo?["timestamp"] as? String ?? userInfo?["ts"] as? String
+        let deepLink: URL?
+        if let team, let channelID, let timestamp {
+            var components = URLComponents(string: "slack://channel")
+            components?.queryItems = [URLQueryItem(name: "team", value: team),
+                                      URLQueryItem(name: "id", value: channelID),
+                                      URLQueryItem(name: "message", value: timestamp)]
+            deepLink = components?.url
+        } else {
+            deepLink = nil
+        }
+        return (sender, channel, body, deepLink)
+    }
+
+    private static func sqliteError(_ database: OpaquePointer?) -> Error {
+        let detail = database.flatMap { sqlite3_errmsg($0).map { String(cString: $0) } } ?? "unknown SQLite error"
+        return NSError(domain: "Sereno", code: 3, userInfo: [NSLocalizedDescriptionKey: detail])
+    }
+
+    private static func accessError(_ message: String) -> Error {
+        NSError(domain: "Sereno", code: 4, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
