@@ -73,3 +73,6 @@ code {
 .scopes span { display: block; color: var(--muted); }
 
 .note { color: var(--muted); font-size: 12px; line-height: 1.7; }
+
+/* The hand-off URL on /callback. Long, and must not blow out the measure. */
+.handoff { word-break: break-all; }

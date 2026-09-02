@@ -33,7 +33,21 @@ enum SlackOAuth {
     static let clientID = "11965903665317.11964850390275"
 
     /// Registered on the Slack app. Must match byte for byte, so it is written once.
-    static let redirectURI = "http://localhost:47823/callback"
+    ///
+    /// HTTPS, not loopback, and not by preference: Slack refuses to distribute an app whose
+    /// redirect URI is not HTTPS, measured against this exact app ("We require apps that are
+    /// distributed to use HTTPS"). A loopback redirect works fine for a dev-only app and is
+    /// rejected the moment you try to let other workspaces install it.
+    ///
+    /// So Slack sends the browser to the Worker in `worker/index.js`, which 302s it to
+    /// `http://127.0.0.1:47823/callback` with `code` and `state` intact. The listener below
+    /// is unchanged: the browser still lands on loopback, just one hop later. Under PKCE the
+    /// code that passes through Cloudflare is useless without the verifier, which is
+    /// generated here and never leaves this machine.
+    static let redirectURI = "https://sereno.errhythm.me/callback"
+
+    /// The port the relay lands on. Below the macOS ephemeral floor (49152) so the OS cannot
+    /// hand it to something else, and bound to IPv4 loopback only.
     static let callbackPort: UInt16 = 47823
 
     /// Read-only, and `user_scope`, never `scope`: a desktop redirect may not request bot
@@ -637,8 +651,11 @@ func demoSlackAuth() {
     // substring, so the check has to be anchored to a parameter boundary.
     assert(!query.contains("&scope=") && !query.hasPrefix("scope="), "sends bot scope, not user_scope")
     assert(query.contains("code_challenge_method=S256"), "missing code_challenge_method=S256")
-    assert(query.contains("redirect_uri=http%3A%2F%2Flocalhost%3A47823%2Fcallback"),
+    assert(query.contains("redirect_uri=https%3A%2F%2Fsereno.errhythm.me%2Fcallback"),
            "redirect_uri not percent-encoded exactly")
+    // Slack rejects a non-HTTPS redirect for a distributed app, so a regression to loopback
+    // here would pass every other check and only fail at the authorize screen.
+    assert(SlackOAuth.redirectURI.hasPrefix("https://"), "redirect_uri must be HTTPS to distribute")
     assert(!query.contains("client_secret"), "client_secret in an authorize URL")
 
     // Callback: state is the gate.
