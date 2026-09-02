@@ -1,6 +1,9 @@
 {
   "name": "sereno",
-  "compatibility_date": "2026-09-02",
+  "compatibility_date": "2026-06-10",
+  "routes": [
+    { "pattern": "sereno.errhythm.me", "custom_domain": true }
+  ],
   "assets": {
     "directory": "./docs",
     "html_handling": "auto-trailing-slash",
