@@ -22,7 +22,9 @@ struct SerenoApp: App {
 
     init() {
         GlobalHotkey.install()
-        let store = Store()
+        // LiveMessageSource asks the Keychain on every call, so connecting or
+        // disconnecting Slack takes effect on the next refresh instead of the next launch.
+        let store = Store(source: LiveMessageSource())
         _store = State(initialValue: store)
         Notify.start(store)
     }

@@ -2,3 +2,5 @@
 .build/
 .swiftpm/
 *.app/
+.wrangler/
+node_modules/

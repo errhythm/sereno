@@ -47,7 +47,7 @@ bash build.sh        # produces Sereno.app, ad-hoc signed, LSUIElement
 
 Demos are plain `assert` functions, no test framework: `demo`, `demoMockSource`,
 `demoAutoComplete`, `demoAddressing`, `demoStoreMerge`, `demoPreferences`, `demoRefreshTimer`,
-`demoSky`, `demoWeather`, `demoNotifyBatch`, `demoAddressingFilter`. The repo has exactly one
+`demoSky`, `demoWeather`, `demoNotifyBatch`, `demoAddressingFilter`, `demoSlackSource`. The repo has exactly one
 `@main` (App.swift), so run them from a throwaway SwiftPM package under `/private/tmp` that
 copies the sources and supplies its own entry point, then delete it.
 
@@ -163,4 +163,7 @@ first:
   the model, not the code.
 - Whether the window physically drags, and whether its resize edges are grabbable, both need a
   human. A borderless window has no frame border and the outer 12pt is transparent content.
-- `SlackMessageSource` does not exist. The app runs on `MockMessageSource` until it does.
+- `SlackMessageSource` is wired in. `App.swift` hands `Store` a `LiveMessageSource`, which
+  picks Slack or the mock **per call** by asking the Keychain, so connecting or
+  disconnecting takes effect on the next refresh rather than the next launch. Fixtures are
+  now the not-connected path, not the only path.

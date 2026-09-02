@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy | Sereno</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <nav><a href="/">sereno</a> / privacy</nav>
+
+  <h1>Privacy</h1>
+  <p class="dateline">Effective 3 September 2026</p>
+
+  <p>Sereno runs entirely on your own Mac. There is no Sereno server. No backend
+  exists for your messages to pass through, so none of this is a promise about how
+  carefully someone stores your data. There is nowhere for it to be stored.</p>
+
+  <h2>What Sereno keeps, and where</h2>
+
+  <p>All of it is on your Mac:</p>
+
+  <ul>
+    <li>Your Slack access token, in the macOS Keychain, service
+    <code>com.rhystart.sereno</code>.</li>
+    <li>Your to-do list, and the message text it was derived from, in
+    <code>~/Library/Application Support/Sereno/state.json</code>.</li>
+    <li>Your settings, including the role description you write and the city you pick,
+    in macOS UserDefaults.</li>
+  </ul>
+
+  <p>To remove it: disconnect Slack in Settings, which deletes the token, then delete
+  that <code>state.json</code> file.</p>
+
+  <h2>What Slack permissions Sereno asks for</h2>
+
+  <p>Read-only, and only these:</p>
+
+  <ul class="scopes">
+    <li><code>channels:history</code> <code>groups:history</code>
+      <code>im:history</code> <code>mpim:history</code>
+      <span>Message text, in conversations you are already in.</span></li>
+    <li><code>channels:read</code> <code>groups:read</code>
+      <code>im:read</code> <code>mpim:read</code>
+      <span>Conversation names and membership.</span></li>
+    <li><code>users:read</code> <code>usergroups:read</code>
+      <span>Display names, so Sereno can tell whether a message is aimed at you.</span></li>
+  </ul>
+
+  <p>Sereno cannot post, edit, delete, or schedule anything in Slack. It holds no
+  permission that would allow it. It signs in with PKCE, so the app contains no client
+  secret and the token is issued to you rather than to a shared server.</p>
+
+  <h2>What leaves your Mac</h2>
+
+  <p>Two destinations, and nothing else.</p>
+
+  <p><strong>Slack.</strong> Sereno reads your conversations through Slack's API, as
+  you, using the token you granted.</p>
+
+  <p><strong>Open-Meteo,</strong> only if you switch the weather display on. The city
+  name you type goes to <code>geocoding-api.open-meteo.com</code> once, to turn it into
+  coordinates. Those coordinates then go to <code>api.open-meteo.com</code> when the
+  forecast refreshes. Sereno does not use Core Location and never asks your Mac where
+  it is, so the only location involved is the city you chose. With the weather toggle
+  off, nothing is sent. Open-Meteo needs no account and no API key, so these requests
+  carry nothing that identifies you.</p>
+
+  <p><strong>Apple Reminders</strong> is not a network destination, but worth naming:
+  exporting an item writes to your local Reminders database. If your Reminders account
+  syncs through iCloud, that reminder syncs with it, under Apple's privacy policy
+  rather than this one.</p>
+
+  <h2>What does not leave your Mac</h2>
+
+  <p>The ranking runs on Apple's on-device foundation model, through the
+  FoundationModels framework. Your message text is processed locally. It is not sent to
+  Anthropic, OpenAI, Apple, or anyone else for that purpose.</p>
+
+  <p>Sereno contains no analytics, no telemetry, no crash reporting, and no third-party
+  SDKs. It does not phone home, and it has no update checker.</p>
+
+  <h2>Logging</h2>
+
+  <p>Sereno writes diagnostic logs to the macOS unified log, under the subsystem
+  <code>com.rhystart.sereno</code>. Message text, sender and channel names, permalinks,
+  and your city are either marked private or never logged at all. The token is never
+  logged. These logs stay on your Mac.</p>
+
+  <h2>Your workspace administrator</h2>
+
+  <p>If your workspace requires approval for app installations, your administrator sees
+  Sereno's requested permissions before you can connect. They can revoke its access at
+  any time from Slack's own settings, which immediately stops it reading anything.</p>
+
+  <h2>Children</h2>
+
+  <p>Sereno is a workplace tool and is not directed at children under 13.</p>
+
+  <h2>Changes</h2>
+
+  <p>Material changes appear on this page with a new date at the top.</p>
+
+  <h2>Contact</h2>
+
+  <!-- TODO: replace CONTACT_EMAIL_HERE with the address you want publicly scraped, or delete the clause -->
+  <p>Open an issue on <a href="https://github.com/errhythm/sereno/issues">GitHub</a>,
+  or email CONTACT_EMAIL_HERE.</p>
+</main>
+
+<footer>
+  <a href="/privacy">privacy</a> / <a href="/terms">terms</a>
+</footer>
+</body>
+</html>
