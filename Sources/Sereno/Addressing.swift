@@ -56,20 +56,11 @@ func addressing(_ facts: MessageFacts, identity: Identity) -> Set<Addressing> {
 }
 
 extension Set<Addressing> {
-    /// Highest weight among the signals, 0 when empty. For the priority rubric.
-    var strength: Int { map(\.weight).max() ?? 0 }
-
     /// True when the user personally owes something, as opposed to a room-wide notice.
     /// A set containing only .broadcast is NOT personal: @channel in a busy room is an
     /// announcement, not a to-do. The signal is kept in the set either way, so a
     /// "treat @channel as mine" preference can flip this without re-detection.
     var isPersonal: Bool { contains { $0 != .broadcast } }
-
-    /// The single best phrase for the UI, e.g. "mentioned you". nil when empty.
-    /// rawValue breaks weight ties so the phrase is stable across runs.
-    var primaryLabel: String? {
-        self.max { ($0.weight, $0.rawValue) < ($1.weight, $1.rawValue) }?.label
-    }
 }
 
 // MARK: - Slack markup
@@ -98,6 +89,82 @@ private func markupTokens(in text: String) -> [MarkupToken] {
         i = text.index(after: close)
     }
     return tokens
+}
+
+/// User ids that appear in Slack's explicit `<@…>` markup. This deliberately shares the
+/// detector used by addressing(), so a name lookup cannot disagree with a mention signal.
+func mentionedUserIDs(in text: String) -> Set<String> {
+    Set(markupTokens(in: text).compactMap {
+        if case .user(let id) = $0 { return id }
+        return nil
+    })
+}
+
+/// Slack stores its rich-text syntax in `text`. Triage and the UI need readable prose, but
+/// MessageFacts must keep the raw form because addressing() relies on its exact markup.
+func slackPlainText(_ text: String, names: [String: String]) -> String {
+    var out = ""
+    var i = text.startIndex
+
+    while i < text.endIndex {
+        guard text[i] == "<" else {
+            out.append(text[i])
+            i = text.index(after: i)
+            continue
+        }
+        guard let close = text[text.index(after: i)...].firstIndex(of: ">") else {
+            out.append(contentsOf: text[i...])
+            break
+        }
+
+        let inner = text[text.index(after: i)..<close]
+        let parts = inner.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        let token = String(parts[0])
+        let label = parts.count == 2 ? String(parts[1]) : nil
+
+        if token.hasPrefix("@") {
+            let id = String(token.dropFirst())
+            let display = label ?? names[id] ?? id
+            out.append("@")
+            out.append(contentsOf: display.drop(while: { $0 == "@" }))
+        } else if token.hasPrefix("!") {
+            let keyword = String(token.dropFirst())
+            if broadcastKeywords.contains(keyword) {
+                out.append("@")
+                out.append(contentsOf: keyword)
+            } else if keyword.hasPrefix(subteamPrefix) {
+                if let label {
+                    out.append("@")
+                    out.append(contentsOf: label.drop(while: { $0 == "@" }))
+                } else {
+                    out.append("@team")
+                }
+            } else if let label {
+                out.append(contentsOf: label)
+            }
+        } else if token.hasPrefix("#") {
+            let channel = label ?? String(token.dropFirst())
+            out.append("#")
+            out.append(contentsOf: channel.drop(while: { $0 == "#" }))
+        } else if token.contains("://") || token.hasPrefix("mailto:") || token.hasPrefix("tel:") {
+            if let label {
+                out.append(contentsOf: label)
+                out.append(" (")
+                out.append(contentsOf: token)
+                out.append(")")
+            } else {
+                out.append(contentsOf: token)
+            }
+        } else {
+            out.append(contentsOf: text[i...close])
+        }
+        i = text.index(after: close)
+    }
+
+    return out
+        .replacingOccurrences(of: "&lt;", with: "<")
+        .replacingOccurrences(of: "&gt;", with: ">")
+        .replacingOccurrences(of: "&amp;", with: "&")
 }
 
 // MARK: - Plain-text name matching
@@ -130,7 +197,7 @@ private func mentionsNamePlainly(_ text: String, identity: Identity) -> Bool {
 /// the removed span becomes whitespace rather than vanishing.
 /// ponytail: an unmatched backtick swallows the rest of the message. That errs toward
 /// no match, which is the safe direction here. Pair the runs properly if it ever bites.
-private func strippingMarkupAndCode(_ text: String) -> String {
+func strippingMarkupAndCode(_ text: String) -> String {
     var out = ""
     var inCode = false
     var i = text.startIndex
@@ -164,7 +231,7 @@ private func strippingMarkupAndCode(_ text: String) -> String {
 }
 
 /// Whole-word substring search. Both arguments must already be lowercased.
-private func containsWord(_ needle: String, in haystack: String) -> Bool {
+func containsWord(_ needle: String, in haystack: String) -> Bool {
     var from = haystack.startIndex
     while let found = haystack.range(of: needle, range: from..<haystack.endIndex) {
         let leftClear = found.lowerBound == haystack.startIndex
@@ -231,7 +298,6 @@ func demoAddressing() {
     assert(addressing(facts("<!channel> all hands"), identity: me) == [.broadcast])
     assert(addressing(facts("<!everyone> all hands"), identity: me) == [.broadcast])
     assert(addressing(facts("<!here> deploy in 5"), identity: me).isPersonal == false)
-    assert(addressing(facts("<!here> deploy in 5"), identity: me).strength == 0)
 
     // Rule 5: user groups, only the ones the user is in.
     assert(addressing(facts("<!subteam^S1> review please"), identity: me) == [.userGroup])
@@ -281,17 +347,27 @@ func demoAddressing() {
            == addressing(facts("<@U_ME> <!here>"), identity: me))
 
     // The Set helpers.
-    assert(Set<Addressing>().strength == 0)
     assert(Set<Addressing>().isPersonal == false)
-    assert(Set<Addressing>().primaryLabel == nil)
-    assert(Set<Addressing>([.nameMentioned]).strength == 1)
     assert(Set<Addressing>([.nameMentioned, .broadcast]).isPersonal)
-    assert(Set<Addressing>([.broadcast, .mention]).strength == 3)
-    assert(Set<Addressing>([.broadcast, .mention]).primaryLabel == "mentioned you")
-    assert(Set<Addressing>([.broadcast]).primaryLabel == "channel-wide")
-    assert(Set<Addressing>([.threadParticipant, .nameMentioned]).primaryLabel == "your thread")
-    // Weight ties resolve the same way every run: directMessage < mention < replyToMe by rawValue.
-    assert(Set<Addressing>([.directMessage, .mention, .replyToMe]).primaryLabel == "replied to you")
+
+    // Slack markup becomes readable prose for triage and the UI, while raw markup above
+    // remains the source of truth for the addressing assertions.
+    assert(slackPlainText("<@U1>", names: ["U1": "rhythm"]) == "@rhythm")
+    assert(slackPlainText("<@U1|label>", names: [:]) == "@label")
+    assert(slackPlainText("<@U1>", names: [:]) == "@U1")
+    assert(slackPlainText("<@U1>", names: ["U1": "@rhythm"]) == "@rhythm")
+    assert(slackPlainText("<!here> <!channel|ignored> <!everyone>", names: [:]) == "@here @channel @everyone")
+    assert(slackPlainText("<!subteam^S1|@team> <!subteam^S1>", names: [:]) == "@team @team")
+    assert(slackPlainText("<!date^123|Thursday>", names: [:]) == "Thursday")
+    assert(slackPlainText("<!date^123>", names: [:]).isEmpty)
+    assert(slackPlainText("<#C1|general> <#C2>", names: [:]) == "#general #C2")
+    assert(slackPlainText("<https://x/y|label> <https://x/y>", names: [:]) == "label (https://x/y) https://x/y")
+    assert(slackPlainText("<http://x/y|label> <http://x/y>", names: [:]) == "label (http://x/y) http://x/y")
+    assert(slackPlainText("<mailto:a@b.com|email> <mailto:a@b.com>", names: [:]) == "email (mailto:a@b.com) mailto:a@b.com")
+    assert(slackPlainText("<tel:+15551234|call>", names: [:]) == "call (tel:+15551234)")
+    assert(slackPlainText("&amp;lt; &lt; &gt; &amp;", names: [:]) == "&lt; < > &")
+    assert(slackPlainText("before <unfinished", names: [:]) == "before <unfinished")
+    assert(mentionedUserIDs(in: "<@U1> <@U2|two> <!here>") == ["U1", "U2"])
 
     print("demoAddressing: PASS")
 }

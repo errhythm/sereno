@@ -36,6 +36,14 @@ final class Store {
     /// Durable Slack call-reduction state. It is optional so state.json files written by
     /// older Sereno versions decode without migration work.
     private var slackScanState: SlackScanState?
+    /// Conversation keys the user explicitly removed, with the moment they did it. Search
+    /// discovery's candidate cutoff is now a bounded lookback (see
+    /// SlackMessageSource.searchLookback) rather than a sliding watermark, so without this a
+    /// wider re-scan could resurrect exactly what Remove was supposed to bury. "Not this, not
+    /// again": a conversation stays out until it has a genuinely newer message than its
+    /// dismissal. Lives in Store rather than SlackScanState because it is a user decision, not
+    /// Slack-scan mechanics, and Store is the only thing that ever needs to read or write it.
+    private var dismissed: [String: Date] = [:]
     private var restoredSlackScanState = false
     private var resetGeneration = 0
     /// Earliest time refreshIfStale() may try again after a failure. Deliberately NOT
@@ -80,16 +88,19 @@ final class Store {
         var todos: [TodoItem]
         var lastScan: Date
         var slackScanState: SlackScanState?
+        var dismissed: [String: Date]
 
         private enum CodingKeys: String, CodingKey {
-            case schemaVersion, todos, lastScan, slackScanState
+            case schemaVersion, todos, lastScan, slackScanState, dismissed
         }
 
-        init(todos: [TodoItem], lastScan: Date, slackScanState: SlackScanState?, schemaVersion: Int = Store.currentSchemaVersion) {
+        init(todos: [TodoItem], lastScan: Date, slackScanState: SlackScanState?,
+             dismissed: [String: Date] = [:], schemaVersion: Int = Store.currentSchemaVersion) {
             self.schemaVersion = schemaVersion
             self.todos = todos
             self.lastScan = lastScan
             self.slackScanState = slackScanState
+            self.dismissed = dismissed
         }
 
         init(from decoder: Decoder) throws {
@@ -100,6 +111,8 @@ final class Store {
             todos = try container.decode([TodoItem].self, forKey: .todos)
             lastScan = try container.decode(Date.self, forKey: .lastScan)
             slackScanState = try container.decodeIfPresent(SlackScanState.self, forKey: .slackScanState)
+            // Absent in every state.json written before this field existed.
+            dismissed = try container.decodeIfPresent([String: Date].self, forKey: .dismissed) ?? [:]
         }
     }
 
@@ -193,48 +206,82 @@ final class Store {
         return max(failureBackoff, retryAfter ?? 0)
     }
 
+    /// Moves an unreadable or undecodable state file aside before load() lets a
+    /// subsequent save() overwrite it. A rename needs write permission on the containing
+    /// directory, not readability of the file itself, so this still works when the read
+    /// that triggered it failed. The name carries a timestamp plus a short random suffix
+    /// so repeated failures (e.g. across relaunches within the same second) each get their
+    /// own sidecar instead of one clobbering another. Returns the sidecar URL on success;
+    /// nil if the move itself failed, which is logged here but never allowed to block
+    /// startup.
+    private func quarantineCorruptStateFile() -> URL? {
+        let sidecar = fileURL.deletingLastPathComponent().appendingPathComponent(
+            "state-corrupt-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
+        )
+        do {
+            try FileManager.default.moveItem(at: fileURL, to: sidecar)
+            return sidecar
+        } catch {
+            log.error("failed to quarantine corrupt state file error=\(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
     // Missing or corrupt state file just means "no history yet", not a crash. Missing is
     // normal on first launch; corrupt means the user's saved todos are gone, which they
-    // will notice, so only that one is an error.
+    // will notice, so only that one is an error. Either failure quarantines the file first
+    // (see quarantineCorruptStateFile) so the next save() cannot overwrite the only copy.
     private func load() {
         guard let data = try? Data(contentsOf: fileURL) else {
             // Absent is normal on first launch. Present-but-unreadable means the user's
             // saved list just vanished, which they will notice, so it is an error.
             if FileManager.default.fileExists(atPath: fileURL.path) {
-                log.error("state file present but unreadable, starting empty")
+                let sidecar = quarantineCorruptStateFile()
+                log.error("state file present but unreadable, starting empty sidecar=\(sidecar?.lastPathComponent ?? "none", privacy: .public)")
             } else {
                 log.debug("no state file yet, starting empty")
             }
             todos = []
             lastScan = .distantPast
             slackScanState = nil
+            dismissed = [:]
             return
         }
         do {
             let state = try JSONDecoder().decode(State.self, from: data)
+            let loadedTodos: [TodoItem]
             if state.schemaVersion == 0 {
                 // These files predate the required source, so non-manual todos may be
                 // mock fixtures. Manual todos came from the user and must survive.
-                todos = state.todos.filter(\.isManual)
-                log.info("migrated pre-schema state dropped items=\(state.todos.count - self.todos.count, privacy: .public)")
+                loadedTodos = state.todos.filter(\.isManual)
+                log.info("migrated pre-schema state dropped items=\(state.todos.count - loadedTodos.count, privacy: .public)")
             } else {
-                todos = state.todos
+                loadedTodos = state.todos
+            }
+            var seenIDs = Set<String>()
+            todos = loadedTodos.filter { seenIDs.insert($0.id).inserted }
+            let duplicateCount = loadedTodos.count - todos.count
+            if duplicateCount > 0 {
+                log.info("deduplicated loaded state items=\(duplicateCount, privacy: .public)")
             }
             lastScan = state.lastScan
             slackScanState = state.slackScanState
-            if state.schemaVersion == 0 { save() }
+            dismissed = state.dismissed
+            if state.schemaVersion == 0 || duplicateCount > 0 { save() }
         } catch {
-            log.error("state file unreadable, starting empty bytes=\(data.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            let sidecar = quarantineCorruptStateFile()
+            log.error("state file unreadable, starting empty bytes=\(data.count, privacy: .public) error=\(error.localizedDescription, privacy: .public) sidecar=\(sidecar?.lastPathComponent ?? "none", privacy: .public)")
             todos = []
             lastScan = .distantPast
             slackScanState = nil
+            dismissed = [:]
         }
     }
 
     private func save() {
         do {
             let data = try JSONEncoder().encode(
-                State(todos: todos, lastScan: lastScan, slackScanState: slackScanState)
+                State(todos: todos, lastScan: lastScan, slackScanState: slackScanState, dismissed: dismissed)
             )
             try data.write(to: fileURL, options: .atomic)
         } catch {
@@ -293,14 +340,15 @@ final class Store {
         message.conversationID.isEmpty ? message.id : message.conversationID
     }
 
-    /// Drops messages that are not the user's to act on, per `Set<Addressing>.deservesTask`.
-    /// This is the only place the detected addressing decides whether a task exists.
+    /// Drops conversations whose only non-context reasons for consideration were explicitly
+    /// switched off by the user, per `Set<Addressing>.deservesTask`.
     ///
     /// Deliberately conversation-level, not message-level: Triage judges the exchange as a
-    /// whole, so a conversation survives as soon as ONE of its messages deserves a task.
+    /// whole, so a conversation survives as soon as ONE non-context message deserves a task.
     /// Filtering message by message would strip the context that makes a follow-up
     /// readable ("Hi", then "review it within the hour"). Only a conversation where NO
-    /// message deserves a task is dropped.
+    /// non-context message deserves a task is dropped. Context can tag along with a kept
+    /// conversation, but it can never be the reason one survives.
     ///
     /// An EMPTY addressing set deserves a task, so a source that never populates
     /// `addressing` — a future real Slack client that forgets to — loses nothing here.
@@ -309,9 +357,60 @@ final class Store {
         ignoring ignored: Set<Addressing>
     ) -> [SlackMessage] {
         let keep = Set(
-            messages.filter { $0.addressing.deservesTask(ignoring: ignored) }.map(conversationKey)
+            messages.filter {
+                !$0.isContext && $0.addressing.deservesTask(ignoring: ignored)
+            }.map(conversationKey)
         )
         return messages.filter { keep.contains(conversationKey($0)) }
+    }
+
+    /// "Not this, not again": a conversation the user dismissed stays out until it has a
+    /// message genuinely newer than the dismissal. Whole-conversation, not per-message, like
+    /// `addressed`: a re-discovered thread's context rows (the parent, earlier replies) are
+    /// always older than or equal to the new message that triggered their re-fetch, so a
+    /// per-message date filter would strip exactly the context a follow-up needs to read.
+    nonisolated static func skippingDismissed(
+        _ messages: [SlackMessage],
+        dismissed: [String: Date]
+    ) -> [SlackMessage] {
+        guard !dismissed.isEmpty else { return messages }
+        var newest: [String: Date] = [:]
+        for message in messages {
+            let key = conversationKey(message)
+            newest[key] = max(newest[key] ?? .distantPast, message.date)
+        }
+        return messages.filter { message in
+            let key = conversationKey(message)
+            guard let dismissedAt = dismissed[key] else { return true }
+            return (newest[key] ?? .distantPast) > dismissedAt
+        }
+    }
+
+    /// Triage costs seconds and battery per conversation, and a bounded lookback re-offers
+    /// the same conversations on every refresh. A candidate whose conversation already has a
+    /// todo dated at or after its own newest message has nothing new to say, so it is dropped
+    /// before triage rather than re-deriving the same task. Whole-conversation, same reasoning
+    /// as `skippingDismissed`: a genuinely newer message keeps the conversation, context rows
+    /// included.
+    nonisolated static func droppingAlreadyAccounted(
+        _ messages: [SlackMessage],
+        existing todos: [TodoItem]
+    ) -> [SlackMessage] {
+        var accountedThrough: [String: Date] = [:]
+        for todo in todos where !todo.conversationID.isEmpty {
+            accountedThrough[todo.conversationID] = max(accountedThrough[todo.conversationID] ?? .distantPast, todo.date)
+        }
+        guard !accountedThrough.isEmpty else { return messages }
+        var newest: [String: Date] = [:]
+        for message in messages {
+            let key = conversationKey(message)
+            newest[key] = max(newest[key] ?? .distantPast, message.date)
+        }
+        return messages.filter { message in
+            let key = conversationKey(message)
+            guard let accountedDate = accountedThrough[key] else { return true }
+            return (newest[key] ?? .distantPast) > accountedDate
+        }
     }
 
     func refresh() async {
@@ -364,12 +463,18 @@ final class Store {
 
         do {
             // Preferences is @MainActor and so is this, so read it straight.
-            let addressed = Self.addressed(messages, ignoring: Preferences.shared.ignoredSignals)
-            log.debug("addressing filter dropped messages=\(messages.count - addressed.count, privacy: .public) conversations=\(Set(messages.map(Self.conversationKey)).count - Set(addressed.map(Self.conversationKey)).count, privacy: .public)")
-            let newItems = try await Triage.items(from: addressed)
+            let notDismissed = Self.skippingDismissed(messages, dismissed: dismissed)
+            let addressed = Self.addressed(notDismissed, ignoring: Preferences.shared.ignoredSignals)
+            // Raised to .info: these are the counters that explain a refresh producing
+            // nothing, and they were at .debug (uncaptured on this machine) the one time
+            // that diagnosis actually mattered. Ids and counts only, never content.
+            log.info("addressing filter dropped messages=\(notDismissed.count - addressed.count, privacy: .public) conversations=\(Set(notDismissed.map(Self.conversationKey)).count - Set(addressed.map(Self.conversationKey)).count, privacy: .public)")
+            let unaccounted = Self.droppingAlreadyAccounted(addressed, existing: todos)
+            log.info("already-accounted filter dropped conversations=\(Set(addressed.map(Self.conversationKey)).count - Set(unaccounted.map(Self.conversationKey)).count, privacy: .public)")
+            let newItems = try await Triage.items(from: unaccounted)
             guard refreshGeneration == resetGeneration else { return }
             todos = Self.merged(existing: todos, new: newItems)
-            log.debug("refresh scanned messages=\(messages.count, privacy: .public) newItems=\(newItems.count, privacy: .public) fallbacks=\(newItems.filter { $0.reason.hasPrefix("Fallback") }.count, privacy: .public)")
+            log.info("refresh scanned messages=\(messages.count, privacy: .public) newItems=\(newItems.count, privacy: .public) fallbacks=\(newItems.filter { $0.reason.hasPrefix("Fallback") }.count, privacy: .public)")
         } catch {
             guard refreshGeneration == resetGeneration else { return }
             // Fetching does not count as accounting for a message until triage accepts it.
@@ -436,6 +541,7 @@ final class Store {
         todos = []
         lastScan = .distantPast
         slackScanState = nil
+        dismissed = [:]
         restoredSlackScanState = false
         errorText = nil
         retryAfterFailure = nil
@@ -451,14 +557,27 @@ final class Store {
         lastRemoved = todos.remove(at: index)
         lastRemovedIndex = index
         lastUndoable = .removed
+        // Tombstone the conversation so a wider search lookback cannot resurrect it. A
+        // manual item and one with no Slack conversation behind it have nothing to bury.
+        if !item.isManual, !item.conversationID.isEmpty {
+            dismissed[item.conversationID] = Date()
+        }
         save()
     }
 
     func undoRemove() {
-        guard let lastRemoved, let lastRemovedIndex else { return }
-        todos.insert(lastRemoved, at: min(lastRemovedIndex, todos.count))
+        guard let lastRemoved, let lastRemovedIndex else {
+            self.lastRemoved = nil
+            self.lastRemovedIndex = nil
+            lastUndoable = nil
+            return
+        }
+        if !todos.contains(where: { $0.id == lastRemoved.id }) {
+            todos.insert(lastRemoved, at: min(lastRemovedIndex, todos.count))
+        }
         self.lastRemoved = nil
         self.lastRemovedIndex = nil
+        lastUndoable = nil
         save()
     }
 
@@ -650,7 +769,29 @@ func demoStoreMerge() async {
     store.remove(first)
     assert(store.lastRemoved == first && store.todos.count == 1)
     store.undoRemove()
-    assert(store.lastRemoved == nil && store.todos.map(\.action) == ["First", "Second"])
+    assert(store.lastRemoved == nil && store.lastUndoable == nil &&
+           store.todos.map(\.action) == ["First", "Second"])
+
+    final class ReaddingSource: MessageSource, @unchecked Sendable {
+        let message = SlackMessage(id: "undo-refresh", conversationID: "undo-refresh",
+                                   sender: "sender", channel: nil,
+                                   text: "Could you reply with the status?",
+                                   date: Date(timeIntervalSinceReferenceDate: 60),
+                                   directlyAddressed: true, addressing: [.directMessage], permalink: nil)
+
+        func unrepliedMessages(since: Date) async throws -> [SlackMessage] { [message] }
+        func repliedIDs(among ids: [String]) async throws -> Set<String> { [] }
+    }
+    let collisionURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-undo-collision-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: collisionURL) }
+    let collisionStore = Store(source: ReaddingSource(), fileURL: collisionURL)
+    await collisionStore.refresh()
+    let refreshed = collisionStore.todos[0]
+    collisionStore.remove(refreshed)
+    await collisionStore.refresh()
+    collisionStore.undoRemove()
+    assert(collisionStore.todos.filter { $0.id == refreshed.id }.count == 1)
 
     struct LegacyState: Codable {
         var todos: [TodoItem]
@@ -668,6 +809,71 @@ func demoStoreMerge() async {
     assert(migratedStore.todos.isEmpty && migratedStore.lastScan == .distantPast)
     let resetStore = Store(source: MockMessageSource(), fileURL: migrationURL)
     assert(resetStore.todos.isEmpty && resetStore.lastScan == .distantPast)
+
+    struct CurrentState: Codable {
+        var schemaVersion: Int
+        var todos: [TodoItem]
+        var lastScan: Date
+        var slackScanState: SlackScanState?
+    }
+    let dedupeURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-dedupe-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: dedupeURL) }
+    let duplicateFirst = todo("duplicate", action: "Keep first", priority: 2, reason: "First.")
+    let duplicateSecond = todo("duplicate", action: "Drop second", priority: 1, reason: "Second.")
+    try! JSONEncoder().encode(CurrentState(schemaVersion: 1, todos: [duplicateFirst, duplicateSecond],
+                                            lastScan: newDate, slackScanState: nil))
+        .write(to: dedupeURL, options: .atomic)
+    let deduplicatedStore = Store(source: MockMessageSource(), fileURL: dedupeURL)
+    assert(deduplicatedStore.todos == [duplicateFirst])
+    let rewrittenState = try! JSONDecoder().decode(CurrentState.self, from: Data(contentsOf: dedupeURL))
+    assert(rewrittenState.todos == [duplicateFirst])
+
+    // A state file that fails to decode must not let the very next save() overwrite the
+    // only copy: load() quarantines it aside first, then starts empty as before.
+    let corruptURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-corrupt-\(UUID().uuidString).json")
+    let corruptDir = corruptURL.deletingLastPathComponent()
+    func sidecarNames() -> Set<String> {
+        Set((try! FileManager.default.contentsOfDirectory(atPath: corruptDir.path))
+            .filter { $0.hasPrefix("state-corrupt-") })
+    }
+    let sidecarsBefore = sidecarNames()
+    let invalidBytes = Data("not json at all".utf8)
+    try! invalidBytes.write(to: corruptURL)
+    let corruptStore = Store(source: MockMessageSource(), fileURL: corruptURL)
+    assert(corruptStore.todos.isEmpty && corruptStore.lastScan == .distantPast)
+    assert(!FileManager.default.fileExists(atPath: corruptURL.path),
+           "the bad file must be moved aside so a subsequent save() writes fresh, not mixed with the bad one")
+    let firstSidecars = sidecarNames().subtracting(sidecarsBefore)
+    assert(firstSidecars.count == 1, "one corrupt load must produce exactly one sidecar")
+    let firstSidecar = corruptDir.appendingPathComponent(firstSidecars.first!)
+    defer { try? FileManager.default.removeItem(at: firstSidecar) }
+    assert(try! Data(contentsOf: firstSidecar) == invalidBytes,
+           "the sidecar must hold exactly the bad bytes that were written")
+
+    // A second, independent corrupt load must not clobber the first quarantine.
+    try! invalidBytes.write(to: corruptURL)
+    let secondCorruptStore = Store(source: MockMessageSource(), fileURL: corruptURL)
+    assert(secondCorruptStore.todos.isEmpty)
+    let secondSidecars = sidecarNames().subtracting(sidecarsBefore).subtracting(firstSidecars)
+    assert(secondSidecars.count == 1, "a second corrupt load must produce its own new sidecar")
+    let secondSidecar = corruptDir.appendingPathComponent(secondSidecars.first!)
+    defer { try? FileManager.default.removeItem(at: secondSidecar) }
+    assert(secondSidecar != firstSidecar, "two corrupt loads must not share a sidecar name")
+
+    // The normal path is untouched: a valid state file loads its todos and leaves no
+    // sidecar behind.
+    let validURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-valid-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: validURL) }
+    try! JSONEncoder().encode(CurrentState(schemaVersion: 1, todos: [existingOnly], lastScan: newDate,
+                                            slackScanState: nil))
+        .write(to: validURL, options: .atomic)
+    let sidecarsBeforeValidLoad = sidecarNames()
+    let validStore = Store(source: MockMessageSource(), fileURL: validURL)
+    assert(validStore.todos == [existingOnly])
+    assert(sidecarNames() == sidecarsBeforeValidLoad, "a valid load must not create a sidecar")
 
     final class ResettingEmptySource: MessageSource, @unchecked Sendable {
         var reset: (@MainActor @Sendable () -> Void)?
@@ -695,17 +901,17 @@ func demoStoreMerge() async {
 func demoAddressingFilter() {
     let now = Date(timeIntervalSinceReferenceDate: 0)
     func message(_ id: String, conversation: String = "", _ addressing: Set<Addressing>,
-                 offset: TimeInterval = 0) -> SlackMessage {
+                 offset: TimeInterval = 0, isContext: Bool = false) -> SlackMessage {
         SlackMessage(id: id, conversationID: conversation, sender: "sender", channel: "#channel",
-                     text: "text", date: now.addingTimeInterval(offset),
+                     text: "text", isContext: isContext, date: now.addingTimeInterval(offset),
                      directlyAddressed: false, addressing: addressing, permalink: nil)
     }
-    func kept(_ messages: [SlackMessage], ignoring ignored: Set<Addressing> = [.broadcast]) -> [String] {
+    func kept(_ messages: [SlackMessage], ignoring ignored: Set<Addressing> = []) -> [String] {
         Store.addressed(messages, ignoring: ignored).map(\.id)
     }
 
-    // The bug: an @channel notice ranked priority 1 because nothing read its addressing.
-    assert(kept([message("broadcast", [.broadcast])]).isEmpty)
+    // Broadcast ownership now belongs to the model; Swift no longer silently drops it.
+    assert(kept([message("broadcast", [.broadcast])]) == ["broadcast"])
     assert(kept([message("dm", [.directMessage])]) == ["dm"])
 
     // Empty means "nothing explicit points at me", not "not mine". "Team, please complete
@@ -722,13 +928,66 @@ func demoAddressingFilter() {
                  message("mixed/2", conversation: "C_MIXED", [.mention], offset: 60)]
     assert(kept(mixed) == ["mixed/1", "mixed/2"])
 
-    // Broadcast all the way down: nothing in it is anyone's task, so it goes entirely.
+    // Broadcast all the way down now reaches the model, which has the conversation context
+    // needed to decide whether the room-wide request belongs to this reader.
     assert(kept([message("all/1", conversation: "C_ALL", [.broadcast]),
-                 message("all/2", conversation: "C_ALL", [.broadcast], offset: 60)]).isEmpty)
+                 message("all/2", conversation: "C_ALL", [.broadcast], offset: 60)]) ==
+           ["all/1", "all/2"])
+
+    // Context is evidence only: it cannot rescue a conversation by itself, but every
+    // context row tags along when a non-context message survives.
+    let contextOnly = message("context-only", conversation: "C_CONTEXT", [.mention], isContext: true)
+    assert(kept([contextOnly]).isEmpty)
+    let pending = message("pending", conversation: "C_KEPT", [.broadcast])
+    let context = message("context", conversation: "C_KEPT", [], offset: -60, isContext: true)
+    assert(kept([context, pending]) == ["context", "pending"])
 
     // The weakest signal, and the preference that switches it off.
     assert(kept([message("named", [.nameMentioned])], ignoring: []) == ["named"])
     assert(kept([message("named", [.nameMentioned])], ignoring: [.nameMentioned]).isEmpty)
+
+    // "Not this, not again": a dismissed conversation with nothing newer than the
+    // dismissal (including a message landing at the exact dismissal instant) is dropped
+    // whole. A dismissed conversation with a genuinely newer message comes back whole,
+    // context included: that context is what makes the new message readable. A
+    // conversation never dismissed is untouched.
+    let dismissedAt = now.addingTimeInterval(30)
+    let staysOut = message("stays-out", conversation: "C_STAYS_OUT", [.mention], offset: -60)
+    let staysOutAtInstant = message("stays-out/instant", conversation: "C_STAYS_OUT", [.mention], offset: 30)
+    let oldContext = message("has-news/context", conversation: "C_HAS_NEWS", [.mention], offset: -60, isContext: true)
+    let genuinelyNew = message("has-news/new", conversation: "C_HAS_NEWS", [.mention], offset: 90)
+    let untouchedConversation = message("untouched", conversation: "C_LIVE", [.mention])
+    let dismissedInput = [staysOut, staysOutAtInstant, oldContext, genuinelyNew, untouchedConversation]
+    let dismissedResult = Store.skippingDismissed(
+        dismissedInput,
+        dismissed: ["C_STAYS_OUT": dismissedAt, "C_HAS_NEWS": dismissedAt]
+    )
+    assert(Set(dismissedResult.map(\.id)) == ["has-news/context", "has-news/new", "untouched"],
+           "a conversation with nothing newer than its dismissal must be dropped whole; one " +
+           "with a genuinely newer message must come back whole, context included, got \(dismissedResult.map(\.id))")
+    assert(Store.skippingDismissed(dismissedInput, dismissed: [:]) == dismissedInput,
+           "no recorded dismissals must be a no-op")
+
+    // Triage is not worth paying for again when nothing has been said since the existing
+    // todo: a conversation whose newest candidate is at or before its todo's date is
+    // dropped whole; one with real news, or with no existing todo at all, survives.
+    func todo(_ id: String, conversation: String, date: Date) -> TodoItem {
+        TodoItem(id: id, action: "Reply", priority: 2, reason: "r", sender: "sender", channel: nil,
+                 date: date, permalink: nil, conversationID: conversation)
+    }
+    let nothingNewTodo = todo("existing-nothing-new", conversation: "C_NOTHING_NEW", date: now)
+    let olderCandidate = message("nothing-new/older", conversation: "C_NOTHING_NEW", [.mention], offset: -60)
+    let sameDateCandidate = message("nothing-new/same", conversation: "C_NOTHING_NEW", [.mention])
+    let hasNewsTodo = todo("existing-has-news", conversation: "C_HAS_NEWS", date: now)
+    let newerCandidate = message("has-news", conversation: "C_HAS_NEWS", [.mention], offset: 60)
+    let noExistingTodoCandidate = message("no-existing-todo", conversation: "C_OTHER", [.mention])
+    let accountedResult = Store.droppingAlreadyAccounted(
+        [olderCandidate, sameDateCandidate, newerCandidate, noExistingTodoCandidate],
+        existing: [nothingNewTodo, hasNewsTodo]
+    )
+    assert(Set(accountedResult.map(\.id)) == ["has-news", "no-existing-todo"],
+           "a conversation with nothing newer than its existing todo must be dropped whole; " +
+           "one with genuine news, and one with no existing todo, must survive, got \(accountedResult.map(\.id))")
 
     print("demoAddressingFilter: PASS")
 }

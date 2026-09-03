@@ -45,17 +45,18 @@ bash build.sh        # produces Sereno.app, ad-hoc signed, LSUIElement
 
 `log` is a zsh builtin, so use `/usr/bin/log`.
 
-Demos are plain `assert` functions, no test framework: `demo`, `demoMockSource`,
+Demos are plain `assert` functions, no test framework: `demo`, `demoModels`, `demoMockSource`,
 `demoAutoComplete`, `demoAddressing`, `demoStoreMerge`, `demoPreferences`, `demoRefreshTimer`,
-`demoSky`, `demoWeather`, `demoNotifyBatch`, `demoAddressingFilter`, `demoSlackSource`. The repo has exactly one
-`@main` (App.swift), so run them from a throwaway SwiftPM package under `/private/tmp` that
-copies the sources and supplies its own entry point, then delete it.
+`demoSky`, `demoWeather`, `demoNotifyBatch`, `demoAddressingFilter`, `demoSlackSource`. None of
+these are called by the app; each only runs when a throwaway package calls it explicitly. The
+repo has exactly one `@main` (App.swift), so run them from a throwaway SwiftPM package under
+`/private/tmp` that copies the sources and supplies its own entry point, then delete it.
 
 ## The core design principle, learned the hard way
 
 **If the model can get something plausibly wrong, constrain it structurally or check it
-deterministically. Never merely ask.** Four things follow this rule, and each one was a bug
-first:
+deterministically. Never merely ask.** Seven things follow this rule, and most of them were a
+bug first:
 
 | Concern | How it is enforced |
 |---|---|
@@ -64,6 +65,8 @@ first:
 | Action shape | Schema-constrained `verb` enum plus a separate required `topic`, composed in Swift. |
 | Priority | Model picks a semantic category; Swift maps it to 1...5. |
 | "Is this mine" | `Addressing` computed in Swift from the message and identity. |
+| Topic grounding | The model cannot name a subject the conversation never mentioned, checked in Swift after generation, on both stages. |
+| Time | Swift snapshots the current time once per triage run and states it in the prompt, and renders every message timestamp in that same zone. The model is never left to guess what "today" means. |
 
 ## Traps. Every one of these cost real debugging time.
 
@@ -157,8 +160,23 @@ first:
 
 ## Known open items
 
-- Stage-2 split has a grounding guard that never fired in 66 runs, so it is proven only by its
-  unit asserts.
+- There are two grounding guards, deliberately different rules. `topicIsGrounded` (stage 2,
+  the second task) requires at least one token of 4+ characters in the topic to appear
+  anywhere in the conversation text, case-insensitive substring. `primaryTopicIsGrounded`
+  (stage 1, the action actually displayed) requires every non-generic word in the topic to
+  appear as a whole word in the conversation, via `containsWord`, not bare substring (bare
+  substring would ground "CI fix" against "I decided to fix it"); an all-generic topic
+  (`a, an, the, this, that, it, message, request`) passes, which is what keeps a pronoun-only
+  ask like "can you look at this?" out of the fallback row. The stage-1 rule deliberately has
+  no 4-character floor: an earlier version required one and rejected real topics whose
+  subject was verbatim in the text ("the API key" against "please rotate the API key today",
+  "Q3 tax" against "can you check the Q3 tax numbers", "CI fix" against "the CI is red, can
+  you fix it?"). Engineering Slack is full of 2 and 3 character tokens (API, CI, Q3, PR, DB,
+  UI), so a length floor is not survivable here. Both still let through a misleading
+  recombination of words that each appear separately in the conversation. The stage-1 guard's
+  wiring inside `generatedTask` is not covered by any assert: the asserts exercise only the
+  pure function, so deleting the `guard` line would leave every demo passing.
+  `generatedTask` takes a `GeneratedContent`, which a demo cannot easily construct.
 - Occasional determinism wobble under concurrency ("Reply Lunch" vs "Reply lunch"), traced to
   the model, not the code.
 - Whether the window physically drags, and whether its resize edges are grabbable, both need a
@@ -168,3 +186,7 @@ first:
   when it does not. Only demos construct `MockMessageSource`, and `Store.init` has no mock
   default, so production cannot serve fixtures. State files from before the schema-version
   migration drop non-manual todos on load.
+- `Store.merged` identifies a fallback row by `reason.hasPrefix("Fallback")`, so the
+  user-visible reason string is load-bearing for merge behaviour: it must keep starting with
+  the word "Fallback". The clean fix is an `isFallback: Bool` on `TodoItem`, which would need
+  a state migration, so it has not been done.

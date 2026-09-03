@@ -1,8 +1,7 @@
 import Foundation
 
-/// Why a message counts as aimed at the user. A message can match several of these.
-/// Computed deterministically from the message and the user's identity, never guessed
-/// by the model, because "is this even mine" decides whether a task exists at all.
+/// Deterministic evidence that a message may be aimed at the user. A message can match
+/// several of these; the model makes the ownership call, subject to the DM/mention floor.
 enum Addressing: String, Codable, Sendable, CaseIterable {
     /// A 1:1 or group DM. Nothing else needs to be true.
     case directMessage
@@ -22,31 +21,18 @@ enum Addressing: String, Codable, Sendable, CaseIterable {
 }
 
 extension Set<Addressing> {
-    /// Whether this message should produce a task at all, given what the user has switched
-    /// off. An empty set is ALLOWED through: nothing explicit points at the user, but the
-    /// model still gets to judge it against their role. Only a message whose signals are
-    /// all impersonal or all ignored is dropped.
+    /// Whether any detected reason for considering this message remains enabled. An empty
+    /// set is allowed through for the model to judge. A non-empty set is dropped only when
+    /// every signal in it was explicitly switched off by the user.
     /// ponytail: `ignoring` is passed in rather than read from Preferences so this stays a
     /// pure function, testable without the @MainActor singleton.
     func deservesTask(ignoring ignored: Set<Addressing>) -> Bool {
-        let kept = subtracting(ignored)
         if isEmpty { return true }
-        return kept.isPersonal
+        return !subtracting(ignored).isEmpty
     }
 }
 
 extension Addressing {
-    /// How strongly this signal implies the user personally owes a response.
-    /// Feeds the priority rubric, and lets the UI say why an item is on the list.
-    var weight: Int {
-        switch self {
-        case .directMessage, .mention, .replyToMe: 3
-        case .threadParticipant: 2
-        case .userGroup, .nameMentioned: 1
-        case .broadcast: 0
-        }
-    }
-
     /// Short phrase for the UI, e.g. "mentioned you".
     var label: String {
         switch self {
@@ -92,6 +78,12 @@ struct SlackMessage: Sendable, Hashable, Identifiable {
     let channel: String?
     /// The message text.
     let text: String
+    /// Background fetched with a pending conversation. It is readable context, never the
+    /// obligation itself and never a reason for the conversation to survive filtering.
+    var isContext: Bool = false
+    /// True when this is one of the reader's own messages. Triage labels it explicitly so
+    /// the model can see that the reader already answered earlier in the exchange.
+    var isFromUser: Bool = false
     let date: Date
     /// true when the message @-mentions the user or is a DM. Raises priority.
     /// ponytail: kept as the coarse flag existing code reads. `addressing` is the real
@@ -99,19 +91,14 @@ struct SlackMessage: Sendable, Hashable, Identifiable {
     let directlyAddressed: Bool
     /// Every reason this message is aimed at the user.
     ///
-    /// Three cases, and they are deliberately not the same:
-    /// - Contains a personal signal (DM, mention, reply to you, your thread, your group,
-    ///   or your name): definitely yours, always becomes a task.
-    /// - EMPTY: nothing explicit points at you, but it still might be yours. "Team, please
-    ///   complete the deployment doc" carries no signal at all, so the model judges it
-    ///   using Preferences.role. Do NOT drop these, that was the old rule and it silently
-    ///   lost real work.
-    /// - Non-empty but NOT personal, meaning broadcast-only or everything in it is switched
-    ///   off in settings: aimed at a room rather than a person, so no task. This is the one
-    ///   case that gets filtered out.
+    /// Swift uses this only for explicitly ignored preferences and the deterministic
+    /// direct-message/mention floor. All other ownership decisions belong to the model.
     var addressing: Set<Addressing> = []
     /// Link that opens the message in Slack. Real permalink later, nil in the mock.
     let permalink: URL?
+    /// Sender's Slack profile photo (image_72, falling back to image_48). nil in the mock
+    /// and whenever Slack has none, in which case the UI falls back to initials.
+    var avatarURL: URL? = nil
 }
 
 /// Anything that can hand back unreplied messages.
@@ -153,6 +140,10 @@ struct TodoItem: Codable, Identifiable, Sendable, Hashable {
     /// "last activity" time the row shows, and as the marker for detecting a follow-up.
     let date: Date
     let permalink: URL?
+    /// Sender's Slack profile photo, carried from the newest message in the conversation.
+    /// nil for a manual task (no sender) or when Slack has none; the UI falls back to
+    /// initials either way.
+    var avatarURL: URL? = nil
     /// Which conversation produced this task. Several tasks can share one conversation
     /// only when the messages really are separate asks.
     var conversationID: String = ""
@@ -202,6 +193,7 @@ extension TodoItem {
         userPriority = try c.decodeIfPresent(Int.self, forKey: .userPriority)
         snoozedUntil = try c.decodeIfPresent(Date.self, forKey: .snoozedUntil)
         isManual = try c.decodeIfPresent(Bool.self, forKey: .isManual) ?? false
+        avatarURL = try c.decodeIfPresent(URL.self, forKey: .avatarURL)
     }
 }
 
@@ -215,7 +207,41 @@ func extractLinks(from text: String) -> [URL] {
 
 extension TodoItem {
     /// Sort order for the list: urgent first, then oldest first within a priority.
+    /// Ties broken by id so the order is the same on every run: Swift's sort is not
+    /// stable, and a conversation that splits into two tasks produces two items with
+    /// identical effectivePriority and identical date (both take the conversation's
+    /// newest message date), which without this would flip on-screen between refreshes
+    /// for no reason.
     static func ranked(_ items: [TodoItem]) -> [TodoItem] {
-        items.sorted { ($0.effectivePriority, $0.date) < ($1.effectivePriority, $1.date) }
+        items.sorted { ($0.effectivePriority, $0.date, $0.id) < ($1.effectivePriority, $1.date, $1.id) }
     }
+}
+
+func demoModels() {
+    // A state.json written before avatarURL existed has no such key at all. Swift's
+    // synthesized init(from:) does NOT fall back to a stored property's default for a
+    // missing key, it throws instead, which is exactly the trap that once dropped every
+    // todo on load. TodoItem's custom init(from:) uses decodeIfPresent for this reason;
+    // this proves a legacy blob still decodes instead of losing the user's saved todos.
+    let legacyJSON = """
+    {"id":"C1","action":"Reply","priority":2,"reason":"because","sender":"Ayesha",
+     "channel":null,"date":0,"permalink":null}
+    """
+    let decoded = try! JSONDecoder().decode(TodoItem.self, from: Data(legacyJSON.utf8))
+    assert(decoded.avatarURL == nil, "a pre-avatarURL row must decode with avatarURL defaulting to nil")
+    assert(decoded.id == "C1" && decoded.sender == "Ayesha" && decoded.priority == 2,
+           "the rest of a legacy row must survive intact")
+
+    // ranked() must break ties by id. Two items from a conversation that split into two
+    // tasks share both effectivePriority and date (both take the conversation's newest
+    // message date), so without an id tiebreak Swift's non-stable sort can flip their
+    // on-screen order between refreshes for no reason.
+    let sameDate = Date()
+    let itemB = TodoItem(id: "B", action: "Reply B", priority: 2, reason: "r",
+                          sender: "Ayesha", channel: nil, date: sameDate, permalink: nil)
+    let itemA = TodoItem(id: "A", action: "Reply A", priority: 2, reason: "r",
+                          sender: "Ayesha", channel: nil, date: sameDate, permalink: nil)
+    let ranked = TodoItem.ranked([itemB, itemA])
+    assert(ranked.map(\.id) == ["A", "B"],
+           "equal priority and date must still sort deterministically by id")
 }

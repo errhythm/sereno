@@ -168,6 +168,24 @@ struct SlackScanState: Codable, Sendable, Equatable {
     var connectedAt: Date? = nil
     var conversations: [String: SlackConversationCheckpoint] = [:]
     var userNames: [String: String] = [:]
+    /// Sender avatar URLs, cached next to userNames for the same reason: the request
+    /// budget is scarce, so a relaunch must not need a fresh users.info pass.
+    var userAvatars: [String: URL] = [:]
+}
+
+extension SlackScanState {
+    // Swift's synthesized init(from:) does NOT fall back to a property's default for a
+    // missing key, it throws. A state.json written before userAvatars existed has no such
+    // key, so this decodes it explicitly rather than losing the whole scan state (and with
+    // it every conversation watermark and cached display name) on load.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        accountKey = try c.decodeIfPresent(String.self, forKey: .accountKey)
+        connectedAt = try c.decodeIfPresent(Date.self, forKey: .connectedAt)
+        conversations = try c.decodeIfPresent([String: SlackConversationCheckpoint].self, forKey: .conversations) ?? [:]
+        userNames = try c.decodeIfPresent([String: String].self, forKey: .userNames) ?? [:]
+        userAvatars = try c.decodeIfPresent([String: URL].self, forKey: .userAvatars) ?? [:]
+    }
 }
 
 /// Store uses this refinement without widening MessageSource, so simple fixtures keep the
@@ -199,6 +217,17 @@ actor SlackMessageSource: SlackScanStateSource {
     /// its own watermark replaces this window. The connection floor can make the first look
     /// smaller, which is deliberate for a newly connected installation.
     private static let historyWindow: TimeInterval = 7 * 24 * 60 * 60
+    /// How far back search discovery's candidate cutoff looks, measured from now rather than
+    /// from the sliding `since` watermark. THE BUG THIS FIXES: `since` advances on every
+    /// successful refresh whether or not a candidate was found, so a message the search index
+    /// had not yet indexed when its one covering refresh ran was lost forever once the window
+    /// slid past it. A bounded lookback makes a miss self-heal on the next successful refresh
+    /// instead, at the cost of re-asking Slack about the same window repeatedly, which is
+    /// exactly what Tier 2 quota is for (see searchCallBudget below). 24 hours matches
+    /// historyWindow's order of magnitude and comfortably covers both Slack's search-index
+    /// lag and the multi-hour gaps sustained rate limiting produces between successful
+    /// refreshes (measured: 5 successes against 159 failures over 8 hours in the field).
+    private static let searchLookback: TimeInterval = 24 * 60 * 60
     /// The conversation list changes rarely, so it is refetched every tenth refresh.
     private static let conversationCacheRefreshes = 10
     /// Used when a 429 arrived without a readable Retry-After. A minute is what Slack asks
@@ -222,6 +251,7 @@ actor SlackMessageSource: SlackScanStateSource {
     private var conversationsTask: Task<[SlackConversation], Error>?
     private var refreshCount = 0
     private var userNames: [String: String] = [:]
+    private var userAvatars: [String: URL] = [:]
     private var scanState = SlackScanState()
     /// Earliest date each Web API method may be called again, learned from Slack's own
     /// Retry-After. Slack now allows this class of app about one conversations.history a
@@ -264,10 +294,12 @@ actor SlackMessageSource: SlackScanStateSource {
         }
         scanState = state
         userNames = state.userNames
+        userAvatars = state.userAvatars
     }
 
     func currentSlackScanState() -> SlackScanState {
         scanState.userNames = userNames
+        scanState.userAvatars = userAvatars
         return scanState
     }
 
@@ -382,6 +414,7 @@ actor SlackMessageSource: SlackScanStateSource {
         conversations = []
         hasConversationCache = false
         userNames = [:]
+        userAvatars = [:]
         sweepStart = 0
     }
 
@@ -631,9 +664,11 @@ actor SlackMessageSource: SlackScanStateSource {
         }
         log.info("refresh done \(counters, privacy: .public)")
 
-        let names = await resolveNames(Set(pending.map(\.raw.user)))
+        let names = await resolveNames(
+            Set(pending.map(\.raw.user)).union(pending.flatMap { mentionedUserIDs(in: $0.raw.text) })
+        )
         return pending
-            .map { $0.message(identity: identity, host: permalinkHost, names: names) }
+            .map { $0.message(identity: identity, host: permalinkHost, names: names, avatars: userAvatars) }
             .sorted { $0.date > $1.date }
     }
 
@@ -776,10 +811,12 @@ actor SlackMessageSource: SlackScanStateSource {
             for line in lines { log.info("search probe \(line, privacy: .public)") }
         }
 
-        // The connection floor still holds: nothing predating connection may surface, and
-        // nothing already accounted for by an earlier refresh may be offered again.
+        // The candidate cutoff is a bounded LOOKBACK from now, not the sliding `since`
+        // watermark: see searchLookback above for why. The connection floor still holds
+        // absolutely: nothing predating connection may ever surface, however wide the
+        // lookback gets.
         let floor = scanState.connectedAt ?? Date()
-        let cutoff = max(since, floor)
+        let cutoff = max(Date().addingTimeInterval(-Self.searchLookback), floor)
         // `after:` takes a calendar DAY and excludes it, so the coarse filter is the day
         // before the cutoff and `SlackSearch.matches` applies the real cutoff in Swift.
         let candidateDay = cutoff.addingTimeInterval(-86_400)
@@ -875,11 +912,56 @@ actor SlackMessageSource: SlackScanStateSource {
             settled.remove(key)
         }
 
+        // A bare mention does not give triage enough context to infer the owed work. Search
+        // has no thread parent, so buy at most one capped replies request to recover it.
+        if let candidate = pending
+            .filter({ $0.raw.threadTS != nil && strippingMarkupAndCode($0.raw.text)
+                .split(whereSeparator: { $0.isWhitespace }).count < 4 })
+            .max(by: { $0.raw.ts < $1.raw.ts }),
+           let threadTS = candidate.raw.threadTS {
+            if cooldown("conversations.replies") != nil {
+                emit(["threadContext=skipped reason=cooldown"])
+            } else if !spend(reserve: nameReserve) {
+                emit(["threadContext=skipped reason=budget"])
+            } else if let page = try? await get(
+                "conversations.replies",
+                [("channel", candidate.conversation.id), ("ts", threadTS), ("limit", "15")]
+            ) {
+                let replies = Self.ordered(Self.parseMessages(page))
+                if let root = replies.first {
+                    let context = ThreadContext(
+                        ts: threadTS,
+                        parentAuthorID: root.user,
+                        participants: Set(replies.map(\.user))
+                    )
+                    let rootAdded = !pending.contains(where: { $0.raw.ts == root.ts })
+                    let pendingTimestamps = Set(pending.filter {
+                        $0.conversation.id == candidate.conversation.id
+                    }.map(\.raw.ts))
+                    pending += replies.filter { !pendingTimestamps.contains($0.ts) }.map {
+                        Pending(raw: $0, conversation: candidate.conversation,
+                                thread: context, isContext: true)
+                    }
+                    pending = pending.map {
+                        guard $0.raw.threadTS == threadTS else { return $0 }
+                        return Pending(raw: $0.raw, conversation: $0.conversation,
+                                       thread: context, isContext: $0.isContext)
+                    }
+                    emit(["threadContext=fetched root=\(rootAdded ? "added" : "present") participants=\(context.participants.count)"])
+                } else {
+                    emit(["threadContext=skipped reason=empty"])
+                }
+            } else {
+                emit(["threadContext=skipped reason=failed"])
+            }
+        }
+
         // Names come out of the reserve, so a big search result cannot spend the sweep's
         // requests on display names before the sweep has had its turn.
-        let names = await resolveNames(Set(pending.map(\.raw.user)),
+        let names = await resolveNames(
+            Set(pending.map(\.raw.user)).union(pending.flatMap { mentionedUserIDs(in: $0.raw.text) }),
                                        reserve: max(0, budget - nameReserve))
-        out.messages = pending.map { $0.message(identity: identity, host: permalinkHost, names: names) }
+        out.messages = pending.map { $0.message(identity: identity, host: permalinkHost, names: names, avatars: userAvatars) }
         emit(["candidates=\(out.messages.count) answered=\(answered) " +
              "threadTSPresent=\(threadTSPresent) threadTSAbsent=\(threadTSAbsent) " +
              "settled=\(out.settled.count) searchCallsLeft=\(searchBudget)"])
@@ -907,8 +989,9 @@ actor SlackMessageSource: SlackScanStateSource {
         let raw: RawMessage
         let conversation: SlackConversation
         let thread: ThreadContext?
+        var isContext: Bool = false
 
-        func message(identity: Identity, host: String, names: [String: String]) -> SlackMessage {
+        func message(identity: Identity, host: String, names: [String: String], avatars: [String: URL]) -> SlackMessage {
             let facts = MessageFacts(
                 text: raw.text,
                 channelKind: conversation.kind,
@@ -923,12 +1006,15 @@ actor SlackMessageSource: SlackScanStateSource {
                 conversationID: thread?.ts ?? conversation.id,
                 sender: names[raw.user] ?? raw.user,
                 channel: conversation.name.map { "#\($0)" },
-                text: raw.text,
+                text: slackPlainText(raw.text, names: names),
+                isContext: isContext,
+                isFromUser: raw.user == identity.userID,
                 date: raw.date,
                 directlyAddressed: signals.isPersonal,
                 addressing: signals,
                 permalink: SlackMessageSource.permalink(
-                    host: host, channel: conversation.id, ts: raw.ts, threadTS: thread?.ts)
+                    host: host, channel: conversation.id, ts: raw.ts, threadTS: thread?.ts),
+                avatarURL: avatars[raw.user]
             )
         }
     }
@@ -1030,6 +1116,10 @@ actor SlackMessageSource: SlackScanStateSource {
                 let context = ThreadContext(ts: key,
                                             parentAuthorID: root.user,
                                             participants: Set(replies.map(\.user)))
+                let tailTimestamps = Set(threadTail.map(\.ts))
+                pending += replies.filter { !tailTimestamps.contains($0.ts) }.map {
+                    Pending(raw: $0, conversation: conversation, thread: context, isContext: true)
+                }
                 pending += threadTail.map {
                     Pending(raw: $0, conversation: conversation, thread: context)
                 }
@@ -1054,16 +1144,24 @@ actor SlackMessageSource: SlackScanStateSource {
         return ScanResult(pending: pending, checkpoints: checkpoints)
     }
 
-    /// Display names are persisted with the scan state, so an app relaunch is not a cold
-    /// users.info pass. Unknown authors stay sequential because they are normally few.
+    /// Display names and avatars are persisted with the scan state, so an app relaunch is
+    /// not a cold users.info pass. Unknown authors stay sequential because they are normally
+    /// few. A name already cached but with no avatar yet (a state.json from before avatars
+    /// existed) is refetched once, after which both are cached together.
     private func resolveNames(_ ids: Set<String>, reserve: Int = 0) async -> [String: String] {
-        for id in ids.sorted() where userNames[id] == nil {
+        for id in ids.sorted() where userNames[id] == nil || userAvatars[id] == nil {
             guard spend(reserve: reserve) else { break }
             guard let info = try? await get("users.info", [("user", id)]),
                   let user = info["user"] as? [String: Any] else { continue }
-            let display = ((user["profile"] as? [String: Any])?["display_name"] as? String) ?? ""
+            let profile = user["profile"] as? [String: Any]
+            let display = (profile?["display_name"] as? String) ?? ""
             let real = user["real_name"] as? String ?? ""
             userNames[id] = display.isEmpty ? (real.isEmpty ? id : real) : display
+            // ponytail: a genuinely avatar-less profile leaves userAvatars[id] unset, so the
+            // where-clause above refetches that id on every future call. Real Slack users
+            // always carry a default image_48/72, so this is dead weight rather than a real
+            // cost; give it a resolved-but-nil sentinel if that ever stops being true.
+            userAvatars[id] = Self.avatarURL(fromProfile: profile)
         }
         return userNames
     }
@@ -1147,6 +1245,15 @@ actor SlackMessageSource: SlackScanStateSource {
 
     static func parseMessages(_ root: [String: Any]) -> [RawMessage] {
         (root["messages"] as? [[String: Any]] ?? []).compactMap(RawMessage.init)
+    }
+
+    /// image_72 preferred, image_48 as a fallback for a smaller/older profile payload.
+    /// Both are public avatars.slack-edge.com URLs, no token needed to load them. nil,
+    /// never a broken URL, when a profile has neither.
+    static func avatarURL(fromProfile profile: [String: Any]?) -> URL? {
+        let raw = (profile?["image_72"] as? String) ?? (profile?["image_48"] as? String)
+        guard let raw, !raw.isEmpty else { return nil }
+        return URL(string: raw)
     }
 
     static func parseConversations(_ root: [String: Any]) -> [SlackConversation] {
@@ -1303,6 +1410,16 @@ func demoSlackSource() async {
     assert(!S.permalink(host: "acme.slack.com", channel: "C0123", ts: "1.2", threadTS: nil)!
         .absoluteString.hasSuffix("p1.2"))
 
+    // MARK: avatar URL parsing
+    assert(S.avatarURL(fromProfile: ["image_72": "https://avatars.slack-edge.com/x_72.png"])?
+        .absoluteString == "https://avatars.slack-edge.com/x_72.png")
+    assert(S.avatarURL(fromProfile: ["image_48": "https://avatars.slack-edge.com/x_48.png"])?
+        .absoluteString == "https://avatars.slack-edge.com/x_48.png", "image_48 is the fallback when image_72 is absent")
+    assert(S.avatarURL(fromProfile: ["image_72": "https://a/72.png", "image_48": "https://a/48.png"])?
+        .absoluteString == "https://a/72.png", "image_72 wins when both are present")
+    assert(S.avatarURL(fromProfile: [:]) == nil, "a profile with neither field must yield nil, not a broken URL")
+    assert(S.avatarURL(fromProfile: nil) == nil)
+
     // MARK: unreplied detection, the user posted in the middle
     func raw(_ json: String) -> [RawMessage] {
         S.parseMessages((try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:])
@@ -1451,7 +1568,7 @@ func demoSlackSource() async {
                 body = #"{"ok":true,"user_id":"U_ME","team":"Acme","url":"https://acme.slack.com/"}"#
             case "users.info":
                 let id = query.first { $0.0 == "user" }?.1 ?? "U"
-                body = #"{"ok":true,"user":{"real_name":"Name \#(id)","profile":{"display_name":"n\#(id)"}}}"#
+                body = #"{"ok":true,"user":{"real_name":"Name \#(id)","profile":{"display_name":"n\#(id)","image_72":"https://avatars.slack-edge.com/\#(id)_72.png"}}}"#
             case "usergroups.list":
                 body = #"{"ok":true,"usergroups":[{"id":"S1","users":["U_ME"]},{"id":"S9","users":["U_X"]}]}"#
             case "users.conversations":
@@ -1499,15 +1616,27 @@ func demoSlackSource() async {
     assert(paul.allSatisfy { $0.directlyAddressed })
 
     // MessageFacts mapping through the real addressing(): a reply in a thread the user
-    // posted in, under someone else's parent, mentioning them.
+    // posted in, under someone else's parent, mentioning them. The root remains in the
+    // emitted conversation even though unrepliedTail starts after the user's own reply.
     let threadTS = S.slackTS(now.addingTimeInterval(-30 * 60))
     let threadMessages = messages.filter { $0.conversationID == threadTS }
-    assert(threadMessages.count == 1, "one unreplied thread message, got \(threadMessages.count)")
-    assert(threadMessages[0].addressing == [.threadParticipant, .mention],
-           "expected threadParticipant+mention, got \(threadMessages[0].addressing)")
-    assert(threadMessages[0].permalink!.absoluteString.contains("thread_ts=\(threadTS)"))
-    assert(threadMessages[0].channel == "#engineering")
-    assert(threadMessages[0].sender == "nU_AYESHA", "display name resolved via users.info")
+    assert(threadMessages.count == 3, "whole thread page plus unreplied message, got \(threadMessages.count)")
+    assert(threadMessages.contains { $0.text == "deploy thread" }, "the history root is missing")
+    assert(threadMessages.first { $0.text == "deploy thread" }?.isContext == true,
+           "the thread root before the unreplied tail must be context")
+    assert(threadMessages.first { $0.text == "on it" }?.isContext == true,
+           "the reader's earlier reply must be context")
+    assert(threadMessages.first { $0.text == "on it" }?.isFromUser == true,
+           "the reader's own context must be labelled as theirs")
+    let threadReply = threadMessages.first { $0.text.contains("any update") }!
+    assert(!threadReply.isContext, "the unreplied tail is the obligation, not context")
+    assert(threadReply.addressing == [.threadParticipant, .mention],
+           "expected threadParticipant+mention, got \(threadReply.addressing)")
+    assert(threadReply.permalink!.absoluteString.contains("thread_ts=\(threadTS)"))
+    assert(threadReply.channel == "#engineering")
+    assert(threadReply.sender == "nU_AYESHA", "display name resolved via users.info")
+    assert(threadReply.avatarURL?.absoluteString == "https://avatars.slack-edge.com/U_AYESHA_72.png",
+           "image_72 from the same users.info response must reach the emitted SlackMessage, got \(String(describing: threadReply.avatarURL))")
 
     // .replyToMe comes from the parent's author, so check the mapping directly too.
     let underMe = SlackMessageSource.ThreadContext(ts: "111.0001", parentAuthorID: "U_ME", participants: ["U_ME"])
@@ -1524,7 +1653,7 @@ func demoSlackSource() async {
     assert(repliesCalls == 1, "reply_users must gate the replies call, got \(repliesCalls)")
     // Nothing from the settled channel, and nothing from the empty pads.
     assert(!messages.contains { $0.conversationID == "C_SETTLED" }, "the user posted last there")
-    assert(messages.count == 3, "3 unreplied messages across the workspace, got \(messages.count)")
+    assert(messages.count == 5, "thread context adds the root and earlier reply, got \(messages.count)")
     assert(messages == messages.sorted { $0.date > $1.date }, "newest first")
 
     // repliedIDs reuses the scan, costs nothing, and strips the #n suffix.
@@ -1898,6 +2027,8 @@ func demoSlackSource() async {
     /// Everything except search.messages, which each source below answers for itself. This
     /// is the workspace Sereno actually runs on: conversations.history is answered 429 on
     /// the first request of a freshly launched process, so nothing comes from history.
+    let engThreadTS = ts(30)
+    let otherThreadTS = ts(31)
     @Sendable func searchOnlyCall(
         _ method: String,
         _ log: CallLog
@@ -1908,13 +2039,20 @@ func demoSlackSource() async {
         case "users.info": return Data(#"{"ok":true,"user":{"real_name":"Ana","profile":{"display_name":"ana"}}}"#.utf8)
         case "usergroups.list": return Data(#"{"ok":true,"usergroups":[]}"#.utf8)
         case "users.conversations":
-            return Data(#"{"ok":true,"channels":[{"id":"D_PAUL","is_im":true},{"id":"C_ENG","name":"eng"},{"id":"C_SETTLED","name":"design"}]}"#.utf8)
+            return Data(#"{"ok":true,"channels":[{"id":"D_PAUL","is_im":true},{"id":"C_ENG","name":"eng"},{"id":"C_OTHER","name":"other"},{"id":"C_SETTLED","name":"design"}]}"#.utf8)
         case "conversations.history": throw SlackSourceError.rateLimited(retryAfter: 60)
+        case "conversations.replies":
+            return Data("""
+            {"ok":true,"messages":[
+              {"ts":"\(engThreadTS)","user":"U_ME","text":"The deployment plan needs review","thread_ts":"\(engThreadTS)"},
+              {"ts":"\(ts(20))","user":"U_HELPER","text":"Earlier discussion","thread_ts":"\(engThreadTS)"},
+              {"ts":"\(ts(4))","user":"U_DEV","text":"<@U_ME>","thread_ts":"\(engThreadTS)"}
+            ]}
+            """.utf8)
         default: return nil
         }
     }
 
-    let engThreadTS = ts(30)
     @Sendable func searchOnlySource(_ searchLog: CallLog) -> SlackMessageSource {
             SlackMessageSource(call: { method, query in
             if let canned = try await searchOnlyCall(method, searchLog) { return canned }
@@ -1932,8 +2070,12 @@ func demoSlackSource() async {
                 return searchBody(searchMatch(channel: "D_PAUL", ts: ts(5), user: "U_PAUL", text: "<@U_ME> can you review this"))
             }
             if q.hasPrefix("is:thread with:me") {
-                return searchBody(searchMatch(channel: "C_ENG", ts: ts(8), user: "U_DEV",
-                                              text: "any thoughts", threadTS: engThreadTS))
+                return searchBody(
+                    searchMatch(channel: "C_ENG", ts: ts(4), user: "U_DEV",
+                                text: "<@U_ME>", threadTS: engThreadTS),
+                    searchMatch(channel: "C_OTHER", ts: ts(8), user: "U_OTHER",
+                                text: "need help", threadTS: otherThreadTS)
+                )
             }
             if q.hasPrefix("from:me") {
                 // Answered after the C_SETTLED mention above, which settles that conversation.
@@ -1949,17 +2091,28 @@ func demoSlackSource() async {
     let searchRows = try! await searchOnly.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
     let searchHistoryCalls = await searchLog.count(of: "conversations.history")
     assert(searchHistoryCalls >= 1, "history must still be attempted where quota might exist")
-    assert(searchRows.count == 2, "search alone must carry the refresh, got \(searchRows.count)")
-    assert(searchRows.map(\.conversationID) == ["D_PAUL", engThreadTS],
-           "newest first, and a threaded match is keyed by its thread: \(searchRows.map(\.conversationID))")
+    assert(searchRows.count == 5, "the whole search thread page must be added, got \(searchRows.count)")
+    assert(Set(searchRows.map(\.conversationID)) == ["D_PAUL", engThreadTS, otherThreadTS],
+           "threaded matches are keyed by their threads: \(searchRows.map(\.conversationID))")
     // A match whose permalink carried no thread_ts is a plain channel message, never dropped.
-    assert(searchRows[0].addressing.contains(.directMessage) && searchRows[0].addressing.contains(.mention),
-           "the DM kind came from the cached conversation list: \(searchRows[0].addressing)")
-    assert(searchRows[0].sender == "ana" || searchRows[0].sender == "U_PAUL",
+    let searchDM = searchRows.first { $0.conversationID == "D_PAUL" }!
+    assert(searchDM.addressing.contains(.directMessage) && searchDM.addressing.contains(.mention),
+           "the DM kind came from the cached conversation list: \(searchDM.addressing)")
+    assert(searchDM.sender == "ana" || searchDM.sender == "U_PAUL",
            "a name lookup may be skipped for budget but must not invent one")
-    // `with:<self>` is proof of participation, so the one thread fact search can state.
-    assert(searchRows[1].addressing.contains(.threadParticipant), "got \(searchRows[1].addressing)")
-    let searchSettled = try! await searchOnly.repliedIDs(among: ["C_SETTLED", "D_PAUL", engThreadTS])
+    let contextualThread = searchRows.filter { $0.conversationID == engThreadTS }
+    assert(contextualThread.contains { $0.text == "The deployment plan needs review" },
+           "the context-starved reply must bring its root")
+    assert(contextualThread.filter(\.isContext).map(\.text).sorted() ==
+           ["Earlier discussion", "The deployment plan needs review"],
+           "every non-pending row in the fetched thread page must be context")
+    assert(contextualThread.filter { !$0.isContext }.count == 1,
+           "the pending search match must remain the sole obligation")
+    assert(contextualThread.contains { $0.addressing.contains(.threadParticipant) && $0.addressing.contains(.replyToMe) },
+           "the fetched parent and participants must reach addressing: \(contextualThread.map(\.addressing))")
+    let searchRepliesCalls = await searchLog.count(of: "conversations.replies")
+    assert(searchRepliesCalls == 1, "two context-starved threads must cost one replies call, got \(searchRepliesCalls)")
+    let searchSettled = try! await searchOnly.repliedIDs(among: ["C_SETTLED", "D_PAUL", engThreadTS, otherThreadTS])
     assert(searchSettled == ["C_SETTLED"], "from:<self> is the reply detector now, got \(searchSettled)")
     assert(!searchRows.contains { $0.conversationID == "C_SETTLED" },
            "a conversation the user has since answered is not an obligation")
@@ -1974,9 +2127,10 @@ func demoSlackSource() async {
     assert(searchLines == ["kind=mention ok=true total=2 matches=2",
                            "kind=to:self ok=true total=1 matches=1",
                            "selfReference=me confirmed=true",
-                           "kind=thread ok=true total=1 matches=1",
+                           "kind=thread ok=true total=2 matches=2",
                            "kind=from:self ok=true total=1 matches=1",
-                           "candidates=2 answered=1 threadTSPresent=1 threadTSAbsent=2 " +
+                           "threadContext=skipped reason=budget",
+                           "candidates=3 answered=1 threadTSPresent=2 threadTSAbsent=2 " +
                            "settled=1 searchCallsLeft=4"],
            "got \(searchLines)")
     assert(!searchLines.contains { $0.contains("D_PAUL") || $0.contains("C_ENG") || $0.contains("review")
@@ -2006,6 +2160,56 @@ func demoSlackSource() async {
            "both spellings must have been tried: \(altQueries)")
     assert(altQueries.contains { $0.hasPrefix("is:thread with:@me") },
            "the winning spelling must be kept for the rest of the process: \(altQueries)")
+
+    // MARK: search discovery is a bounded lookback, not a sliding watermark
+    // THE BUG THIS PINS: a refresh's `since` (Store's lastScan) advances on every success
+    // whether or not anything was found, so under the old cutoff = max(since, floor) a
+    // workspace with a fast refresh cadence had `since` sitting seconds behind "now" on
+    // every pass, which silently excluded any match older than that instant. Only mention
+    // queries answer here; to:/thread/from: queries return no matches, so a match reaching
+    // the emitted rows can only have come through the cutoff this section pins.
+    @Sendable func mentionOnlySource(matches: [(ts: String, text: String)]) -> SlackMessageSource {
+        SlackMessageSource(call: { method, query in
+            switch method {
+            case "auth.test": return Data(#"{"ok":true,"user_id":"U_ME","url":"https://acme.slack.com/"}"#.utf8)
+            case "users.info": return Data(#"{"ok":true,"user":{"real_name":"","profile":{"display_name":""}}}"#.utf8)
+            case "usergroups.list": return Data(#"{"ok":true,"usergroups":[]}"#.utf8)
+            case "users.conversations": return Data(#"{"ok":true,"channels":[{"id":"C_LOOKBACK","name":"lookback"}]}"#.utf8)
+            case "conversations.history": throw SlackSourceError.rateLimited(retryAfter: 60)
+            case "search.messages":
+                let q = query.first { $0.0 == "query" }?.1 ?? ""
+                guard q.hasPrefix("<@U_ME>") else { return searchBody() }
+                let bodies = matches.map { searchMatch(channel: "C_LOOKBACK", ts: $0.ts, user: "U_OTHER", text: $0.text) }
+                return Data("""
+                {"ok":true,"messages":{"pagination":{"total":\(bodies.count),"page":1,"page_count":1,"per_page":100},
+                 "matches":[\(bodies.joined(separator: ","))]}}
+                """.utf8)
+            default: return Data(#"{"ok":false,"error":"unknown_method"}"#.utf8)
+            }
+        })
+    }
+
+    // A match older than `since` but inside the lookback IS discovered: `since` sits one
+    // second behind "now", exactly what a fast, repeatedly-successful refresh cadence
+    // produces, while connectedAt is far older than the 24h lookback so it never binds.
+    let staleWatermarkConnectedAt = now.addingTimeInterval(-10 * 24 * 60 * 60)
+    let insideLookbackTS = S.slackTS(now.addingTimeInterval(-3 * 60 * 60))
+    let staleWatermarkSource = mentionOnlySource(matches: [(insideLookbackTS, "old but inside the lookback")])
+    await staleWatermarkSource.restoreSlackScanState(SlackScanState(connectedAt: staleWatermarkConnectedAt))
+    let staleWatermarkRows = try! await staleWatermarkSource.unrepliedMessages(since: now.addingTimeInterval(-1))
+    assert(staleWatermarkRows.contains { $0.text == "old but inside the lookback" },
+           "a match older than `since` but inside the lookback must still be discovered, got \(staleWatermarkRows.map(\.text))")
+
+    // A match older than connectedAt is still never discovered, even though it sits well
+    // inside what the 24h lookback alone would allow: connectedAt is the tighter, absolute
+    // floor here (2h ago vs. a 24h lookback), and it must still win.
+    let recentConnectedAt = now.addingTimeInterval(-2 * 60 * 60)
+    let beforeFloorTS = S.slackTS(recentConnectedAt.addingTimeInterval(-10 * 60))
+    let floorGuardedSource = mentionOnlySource(matches: [(beforeFloorTS, "predates connection")])
+    await floorGuardedSource.restoreSlackScanState(SlackScanState(connectedAt: recentConnectedAt))
+    let floorGuardedRows = try! await floorGuardedSource.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    assert(!floorGuardedRows.contains { $0.text == "predates connection" },
+           "a match older than connectedAt must never surface, even inside the lookback")
 
     // MARK: a missing scope is Slack's own vocabulary, so it is logged, and history decides
     let scopeSource = SlackMessageSource(call: { method, _ in

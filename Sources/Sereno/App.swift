@@ -74,7 +74,7 @@ struct SerenoApp: App {
         MenuBarExtra {
             MenuContent(store: store)
         } label: {
-            MenuBarRoot(count: store.todos.filter { !$0.done && !$0.isSnoozed }.count)
+            MenuBarRoot(store: store)
         }
         .menuBarExtraStyle(.window)
         // No .defaultSize here. Apple documents it for WindowGroup, Window, DocumentGroup
@@ -206,6 +206,101 @@ enum Foreground {
         window.level = Preferences.shared.windowAlwaysOnTop ? .floating : .normal
         window.isMovableByWindowBackground = true
         window.styleMask.insert(.resizable)
+    }
+
+    /// Where a popover showing `idealHeight` of content belongs, given where it sits now
+    /// and what the screen allows. Returns nil when it is already the right size.
+    ///
+    /// Pure, and takes the current content height as well as the frame so it never assumes
+    /// the two are equal: `chrome` is whatever the window adds around its content, and the
+    /// frame grows by exactly the amount the content wants. demoPopoverFit checks it.
+    ///
+    /// The TOP edge is the anchor, not the origin. An NSWindow's frame origin is its
+    /// bottom-left, so growing the height in place would push the popover UP through the
+    /// menu bar; a popover hangs downwards from its status item, so maxY is what has to
+    /// stay put.
+    nonisolated static func popoverFrame(current: NSRect, contentHeight: CGFloat,
+                                         idealHeight: CGFloat, visible: NSRect,
+                                         growOnly: Bool = false) -> NSRect? {
+        let top = current.maxY
+        let chrome = current.height - contentHeight
+        // How far down the screen the popover may reach. Beyond this the list scrolls,
+        // which is what the ScrollView is for.
+        let room = top - visible.minY
+        guard room > 0 else { return nil }
+        let height = min(idealHeight + chrome, room)
+        // growOnly is a deliberate safety catch, not a preference: see fitPopover. A
+        // measurement this code cannot verify can only do harm by shrinking, and the
+        // reported symptom is a panel that is too short.
+        if growOnly, height < current.height { return nil }
+        // A point of slack, and it is load-bearing: resizing makes SwiftUI lay the content
+        // out again, which calls back in here, and this is what stops that from looping.
+        guard abs(height - current.height) > 1 else { return nil }
+        return NSRect(x: current.minX, y: top - height, width: current.width, height: height)
+    }
+
+    /// Resize the popover to fit its content. MenuBarExtra frames its window from the
+    /// content once, when it opens, and then never asks again: a to-do arriving while the
+    /// panel was open landed below the fold and the user could not see it. Reported from
+    /// the field as "it keeps the old height so I can not see the new one".
+    ///
+    /// This is the fourth entry in the same family as applyWindowTraits above — a
+    /// scene-level behaviour that does not do what its name implies, fixed by reading the
+    /// real NSWindow. There is no scene modifier for it at all: `.defaultSize` is
+    /// documented for other scene types and silently does nothing on MenuBarExtra (see the
+    /// note in SerenoApp.body), and no SwiftUI expression can make an NSWindow re-measure.
+    ///
+    /// Driven by `fittingSize`, which is the content's own ideal height, so every one of
+    /// the things that changes it — rows, both banners, the role hint, the compose area,
+    /// the undo bar, the snoozed section — is accounted for without this knowing they
+    /// exist. Measured: with the window pinned at 161 and the content grown from one row
+    /// to three, fittingSize reports 233 while the frame is still 161, and it reports 485
+    /// at twelve rows (the list's own 400 cap) and back down to 161 at one, so it tracks
+    /// shrinking as well as growing.
+    ///
+    /// GROW ONLY, deliberately, and this is the second attempt. The first shipped both
+    /// directions and the field report came back "showing the height of 1 card". Measured
+    /// afterwards, the SwiftUI side is NOT at fault: the panel's own ideal height is 161,
+    /// 233 and 485 at one, three and twelve rows, so it does track its rows, and the
+    /// ScrollView's frame modifier does not swallow that. What no headless harness can
+    /// observe is the live popover's `contentView`, which is where both inputs above come
+    /// from. A wrong reading there can only do harm by SHRINKING, and too-short is exactly
+    /// the symptom, so shrinking stays off until the log lines below report the real
+    /// numbers from a running app. Re-enable by dropping growOnly once they do.
+    ///
+    /// ponytail: it fires on every content change, including each frame of a row's insert
+    /// animation, so the panel's height animates along with the row. If that reads as
+    /// jitter, the upgrade path is to coalesce on the next runloop turn rather than to
+    /// start guessing heights.
+    static func fitPopover() {
+        // Same fallback closePopover uses, and for the same reason: if the reference the
+        // content handed over is nil, nothing happens at all and the failure is silent.
+        let target = popover ?? NSApp.windows.first {
+            $0.isVisible && $0.level == .popUpMenu && $0.identifier == nil
+        }
+        let log = Logger(subsystem: "com.rhystart.sereno", category: "popover")
+        guard let window = target, window.isVisible, let content = window.contentView else {
+            log.debug("fitPopover found no popover window, panel keeps the height it has")
+            return
+        }
+        guard let visible = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
+
+        // Numbers and a class name, so all .public: this is geometry, never message
+        // content. These are the two reads no headless harness can observe — the LIVE
+        // popover's contentView — and the field failure is in one of them, so they get
+        // logged rather than guessed at a second time.
+        let ideal = content.fittingSize.height
+        let kind = String(describing: type(of: content))
+        log.debug("fitPopover frame=\(window.frame.height, privacy: .public) content=\(content.frame.height, privacy: .public) ideal=\(ideal, privacy: .public) room=\(window.frame.maxY - visible.minY, privacy: .public) view=\(kind, privacy: .public)")
+
+        guard let frame = popoverFrame(current: window.frame,
+                                       contentHeight: content.frame.height,
+                                       idealHeight: ideal,
+                                       visible: visible,
+                                       growOnly: true)
+        else { return }
+        log.debug("fitPopover grew to \(frame.height, privacy: .public)")
+        window.setFrame(frame, display: true)
     }
 
     /// The live menu bar popover, handed over by the WindowReader the popover's own content
@@ -1082,6 +1177,18 @@ private final class ClickHandler: NSObject, UNUserNotificationCenterDelegate {
         -> UNNotificationPresentationOptions { [.banner, .sound] }
 }
 
+/// What the user is meant to see: open, not snoozed, in list order. The badge, the
+/// header count and the rows all go through this one property, so a count can no longer
+/// disagree with the rows under it. Two copies of this predicate is exactly how the badge
+/// came to show a number over an empty list.
+///
+/// ponytail: this belongs on Store, next to `todos`, in Store.swift. It is declared here
+/// only because Store.swift is owned by another change in flight; move it across when
+/// that lands and delete this extension.
+private extension Store {
+    var visible: [TodoItem] { TodoItem.ranked(todos.filter { !$0.done && !$0.isSnoozed }) }
+}
+
 /// The tray icon, plus the one thing that has to happen without anyone clicking first.
 ///
 /// An accessory app builds nothing of its own at launch: the popover's content is made
@@ -1094,12 +1201,24 @@ private final class ClickHandler: NSObject, UNUserNotificationCenterDelegate {
 /// is re-installed, so `presented` keeps a user who is midway through setup from having
 /// the window yanked to the front under them.
 private struct MenuBarRoot: View {
-    let count: Int
+    let store: Store
     @Environment(\.openWindow) private var openWindow
     @State private var presented = false
 
+    init(store: Store) { self.store = store }
+
+    /// The badge's number, as its own property so a check can call the reader itself
+    /// rather than re-deriving the predicate and proving nothing. See demoVisibleSelector.
+    var badgeCount: Int { store.visible.count }
+
     var body: some View {
-        MenuBarLabel(count: count)
+        // Counted HERE, in a View body, not handed in as an Int from SerenoApp.body.
+        // That was the stale-badge bug: a plain Int across the Scene/View boundary meant
+        // this view read no property of the store, so it established no observation
+        // dependency on `todos` and kept drawing the pre-refresh number after the panel's
+        // list had emptied. Reading an @Observable during body is the whole subscription;
+        // no @State and no @Bindable are needed for it.
+        MenuBarLabel(count: badgeCount)
             .onAppear {
                 guard !presented, !Preferences.shared.hasCompletedOnboarding else { return }
                 presented = true
@@ -1553,8 +1672,10 @@ private struct MenuContent: View {
         _undoShown = State(initialValue: undoShown)
     }
 
-    /// Done and snoozed items are not part of the list, the count, or the badge.
-    private var items: [TodoItem] { TodoItem.ranked(store.todos.filter { !$0.done && !$0.isSnoozed }) }
+    /// Done and snoozed items are not part of the list, the count, or the badge. The
+    /// predicate itself lives in one place (`Store.visible`) and the badge reads the same
+    /// one; nothing here keeps a copy of it.
+    var items: [TodoItem] { store.visible }
 
     /// Gated on `state` alone and not on `hasToken`: hasToken reads the Keychain, and
     /// body runs on every store change and every animation frame. `state` already
@@ -1626,7 +1747,23 @@ private struct MenuContent: View {
                 // Popover branch only. In the window branch this would hand the window
                 // scene's own window to closePopover, which would then order out the window
                 // the button had just opened.
-                .background(WindowReader { Foreground.capture($0) })
+                //
+                // OPEN QUESTION, needs a human with the app running: whether this popover's
+                // window re-measures when the content grows after it is presented. It is
+                // framed from its content, and the panel opens while the list is still
+                // empty because `refreshIfStale` has not returned, so if the frame does not
+                // grow when the rows land, the list absorbs the whole difference (hence the
+                // floor above). This file's own trap list has three cases of a scene-level
+                // behaviour not matching its modifier name where the fix was to read the
+                // real NSWindow — and `Foreground.capture` below already holds this one, so
+                // the lever is here if it turns out the frame is stale.
+                // capture first, fitPopover reads what it stored. updateNSView runs on
+                // every content change, which is exactly when the ideal height can have
+                // moved, so no observer or timer of its own is needed.
+                .background(WindowReader {
+                    Foreground.capture($0)
+                    Foreground.fitPopover()
+                })
         }
     }
 
@@ -1901,7 +2038,24 @@ private struct MenuContent: View {
             .scrollContentBackground(.hidden)
             // The popover caps its own height, the window is resizable and the list is what
             // the extra height is for.
-            .frame(maxHeight: windowed ? .infinity : 400)
+            //
+            // minHeight is a floor, not a size, and it is the reported bug's fix: this
+            // ScrollView is the ONLY compressible thing in the panel, so any height
+            // shortfall lands entirely on it, and measured it goes to exactly 0.0 — a
+            // header counting rows above no rows. Measured with NSHostingView at popover
+            // frames of 135/161/169pt: without the floor the list gets 0.0 as soon as one
+            // error banner shares the panel with the rows; with it, 72.0.
+            //
+            // 72 specifically: it is one section header plus one whole row, and it is the
+            // largest floor that leaves every content ideal untouched (1, 3 and 12 rows,
+            // and every banner combination the code can produce — 161/233/485/283/318/333
+            // before and after). At 76 the 3-row ideal moves to 246, which would pad the
+            // popover with dead space, so do not raise it without re-measuring.
+            //
+            // ponytail: what shortens the popover in the first place is not established
+            // (see the note in `panel`). The floor makes the symptom impossible either way,
+            // which is the part that can be fixed from inside SwiftUI.
+            .frame(minHeight: 72, maxHeight: windowed ? .infinity : 400)
             .animation(.spring(duration: 0.25), value: items.map(\.id))
             .focusable()
             .focusEffectDisabled()
@@ -2148,6 +2302,137 @@ private struct MenuContent: View {
             store.undoLast()
         }
     }
+}
+
+/// The badge and the panel must never compute visibility differently. They are separate
+/// views in separate scenes and each used to carry its own copy of the predicate, which is
+/// how the badge came to sit over an empty list. This calls the two readers' OWN properties
+/// rather than re-deriving the predicate, so it fails the moment either one stops going
+/// through `Store.visible`.
+@MainActor
+func demoVisibleSelector() {
+    let file = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-visible-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = Store(source: MockMessageSource(), fileURL: file)
+
+    let urgent = store.addManual("Ship the release", priority: 1, detail: "")
+    let open = store.addManual("Reply to Marta", priority: 4, detail: "")
+    let finished = store.addManual("Already handled", priority: 2, detail: "")
+    let later = store.addManual("Not yet", priority: 2, detail: "")
+    store.markDone(finished)
+    store.snooze(later, until: Date().addingTimeInterval(3600))
+
+    assert(store.visible.map(\.id) == [urgent.id, open.id],
+           "visible must drop done and snoozed items and rank what is left")
+
+    assert(MenuBarRoot(store: store).badgeCount == MenuContent(store: store).items.count,
+           "the badge and the panel must count the same list")
+    assert(MenuContent(store: store).items.map(\.id) == store.visible.map(\.id),
+           "the panel's rows must be the selector's items, in the selector's order")
+
+    // The badge's read also has to BE an observation dependency, which is precisely what
+    // the plain Int handed across the Scene boundary was not. onChange fires only if
+    // reading badgeCount touched an observed property of the store.
+    // A box, because withObservationTracking's onChange is @Sendable and so cannot
+    // mutate a captured local. Single-threaded here, hence @unchecked.
+    final class Flag: @unchecked Sendable { var hit = false }
+    let observed = Flag()
+    _ = withObservationTracking { MenuBarRoot(store: store).badgeCount } onChange: { observed.hit = true }
+    store.addManual("Something new", priority: 5, detail: "")
+    assert(observed.hit, "reading the badge count must register an observation on the store")
+
+    print("demoVisibleSelector: PASS badge \(MenuBarRoot(store: store).badgeCount)"
+          + " == rows \(MenuContent(store: store).items.count)")
+}
+
+/// The popover's resize arithmetic. The window itself needs a human, but the geometry does
+/// not: what has to hold is that the top edge never moves, that the screen is respected,
+/// that it works in both directions, and that it stops asking once it fits — that last one
+/// is what keeps resizing (which relayouts the content, which calls back in) from looping.
+func demoPopoverFit() {
+    // A 1440x900 screen with the menu bar taken off the top, and a popover hanging under
+    // the status item: 360 wide, 161 tall, its top edge just below the menu bar.
+    let visible = NSRect(x: 0, y: 0, width: 1440, height: 875)
+    let start = NSRect(x: 900, y: 875 - 161, width: 360, height: 161)
+
+    // Grows when a to-do arrives, downwards, keeping the top edge exactly where it was.
+    let grown = Foreground.popoverFrame(current: start, contentHeight: start.height,
+                                        idealHeight: 233, visible: visible)!
+    assert(grown.height == 233, "must take the content's ideal height, got \(grown.height)")
+    assert(grown.maxY == start.maxY, "the top edge must not move, a popover hangs downwards")
+    assert(grown.minX == start.minX && grown.width == start.width, "only the height changes")
+
+    // And shrinks again when the list empties, same anchor.
+    let shrunk = Foreground.popoverFrame(current: grown, contentHeight: grown.height,
+                                         idealHeight: 161, visible: visible)!
+    assert(shrunk.height == 161 && shrunk.maxY == start.maxY,
+           "shrinking must work too, and from the same edge")
+
+    // Already the right size: no frame set, so the relayout it would cause cannot loop.
+    assert(Foreground.popoverFrame(current: grown, contentHeight: grown.height,
+                                   idealHeight: 233, visible: visible) == nil,
+           "a popover that already fits must not be resized")
+    assert(Foreground.popoverFrame(current: grown, contentHeight: grown.height,
+                                   idealHeight: 233.5, visible: visible) == nil,
+           "half a point is not a resize, or every relayout starts another one")
+
+    // Taller than the screen: clamped to what is actually visible, and the list scrolls
+    // the rest. 875 - (875 - 161) = 161pt of room below the top edge... which is the whole
+    // screen below it, so ask for far more than the screen holds.
+    let huge = Foreground.popoverFrame(current: start, contentHeight: start.height,
+                                       idealHeight: 4000, visible: visible)!
+    assert(huge.maxY == start.maxY, "clamping must not move the top edge either")
+    assert(huge.minY >= visible.minY, "must not run off the bottom of the screen")
+    assert(huge.height == start.maxY - visible.minY, "must use exactly the room available")
+
+    // Chrome is whatever the window adds around its content, so the frame grows by what
+    // the CONTENT asked for, not by the ideal read as a frame height.
+    let titled = NSRect(x: 0, y: 700, width: 360, height: 189)
+    let withChrome = Foreground.popoverFrame(current: titled, contentHeight: 161,
+                                             idealHeight: 233, visible: visible)!
+    assert(withChrome.height == 233 + 28, "must carry the 28pt of chrome across, got \(withChrome.height)")
+    assert(withChrome.maxY == titled.maxY, "the top edge is the anchor whatever the chrome")
+
+    // growOnly, the safety catch fitPopover ships with: it must still grow and still
+    // clamp, and must refuse every shrink. That refusal is the whole point — the field
+    // symptom was a panel too SHORT, so an unverifiable measurement must not be allowed
+    // to make it shorter.
+    let grownSafely = Foreground.popoverFrame(current: start, contentHeight: start.height,
+                                              idealHeight: 233, visible: visible, growOnly: true)!
+    assert(grownSafely == grown, "growOnly must not change how growing works")
+    assert(Foreground.popoverFrame(current: grown, contentHeight: grown.height,
+                                   idealHeight: 161, visible: visible, growOnly: true) == nil,
+           "growOnly must refuse to shrink the panel")
+    let clampedSafely = Foreground.popoverFrame(current: start, contentHeight: start.height,
+                                                idealHeight: 4000, visible: visible, growOnly: true)!
+    assert(clampedSafely == huge, "growOnly must still respect the screen")
+
+    print("demoPopoverFit: PASS grow \(start.height)->\(grown.height),"
+          + " shrink ->\(shrunk.height), clamp ->\(huge.height),"
+          + " growOnly refuses shrink")
+}
+
+/// The bands must partition the priority range: exactly one band per priority, never two
+/// and never none. A gap here is a way for the header to count rows the list then files
+/// under no section and never draws, which is one of the shapes the reported bug could
+/// have taken. Checked over a range wider than 1...5 because `effectivePriority` comes
+/// from the model and from a user override, and neither is clamped.
+func demoBands() {
+    for priority in -2...8 {
+        let matches = Band.allCases.filter { $0.contains(priority) }
+        assert(matches.count == 1,
+               "priority \(priority) landed in \(matches.count) bands, must be exactly 1")
+    }
+    let items = (1...5).map {
+        TodoItem(id: "\($0)", action: "Reply", priority: $0, reason: "", detail: "", links: [],
+                 sender: "Sender", channel: nil, date: Date(), permalink: nil)
+    }
+    // The exact grouping `list` does, so a row can never be built and then filed nowhere.
+    let banded = Band.allCases.flatMap { band in items.filter { band.contains($0.effectivePriority) } }
+    assert(banded.map(\.id).sorted() == items.map(\.id).sorted(),
+           "every item must appear under exactly one band")
+    print("demoBands: PASS \(items.count) items over \(Band.allCases.count) bands")
 }
 
 /// Transient, quiet, and gone in six seconds. Removal is one click, so it needs a
@@ -2577,7 +2862,7 @@ private struct TodoRow: View {
     /// is always nil, and a row that goes nowhere should not look clickable.
     @ViewBuilder private var rowBody: some View {
         let content = HStack(alignment: .top, spacing: 9) {
-            if item.isManual { ManualMark() } else { Avatar(name: item.sender) }
+            if item.isManual { ManualMark() } else { Avatar(name: item.sender, avatarURL: item.avatarURL) }
             VStack(alignment: .leading, spacing: 1) {
                 identityLine
                 taskLine
@@ -2956,14 +3241,36 @@ private struct ManualMark: View {
     }
 }
 
-/// Rounded-square initials, colored per sender. The squircle plus a stable
-/// brand color per person is the most recognizable thing Slack does.
+/// Rounded-square initials, colored per sender, or the sender's real Slack photo when one
+/// is known. The squircle plus a stable brand color per person is the most recognizable
+/// thing Slack does, so the photo draws in the same shape and size and the initials are
+/// both the loading state and the failure state, never a blank square.
 private struct Avatar: View {
     let name: String
+    var avatarURL: URL? = nil
 
     var body: some View {
+        if let avatarURL {
+            AsyncImage(url: avatarURL) { phase in
+                if case .success(let image) = phase {
+                    image.resizable()
+                        .scaledToFill()
+                        .frame(width: 30, height: 30)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                } else {
+                    // .empty (still loading) and .failure both read as "no photo yet".
+                    initialsBody
+                }
+            }
+            .frame(width: 30, height: 30)
+        } else {
+            initialsBody
+        }
+    }
+
+    private var initialsBody: some View {
         let palette = Brand.avatars[colorIndex]
-        RoundedRectangle(cornerRadius: 8, style: .continuous)
+        return RoundedRectangle(cornerRadius: 8, style: .continuous)
             .fill(palette.fill)
             .frame(width: 30, height: 30)
             .overlay {

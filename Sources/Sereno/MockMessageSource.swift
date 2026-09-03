@@ -119,8 +119,8 @@ func demoMockSource() async {
     assert(msgs.filter { $0.conversationID == "D_LECOL_ASK" }.count == 2)
     assert(msgs.filter { $0.conversationID == "C_ENG_THREAD" }.count == 3)
 
-    // Addressing is populated, so the signal line and ignoredSignals filtering run for
-    // real instead of only in asserts. The ids demoAutoComplete pins must keep existing.
+    // Addressing is populated for real, not only in asserts. The ids demoAutoComplete
+    // pins must keep existing.
     func signals(_ id: String) -> Set<Addressing> { msgs.first { $0.id == id }!.addressing }
     assert(signals("C_ENG/1001") == [.mention])
     assert(signals("D_TANVIR/1002") == [.directMessage])
@@ -131,14 +131,6 @@ func demoMockSource() async {
            "one channel fixture must stay unaddressed so the not-for-me path is exercised")
     assert(msgs.allSatisfy { $0.channel != nil || $0.addressing.contains(.directMessage) },
            "every DM fixture carries .directMessage")
-
-    // What the model actually sees: broadcast is ignored by default, so that fixture's
-    // signal line is empty, and switching the preference on is what reveals it.
-    assert(Triage.signalLine(for: [msgs.first { $0.id == "C_GENERAL/1017" }!], ignoring: [.broadcast]) == "")
-    assert(Triage.signalLine(for: [msgs.first { $0.id == "C_GENERAL/1017" }!], ignoring: []) == "\nsignals: channel-wide")
-    assert(Triage.signalLine(for: msgs.filter { $0.conversationID == "C_ENG_THREAD" }, ignoring: [.broadcast])
-           == "\nsignals: your thread")
-    assert(Triage.signalLine(for: [msgs.first { $0.id == "C_ENG/1006" }!], ignoring: []) == "")
     print("demoMockSource: PASS (\(msgs.count) messages)")
 }
 
