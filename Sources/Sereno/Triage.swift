@@ -252,10 +252,29 @@ enum Triage {
     /// Measuring hazard, not a prompt rule: the fixture "can you send the tax numbers
     /// before 5pm today?" tripped Apple's guardrail 3 of 3 (guardrailViolation, which
     /// silently falls back and measures nothing). Same class as "by end of day".
+    static let categoryRubric = """
+    category, the one label that fits what the messages ask:
+    fyi they only pass on news, a state, an outcome, or a fault, and ask nothing of you.
+    social they chat, joke, grumble, or invite, and any reply is optional.
+    directRequest no time today is stated, and they ask you personally for work.
+    deadlineToday they state a time today, or within the hour, when you must act.
+    blocked they say work has stopped and ask you for urgent help now.
+    Category follows what is asked of you, never who asked. A fault only reported is fyi or social.
+    """
+
+    static func modelCurrentTimeLine(_ currentTime: String) -> String {
+        "Current local time: \(currentTime)"
+    }
+
+    static func modelRoleLine(_ role: String) -> String {
+        role.isEmpty ? "" : "\nAbout the person reading this: \(role)"
+    }
+
     static func stageOnePrompt(messages: String, currentTime: String, role: String) -> String {
-        let roleLine = role.isEmpty ? "" : "\nAbout the person reading this: \(role)"
+        let currentTimeLine = modelCurrentTimeLine(currentTime)
+        let roleLine = modelRoleLine(role)
         return """
-        Current local time: \(currentTime)
+        \(currentTimeLine)
         Messages, oldest first:
         \(messages)
 
@@ -265,13 +284,7 @@ enum Triage {
         topic: a 2 to 6 word noun phrase from the messages, never empty, never just the verb, never the whole message pasted, identifiers exactly as written, no sender name. Never state the user's answer, opinion, or commitment.
         yours: yes only when the messages ask the person reading this personally to act; otherwise no.
 
-        category, the one label that fits what the messages ask:
-        fyi they only pass on news, a state, an outcome, or a fault, and ask nothing of you.
-        social they chat, joke, grumble, or invite, and any reply is optional.
-        directRequest no time today is stated, and they ask you personally for work.
-        deadlineToday they state a time today, or within the hour, when you must act.
-        blocked they say work has stopped and ask you for urgent help now.
-        Category follows what is asked of you, never who asked. A fault only reported is fyi or social.
+        \(categoryRubric)
         """
     }
 
@@ -303,6 +316,8 @@ enum Triage {
         if let remoteSource, let config = context.remoteConfig {
             remoteFields = await remoteClient.fields(
                 conversationText: messages,
+                currentTime: currentTime,
+                role: context.role,
                 config: config,
                 apiKey: context.remoteAPIKey
             )
@@ -1397,8 +1412,30 @@ enum Triage {
         let noRole = stageOnePrompt(messages: "sender: Sam\ntext: please look", currentTime: promptNow, role: "")
         let withRole = stageOnePrompt(messages: "sender: Sam\ntext: please look", currentTime: promptNow,
                                       role: "backend engineer, I own deployments")
+        let remoteNoRole = RemoteModel.prompt(
+            conversationText: "sender: Sam\ntext: please look",
+            currentTime: promptNow,
+            role: ""
+        )
+        let remoteWithRole = RemoteModel.prompt(
+            conversationText: "sender: Sam\ntext: please look",
+            currentTime: promptNow,
+            role: "backend engineer, I own deployments"
+        )
+        assert(noRole.contains(categoryRubric), "the on-device prompt must use the shared category rubric")
+        assert(remoteNoRole.system.contains(categoryRubric), "the remote prompt must use the shared category rubric")
+        assert(remoteNoRole.system.contains("one JSON object only") &&
+               remoteNoRole.system.contains("no prose, no markdown fences, no extra keys"))
+        for key in ["verb", "topic", "reason", "yours", "category"] {
+            assert(remoteNoRole.system.contains("\"\(key)\""), "the remote JSON contract must require \(key)")
+        }
         assert(!noRole.contains("About the person"), "no role means no role line")
+        assert(!remoteNoRole.user.contains("About the person"), "no role means no remote role line")
         assert(withRole.contains(roleLine + "\n"))
+        assert(remoteWithRole.user.contains(roleLine + "\n"))
+        let currentTimeLine = modelCurrentTimeLine(promptNow)
+        assert(noRole.contains(currentTimeLine) && remoteNoRole.user.contains(currentTimeLine),
+               "both prompts must receive the same current-time line")
         assert(withRole.count == noRole.count + roleLine.count, "the role line is the only addition")
         // 1162 -> 1198: the widened blocked line put a joke about a broken thing at 1, so
         // blocked now leads with the ask and fyi/social claim a fault that is only reported.
