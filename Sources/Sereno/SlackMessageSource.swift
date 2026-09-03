@@ -221,6 +221,8 @@ actor SlackMessageSource: SlackScanStateSource {
     }
 
     private func get(_ method: String, _ query: [(String, String)] = []) async throws -> [String: Any] {
+        let conversationID = query.first(where: { $0.0 == "channel" })?.1 ?? "none"
+        log.debug("request method=\(method, privacy: .public) conversation=\(conversationID, privacy: .public) callsLeft=\(self.budget, privacy: .public)")
         let data = try await call(method, query)
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw SlackSourceError.badResponse
@@ -236,6 +238,7 @@ actor SlackMessageSource: SlackScanStateSource {
         // keep the old identity: addressing detection would then answer for the wrong human.
         if let identity,
            !observesStoredAccount || Self.storedUserID().map({ $0 == identity.userID }) ?? true {
+            log.info("identity cache user=\(identity.userID, privacy: .public)")
             return identity
         }
         if let identityTask { return try await identityTask.value }
@@ -272,7 +275,7 @@ actor SlackMessageSource: SlackScanStateSource {
             // role is deliberately left empty: Triage fills it from Preferences.
             let built = Identity(userID: userID, displayName: display, realName: real, userGroupIDs: groups)
             identity = built
-            log.info("identity resolved user=\(userID, privacy: .public) groups=\(groups.count, privacy: .public)")
+            log.info("identity auth.test user=\(userID, privacy: .public) groups=\(groups.count, privacy: .public)")
             return built
         }
         identityTask = task
@@ -342,6 +345,7 @@ actor SlackMessageSource: SlackScanStateSource {
     func unrepliedMessages(since: Date) async throws -> [SlackMessage] {
         budget = totalBudget
         synchronizeStoredAccount()
+        log.info("refresh start budget=\(self.budget, privacy: .public) cachedConversations=\(self.conversations.count, privacy: .public)")
         if scanState.connectedAt == nil { scanState.connectedAt = Date() }
         settled = Set(scanState.conversations.compactMap { $0.value.settled ? $0.key : nil })
         defer { refreshCount += 1 }
@@ -720,6 +724,9 @@ actor SlackMessageSource: SlackScanStateSource {
         // stored: the Keychain is the only copy.
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
+        var lastRateLimitStatus = 429
+        var lastRetryAfterSeconds: Int64?
+        var lastRateLimitAttempt = 0
         for attempt in 0..<4 {
             let data: Data
             let response: URLResponse
@@ -731,7 +738,18 @@ actor SlackMessageSource: SlackScanStateSource {
             guard let http = response as? HTTPURLResponse else { return data }
 
             if let wait = retryAfter(http) {
-                guard attempt < 2, wait <= maxRetryWait else { throw SlackSourceError.rateLimited }
+                let waitSeconds = wait.components.seconds
+                lastRateLimitStatus = http.statusCode
+                lastRetryAfterSeconds = waitSeconds
+                lastRateLimitAttempt = attempt
+                if wait > maxRetryWait {
+                    log.error("rate limit gave up method=\(method, privacy: .public) status=\(http.statusCode, privacy: .public) retryAfter=\(waitSeconds, privacy: .public)s attempt=\(attempt, privacy: .public) reason=waitExceedsMaxRetryWait")
+                    throw SlackSourceError.rateLimited
+                }
+                if attempt >= 2 {
+                    log.error("rate limit gave up method=\(method, privacy: .public) status=\(http.statusCode, privacy: .public) retryAfter=\(waitSeconds, privacy: .public)s attempt=\(attempt, privacy: .public) reason=attemptsRanOut")
+                    throw SlackSourceError.rateLimited
+                }
                 log.info("rate limited method=\(method, privacy: .public) waiting=\(wait.components.seconds, privacy: .public)s")
                 try await Task.sleep(for: wait)
                 continue
@@ -745,10 +763,15 @@ actor SlackMessageSource: SlackScanStateSource {
             }
             // Any other 4xx is a request this app got wrong. Retrying repeats the mistake.
             guard (200..<300).contains(http.statusCode) else {
+                if http.statusCode != 429 && http.statusCode < 500 {
+                    log.error("unexpected response method=\(method, privacy: .public) status=\(http.statusCode, privacy: .public)")
+                }
                 throw SlackSourceError.slack("http_\(http.statusCode)")
             }
             return data
         }
+        let retryAfter = lastRetryAfterSeconds.map(String.init) ?? "none"
+        log.error("rate limit gave up method=\(method, privacy: .public) status=\(lastRateLimitStatus, privacy: .public) retryAfter=\(retryAfter, privacy: .public) attempt=\(lastRateLimitAttempt, privacy: .public) reason=attemptsRanOut")
         throw SlackSourceError.rateLimited
     }
 
