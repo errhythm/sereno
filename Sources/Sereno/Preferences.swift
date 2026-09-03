@@ -31,6 +31,7 @@ final class Preferences {
         weatherLatitude = store.object(forKey: Key.weatherLatitude) as? Double
         weatherLongitude = store.object(forKey: Key.weatherLongitude) as? Double
         roleHintDismissed = store.object(forKey: Key.roleHintDismissed) as? Bool ?? false
+        hasCompletedOnboarding = store.object(forKey: Key.hasCompletedOnboarding) as? Bool ?? false
     }
 
     /// What the user does, in their own words. Passed to the model so it can judge whether
@@ -112,6 +113,10 @@ final class Preferences {
     /// never comes back. Not surfaced in Settings: it is bookkeeping, not a preference.
     var roleHintDismissed: Bool { didSet { store.set(roleHintDismissed, forKey: Key.roleHintDismissed) } }
 
+    /// Separates a fresh install from a user who has already dismissed setup, because an
+    /// accessory app has no ordinary launch window where first-run guidance can live.
+    var hasCompletedOnboarding: Bool { didSet { store.set(hasCompletedOnboarding, forKey: Key.hasCompletedOnboarding) } }
+
     /// True only when the user opted in AND we have somewhere to ask about.
     var canFetchWeather: Bool {
         weatherEnabled && weatherLatitude != nil && weatherLongitude != nil
@@ -124,6 +129,30 @@ final class Preferences {
         if !countBroadcast { ignored.insert(.broadcast) }
         if !countNameMentions { ignored.insert(.nameMentioned) }
         return ignored
+    }
+
+    /// Restores in-memory defaults while also removing their stored values, so a reset
+    /// leaves no old preference behind for a later launch to recover.
+    func resetAll() {
+        Key.all.forEach(store.removeObject)
+        role = ""
+        storedRefreshMinutes = 5
+        notifyNewItems = true
+        notifySnoozeWake = true
+        countBroadcast = false
+        countNameMentions = true
+        storedSnoozeHours = 3
+        storedMorningHour = 9
+        windowAlwaysOnTop = true
+        weatherEnabled = false
+        weatherCity = ""
+        weatherLatitude = nil
+        weatherLongitude = nil
+        roleHintDismissed = false
+        hasCompletedOnboarding = false
+        // The assignments above run didSet and write defaults back, so this second sweep
+        // is what leaves the UserDefaults domain clean after a reset.
+        Key.all.forEach(store.removeObject)
     }
 
     private enum Key {
@@ -141,6 +170,13 @@ final class Preferences {
         static let weatherLatitude = "weatherLatitude"
         static let weatherLongitude = "weatherLongitude"
         static let roleHintDismissed = "roleHintDismissed"
+        static let hasCompletedOnboarding = "hasCompletedOnboarding"
+
+        static let all = [
+            role, refreshMinutes, notifyNewItems, notifySnoozeWake, countBroadcast,
+            countNameMentions, snoozeHours, morningHour, windowAlwaysOnTop, weatherEnabled,
+            weatherCity, weatherLatitude, weatherLongitude, roleHintDismissed, hasCompletedOnboarding
+        ]
     }
 }
 
@@ -157,6 +193,7 @@ func demoPreferences() {
     assert(!prefs.countBroadcast, "@channel must not create tasks by default")
     assert(prefs.countNameMentions)
     assert(!prefs.roleHintDismissed, "the role hint should show until dismissed")
+    assert(!prefs.hasCompletedOnboarding, "onboarding should begin incomplete")
     assert(prefs.ignoredSignals == [.broadcast])
 
     // Clamping, so a bad value cannot wedge the refresh timer.
@@ -170,9 +207,11 @@ func demoPreferences() {
     // Round trip through UserDefaults.
     prefs.role = "backend engineer, I own deployments"
     prefs.countNameMentions = false
+    prefs.hasCompletedOnboarding = true
     let reloaded = Preferences(store: suite)
     assert(reloaded.role == "backend engineer, I own deployments")
     assert(!reloaded.countNameMentions)
+    assert(reloaded.hasCompletedOnboarding)
     assert(reloaded.ignoredSignals == [.broadcast, .nameMentioned])
 
     assert(prefs.windowAlwaysOnTop, "the window should float by default")
@@ -192,6 +231,21 @@ func demoPreferences() {
     assert(prefs.canFetchWeather)
     let back = Preferences(store: suite)
     assert(back.weatherCity == "Dhaka" && back.canFetchWeather)
+
+    prefs.snoozeHours = 99
+    prefs.morningHour = 30
+    prefs.resetAll()
+    assert(prefs.role.isEmpty && prefs.refreshMinutes == 5 && prefs.notifyNewItems && prefs.notifySnoozeWake)
+    assert(!prefs.countBroadcast && prefs.countNameMentions && prefs.snoozeHours == 3 && prefs.morningHour == 9)
+    assert(prefs.windowAlwaysOnTop && !prefs.weatherEnabled && prefs.weatherCity.isEmpty)
+    assert(prefs.weatherLatitude == nil && prefs.weatherLongitude == nil && !prefs.roleHintDismissed)
+    assert(!prefs.hasCompletedOnboarding && prefs.ignoredSignals == [.broadcast])
+    let reset = Preferences(store: suite)
+    assert(reset.role.isEmpty && reset.refreshMinutes == 5 && reset.notifyNewItems && reset.notifySnoozeWake)
+    assert(!reset.countBroadcast && reset.countNameMentions && reset.snoozeHours == 3 && reset.morningHour == 9)
+    assert(reset.windowAlwaysOnTop && !reset.weatherEnabled && reset.weatherCity.isEmpty)
+    assert(reset.weatherLatitude == nil && reset.weatherLongitude == nil && !reset.roleHintDismissed)
+    assert(!reset.hasCompletedOnboarding && reset.ignoredSignals == [.broadcast])
 
     print("demoPreferences: PASS")
 }

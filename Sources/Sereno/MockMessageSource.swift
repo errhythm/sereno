@@ -41,7 +41,7 @@ struct MockMessageSource: MessageSource {
             SlackMessage(id: "C_ENG/1006", conversationID: "C_ENG/1006", sender: "Karim", channel: "#engineering",
                 text: "the staging build is green now, fyi", date: ago(200),
                 directlyAddressed: false, addressing: [], permalink: nil),
-            SlackMessage(id: "C_ENG/1007", conversationID: "C_ENG/1007", sender: "Priya", channel: "#engineering",
+            SlackMessage(id: "C_ENG/1007", conversationID: "C_ENG/1007", sender: "Sarah", channel: "#engineering",
                 text: "Please review MR !41 before we merge: https://gitlab.com/gitlab-org/gitlab/-/merge_requests/41",
                 date: ago(240), directlyAddressed: true, addressing: [.mention], permalink: nil),
             SlackMessage(id: "C_PRODUCT/1008", conversationID: "C_PRODUCT/1008", sender: "Omar", channel: "#product",

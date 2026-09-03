@@ -18,6 +18,11 @@ private extension View {
 /// Window menu command.
 let serenoWindowID = "sereno-panel"
 
+/// First run's scene id. A window of its own rather than a sheet over the panel, because
+/// the panel is a popover most of the time and a popover that closes when the browser
+/// takes focus would drop the user halfway through signing in.
+let onboardingWindowID = "sereno-onboarding"
+
 /// The wordmark's font, shipped in the app rather than assumed to be installed.
 ///
 /// Deliberately not `Bundle.module`: its generated accessor calls `fatalError` when the
@@ -69,7 +74,7 @@ struct SerenoApp: App {
         MenuBarExtra {
             MenuContent(store: store)
         } label: {
-            MenuBarLabel(count: store.todos.filter { !$0.done && !$0.isSnoozed }.count)
+            MenuBarRoot(count: store.todos.filter { !$0.done && !$0.isSnoozed }.count)
         }
         .menuBarExtraStyle(.window)
         // No .defaultSize here. Apple documents it for WindowGroup, Window, DocumentGroup
@@ -98,9 +103,23 @@ struct SerenoApp: App {
             CommandGroup(after: .newItem) { OpenWindowItem() }
         }
 
+        // First run, shown until it is finished or skipped. Given an ordinary title bar,
+        // unlike the panel, so it can be moved and closed the way any other window is.
+        //
+        // .windowResizability(.contentSize) is here for the size it proposes, not for the
+        // style mask: measured on this SDK it leaves a `.plain` window with no .resizable
+        // at all, which is exactly what a three-step window at a fixed frame wants, so
+        // nothing here depends on which of the two it actually does.
+        Window("Welcome to Sereno", id: onboardingWindowID) {
+            Onboarding()
+                .windowFullScreenBehavior(.disabled)
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+
         // A real Preferences window, and Cmd+, comes with it.
         Settings {
-            SettingsForm()
+            SettingsView(store: store)
         }
     }
 }
@@ -133,7 +152,7 @@ enum Foreground {
     /// here. It is not a window anyone opened, so it must neither be ordered around nor
     /// hold the app in .regular.
     static let settingsID = "com_apple_SwiftUI_Settings_window"
-    private static let managed: Set<String> = [settingsID, serenoWindowID]
+    private static let managed: Set<String> = [settingsID, serenoWindowID, onboardingWindowID]
 
     static var windows: [NSWindow] {
         NSApp.windows.filter { $0.isVisible && managed.contains($0.identifier?.rawValue ?? "") }
@@ -305,33 +324,76 @@ private func hourLabel(_ hour: Int) -> String {
     return base.formatted(.dateTime.hour())
 }
 
-/// One pane. There are eight settings, which is not a tab bar's worth.
+/// Settings, as tabs. It was one pane carrying nine sections at a fixed 460x620, so the
+/// weather controls and the shortcut list sat below the fold of a window that gives no
+/// sign it scrolls. Five panes, each short enough to be read without moving anything.
+///
+/// The panes are separate views rather than properties of one, because a Settings TabView
+/// takes its height from the pane on screen and a pane can only state its own size if it
+/// is its own view.
 @MainActor
-private struct SettingsForm: View {
+private struct SettingsView: View {
+    let store: Store
+
+    /// Persisted, so Settings reopens on the pane it was left on, and so a deep link has
+    /// something to write. The key is the one Apple documents for this.
+    @AppStorage("selectedSettingsTab") private var tab: SettingsTab = .general
+
+    var body: some View {
+        TabView(selection: $tab) {
+            Tab("General", systemImage: "gearshape", value: SettingsTab.general) {
+                GeneralPane()
+            }
+            Tab("Slack", systemImage: "link", value: SettingsTab.slack) {
+                SlackPane()
+            }
+            Tab("Notifications", systemImage: "bell", value: SettingsTab.notifications) {
+                NotificationsPane()
+            }
+            Tab("Appearance", systemImage: "cloud.sun", value: SettingsTab.appearance) {
+                AppearancePane()
+            }
+            Tab("About", systemImage: "info.circle", value: SettingsTab.about) {
+                AboutPane(store: store)
+            }
+        }
+    }
+}
+
+/// String raw values, not the case order, because this is written to UserDefaults and
+/// inserting a tab later must not land an existing user on a different one.
+private enum SettingsTab: String {
+    case general, slack, notifications, appearance, about
+}
+
+/// The shape every pane shares. The width is fixed so the tab bar does not jump as the
+/// selection moves; the height is left to the content, which is the whole point of
+/// splitting the form up.
+private struct Pane<Content: View>: View {
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) { self.content = content() }
+
+    var body: some View {
+        Form { content }
+            .formStyle(.grouped)
+            .frame(width: 460)
+    }
+}
+
+/// What the app does for this particular user, and how often it does it.
+@MainActor
+private struct GeneralPane: View {
     @Bindable private var prefs = Preferences.shared
-    /// Not @Bindable and not @State: an @Observable read during body is tracked either way,
-    /// and this one is a shared controller the whole app signs in through, not view state.
-    private let slack = SlackAuth.shared
-    @State private var resolving = false
-    /// What the last Resolve did, in one line. Success names the place Open-Meteo picked,
-    /// which is the only way to tell the right Springfield from the wrong one.
-    @State private var resolveNote: String?
 
     /// The stored value is always in the list, so a value set outside these choices
     /// (or clamped to 240) shows itself instead of leaving the picker blank.
-    private var refreshChoices: [Int] { Array(Set([1, 5, 15, 30, 60, prefs.refreshMinutes])).sorted() }
-    private var morningChoices: [Int] { Array(Set(Array(5...11) + [prefs.morningHour])).sorted() }
+    private var refreshChoices: [Int] {
+        Array(Set([1, 5, 15, 30, 60, prefs.refreshMinutes])).sorted()
+    }
 
     var body: some View {
-        Form {
-            Section {
-                slackControls
-            } header: {
-                Text("Slack")
-            } footer: {
-                Text("Connecting grants Sereno read-only access to the messages you can already see. The token is kept in your Keychain, never in a file or a preference, and nothing is sent anywhere except Slack itself.")
-            }
-
+        Pane {
             Section {
                 TextField("Your role", text: $prefs.role,
                           prompt: Text("backend engineer, I own deployments and the public API"),
@@ -354,6 +416,35 @@ private struct SettingsForm: View {
             }
 
             Section {
+                Toggle("Keep window above other apps", isOn: $prefs.windowAlwaysOnTop)
+            } header: {
+                Text("Window")
+            } footer: {
+                Text("Off lets other windows cover it, the way an ordinary window behaves. Takes effect straight away, on an open window too.")
+            }
+        }
+    }
+}
+
+/// The account, and which of its signals are allowed to create work.
+@MainActor
+private struct SlackPane: View {
+    @Bindable private var prefs = Preferences.shared
+    /// Not @Bindable and not @State: an @Observable read during body is tracked either way,
+    /// and this one is a shared controller the whole app signs in through, not view state.
+    private let slack = SlackAuth.shared
+
+    var body: some View {
+        Pane {
+            Section {
+                slackControls
+            } header: {
+                Text("Slack")
+            } footer: {
+                Text("Connecting grants Sereno read-only access to the messages you can already see. The token is kept in your Keychain, never in a file or a preference, and nothing is sent anywhere except Slack itself.")
+            }
+
+            Section {
                 Toggle("My name in the text", isOn: $prefs.countNameMentions)
                 Toggle("@channel and @here", isOn: $prefs.countBroadcast)
             } header: {
@@ -361,63 +452,7 @@ private struct SettingsForm: View {
             } footer: {
                 Text("Name matching goes wrong when your name is also an ordinary word. A broadcast is addressed to a room, not to you, which is why it is off. DMs, @mentions, replies to you and replies in your threads always count and cannot be switched off.")
             }
-
-            Section {
-                Stepper(value: $prefs.snoozeHours, in: 1...23) {
-                    Text("Snooze for \(plural(prefs.snoozeHours, "hour"))")
-                }
-                Picker("Tomorrow morning is", selection: $prefs.morningHour) {
-                    ForEach(morningChoices, id: \.self) { Text(hourLabel($0)).tag($0) }
-                }
-            } header: {
-                Text("Snooze")
-            } footer: {
-                Text("Both of these name the panel's Snooze menu.")
-            }
-
-            Section {
-                Toggle("New to-dos", isOn: $prefs.notifyNewItems)
-                Toggle("Snooze running out", isOn: $prefs.notifySnoozeWake)
-            } header: {
-                Text("Notifications")
-            } footer: {
-                Text("New to-dos are batched into one notification per check, not one per item.")
-            }
-
-            Section {
-                Toggle("Keep window above other apps", isOn: $prefs.windowAlwaysOnTop)
-            } header: {
-                Text("Window")
-            } footer: {
-                Text("Off lets other windows cover it, the way an ordinary window behaves. Takes effect straight away, on an open window too.")
-            }
-
-            Section {
-                Toggle("Sky follows the weather", isOn: $prefs.weatherEnabled)
-                HStack {
-                    TextField("City", text: $prefs.weatherCity, prompt: Text("Dhaka"))
-                        .onSubmit(resolve)
-                    Button(resolving ? "Looking up" : "Look up", action: resolve)
-                        .disabled(resolving || city.isEmpty)
-                }
-                if let resolveNote {
-                    Text(resolveNote)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("Weather")
-            } footer: {
-                Text("Off by default. With it on, the header sky shows rain, snow, fog, cloud or a storm instead of only the time of day. Looking up a city sends that city name to Open-Meteo, and each check afterwards sends its coordinates, at most once every 25 minutes. Nothing about your Slack ever leaves this machine, and if the lookup fails the sky just follows the clock.")
-            }
-
-            Section("Sereno") {
-                LabeledContent("Open the panel from anywhere", value: "⌘⇧T")
-                LabeledContent("Open Sereno in its own window", value: "⌘⇧O")
-            }
         }
-        .formStyle(.grouped)
-        .frame(width: 460, height: 620)
     }
 
     /// Three shapes, one per state. Nothing to configure: the client_id is compiled in, so
@@ -457,6 +492,75 @@ private struct SettingsForm: View {
             }
         }
     }
+}
+
+/// What interrupts you, and what happens to an item you push away. Snooze lives here
+/// rather than under General because both of its settings are about a later interruption.
+@MainActor
+private struct NotificationsPane: View {
+    @Bindable private var prefs = Preferences.shared
+
+    private var morningChoices: [Int] { Array(Set(Array(5...11) + [prefs.morningHour])).sorted() }
+
+    var body: some View {
+        Pane {
+            Section {
+                Toggle("New to-dos", isOn: $prefs.notifyNewItems)
+                Toggle("Snooze running out", isOn: $prefs.notifySnoozeWake)
+            } header: {
+                Text("Notifications")
+            } footer: {
+                Text("New to-dos are batched into one notification per check, not one per item.")
+            }
+
+            Section {
+                Stepper(value: $prefs.snoozeHours, in: 1...23) {
+                    Text("Snooze for \(plural(prefs.snoozeHours, "hour"))")
+                }
+                Picker("Tomorrow morning is", selection: $prefs.morningHour) {
+                    ForEach(morningChoices, id: \.self) { Text(hourLabel($0)).tag($0) }
+                }
+            } header: {
+                Text("Snooze")
+            } footer: {
+                Text("Both of these name the panel's Snooze menu.")
+            }
+        }
+    }
+}
+
+/// The header sky is the only thing in the app with a look to configure, so this pane is
+/// one section and is meant to stay that way.
+@MainActor
+private struct AppearancePane: View {
+    @Bindable private var prefs = Preferences.shared
+    @State private var resolving = false
+    /// What the last Resolve did, in one line. Success names the place Open-Meteo picked,
+    /// which is the only way to tell the right Springfield from the wrong one.
+    @State private var resolveNote: String?
+
+    var body: some View {
+        Pane {
+            Section {
+                Toggle("Sky follows the weather", isOn: $prefs.weatherEnabled)
+                HStack {
+                    TextField("City", text: $prefs.weatherCity, prompt: Text("Dhaka"))
+                        .onSubmit(resolve)
+                    Button(resolving ? "Looking up" : "Look up", action: resolve)
+                        .disabled(resolving || city.isEmpty)
+                }
+                if let resolveNote {
+                    Text(resolveNote)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Weather")
+            } footer: {
+                Text("Off by default. With it on, the header sky shows rain, snow, fog, cloud or a storm instead of only the time of day. Looking up a city sends that city name to Open-Meteo, and each check afterwards sends its coordinates, at most once every 25 minutes. Nothing about your Slack ever leaves this machine, and if the lookup fails the sky just follows the clock.")
+            }
+        }
+    }
 
     private var city: String { prefs.weatherCity.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -485,6 +589,255 @@ private struct SettingsForm: View {
             }
             resolving = false
         }
+    }
+}
+
+/// The shortcuts, and the two ways back to a clean slate.
+@MainActor
+private struct AboutPane: View {
+    let store: Store
+    @Environment(\.openWindow) private var openWindow
+    @State private var confirmingReset = false
+
+    var body: some View {
+        Pane {
+            Section("Keyboard shortcuts") {
+                LabeledContent("Open the panel from anywhere", value: "⌘⇧T")
+                LabeledContent("Open Sereno in its own window", value: "⌘⇧O")
+            }
+
+            Section {
+                Button("Show onboarding again", action: showOnboarding)
+                    .pointerCursor()
+                Button("Reset Sereno", role: .destructive) { confirmingReset = true }
+                    .pointerCursor()
+            } header: {
+                Text("Reset")
+            } footer: {
+                Text("Showing onboarding again costs nothing, it only reopens the first-run window. Resetting is the other thing entirely, so it asks first.")
+            }
+        }
+        .confirmationDialog("Reset Sereno?", isPresented: $confirmingReset) {
+            Button("Reset Sereno", role: .destructive, action: reset)
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Every to-do Sereno has collected is deleted, every setting goes back to its default, and the Slack token is removed from your Keychain. Nothing in Slack itself changes. This cannot be undone.")
+        }
+    }
+
+    /// Clearing the flag is not enough on its own. Nothing watches it after launch, and a
+    /// user asking to see onboarding again means now, not at the next launch.
+    private func showOnboarding() {
+        Preferences.shared.hasCompletedOnboarding = false
+        Foreground.present(onboardingWindowID) { openWindow(id: onboardingWindowID) }
+    }
+
+    /// Preferences.resetAll already clears hasCompletedOnboarding, so the call below is
+    /// only about putting the window on screen rather than about the flag.
+    private func reset() {
+        store.resetAll()
+        Preferences.shared.resetAll()
+        // A completed browser round trip must not put a fresh token back after reset.
+        SlackAuth.shared.cancelConnect()
+        SlackAuth.shared.disconnect()
+        showOnboarding()
+    }
+}
+
+/// First run. There was none: the app has no Dock icon and opens no window, so everything
+/// it needs to be told lived behind a gear in a popover the user had to find first, and a
+/// fresh install showed a menu bar count over a list with no account attached to it.
+///
+/// Three steps, and every one of them can be walked out of. Both of the things it asks for
+/// work just as well later from Settings, so neither is allowed to become a wall.
+@MainActor
+private struct Onboarding: View {
+    @Bindable private var prefs = Preferences.shared
+    /// Not @Bindable and not @State, for the reason SlackPane gives: this is the shared
+    /// controller the whole app signs in through, and reading `state` here is what makes
+    /// the second step change under the user the moment the browser hands the token back.
+    private let slack = SlackAuth.shared
+    @State private var step: Step = .what
+    @Environment(\.dismiss) private var dismiss
+
+    /// The sky at the hour the window opened, fixed rather than driven by a timeline. The
+    /// header that follows the clock is the panel's, and this window is up for a minute.
+    private let phase = SkyPhase.at(Date())
+
+    /// Raw values so Back and Continue are arithmetic rather than a switch that has to be
+    /// edited in two places when a step is added.
+    private enum Step: Int, CaseIterable { case what, connect, role }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            banner
+            stepContent
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+            Spacer(minLength: 12)
+            Divider()
+            controls
+        }
+        // Fixed, and sized for the longest step, so the window does not resize under the
+        // pointer every time Continue is pressed.
+        .frame(width: 480, height: 462)
+    }
+
+    private var banner: some View {
+        ZStack {
+            phase.gradient
+            Sky(phase: phase)
+            Text("Sereno")
+                .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 21))
+                .foregroundStyle(phase.ink)
+        }
+        .frame(height: 92)
+    }
+
+    /// Each step is a heading, prose, and at most one control. Anything more would be
+    /// Settings, which is one Cmd+comma away for the rest of the app's life.
+    @ViewBuilder private var stepContent: some View {
+        switch step {
+        case .what: whatStep
+        case .connect: connectStep
+        case .role: roleStep
+        }
+    }
+
+    private var whatStep: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("What Sereno does").font(.headline)
+            Text("It reads the conversations you are already in, works out which messages are actually waiting on a reply from you, and ranks them. The list lives in your menu bar.")
+            Text("Sereno is a Slack helper, not a Slack alternative. Clicking a to-do opens that message in Slack. There is no replying from here and no drafted replies. Slack keeps the conversation.")
+            Text("The ranking runs on Apple's on-device model. There is no Sereno server, and nothing about your messages leaves this Mac.")
+            Text("Named after the serenos, the night watchmen of Spanish cities from 1715 to the 1970s, who called out the hour and the weather. Las dos y sereno. Two o'clock and clear.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var connectStep: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("Connect Slack").font(.headline)
+            Text("Sereno has nothing to show until an account is attached. It asks for read-only permission to the messages you can already see, it cannot post anything, and the token is kept in your Keychain rather than in a file.")
+            slackControls
+        }
+    }
+
+    /// The same three states Settings shows, in the same words. A sign-in that says nothing
+    /// when it fails is a dead end wherever it happens, and here it is the first thing the
+    /// user ever asked the app to do.
+    @ViewBuilder private var slackControls: some View {
+        switch slack.state {
+        case .connecting:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Waiting for Slack in your browser…")
+                Button("Cancel") { slack.cancelConnect() }
+                    .pointerCursor()
+            }
+            Text("Approve Sereno in the tab that just opened. Sereno stops waiting after a couple of minutes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+        case .connected(let workspace, let userID):
+            Label(workspace.map { "Connected to \($0)." } ?? "Connected.",
+                  systemImage: "checkmark.circle.fill")
+                .foregroundStyle(Brand.green)
+            Text("Signed in as \(userID). You can disconnect at any time in Settings.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+        case .disconnected, .failed:
+            Button("Connect Slack") {
+                Task { await slack.connect() }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Brand.aubergine)
+            .pointerCursor()
+            if case .failed(let reason) = slack.state {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(Brand.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var roleStep: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("What you do").font(.headline)
+            Text("A message like \"Team, please complete the deployment doc\" names nobody, and this line is what lets the model decide whether it is yours. Measured on a real one: saying the role owned the API moved \"please read the rollout notes\" from the bottom of the list to the top.")
+            TextField("Your role", text: $prefs.role,
+                      prompt: Text("backend engineer, I own deployments and the public API"),
+                      axis: .vertical)
+                .lineLimit(3...5)
+                .textFieldStyle(.roundedBorder)
+            Text("Optional. Leave it empty and only the explicit signals count: DMs, mentions, and replies to you.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var controls: some View {
+        HStack(spacing: 10) {
+            if step != .what {
+                Button("Back") {
+                    withAnimation(.snappy(duration: 0.2)) { step = previous }
+                }
+                .pointerCursor()
+            }
+            Spacer()
+            if step != .role {
+                Button("Skip setup", action: finish)
+                    .buttonStyle(.link)
+                    .pointerCursor()
+            }
+            Button(step == .role ? "Done" : "Continue", action: advance)
+                // Not on the last step. The role field takes Return as a newline, being a
+                // vertical-axis TextField, and a default action there would race it.
+                .keyboardShortcut(step == .role ? nil : KeyboardShortcut.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .tint(Brand.aubergine)
+                .pointerCursor()
+        }
+        // Centred over the whole bar rather than placed in the row, so the dots stay in the
+        // middle of the window whether or not Back is showing.
+        .overlay { dots }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+    }
+
+    /// Three is few enough that a progress bar would be more chrome than information, but
+    /// with nothing at all the first step reads as open ended.
+    private var dots: some View {
+        HStack(spacing: 5) {
+            ForEach(Step.allCases, id: \.rawValue) { each in
+                Circle()
+                    .fill(each == step ? Brand.aubergine : Color.secondary.opacity(0.3))
+                    .frame(width: 5, height: 5)
+            }
+        }
+    }
+
+    private var previous: Step { Step(rawValue: step.rawValue - 1) ?? .what }
+
+    private func advance() {
+        guard let next = Step(rawValue: step.rawValue + 1) else {
+            finish()
+            return
+        }
+        withAnimation(.snappy(duration: 0.2)) { step = next }
+    }
+
+    /// Closing the window with its close button deliberately does not do this. Setup counts
+    /// as done when it is finished or skipped, and Skip setup is on every step before the
+    /// last one, where Done costs nothing to press.
+    private func finish() {
+        prefs.hasCompletedOnboarding = true
+        dismiss()
     }
 }
 
@@ -729,6 +1082,32 @@ private final class ClickHandler: NSObject, UNUserNotificationCenterDelegate {
         -> UNNotificationPresentationOptions { [.banner, .sound] }
 }
 
+/// The tray icon, plus the one thing that has to happen without anyone clicking first.
+///
+/// An accessory app builds nothing of its own at launch: the popover's content is made
+/// when the popover opens, and a Window scene stays closed until something opens it. The
+/// menu bar label is the only view SwiftUI instantiates on its own, so first run is
+/// presented from here. It goes through Foreground.present for the reason that helper
+/// exists, an accessory app's window otherwise opens behind whatever was frontmost.
+///
+/// The flag alone would be enough to decide, but onAppear can run again for a label that
+/// is re-installed, so `presented` keeps a user who is midway through setup from having
+/// the window yanked to the front under them.
+private struct MenuBarRoot: View {
+    let count: Int
+    @Environment(\.openWindow) private var openWindow
+    @State private var presented = false
+
+    var body: some View {
+        MenuBarLabel(count: count)
+            .onAppear {
+                guard !presented, !Preferences.shared.hasCompletedOnboarding else { return }
+                presented = true
+                Foreground.present(onboardingWindowID) { openWindow(id: onboardingWindowID) }
+            }
+    }
+}
+
 /// The tray icon plus a red count badge.
 ///
 /// macOS treats a MenuBarExtra label as a template image, which flattens every color
@@ -806,8 +1185,11 @@ private enum Brand {
 /// in the artwork's 1024-unit space and normalised against whatever rect it is handed,
 /// so it is resolution independent at any frame.
 ///
-/// Takes the phase for the same reason every other foreground in the header does: the
-/// artwork's near-white is right on a night sky and invisible on a noon one.
+/// Takes the phase because the artwork's near-white is right on a night sky and
+/// invisible on a noon one.
+///
+/// Nothing draws this now: the header is the wordmark alone. Kept because the geometry
+/// is the app icon's, and `demoMark` still checks it normalises to any rect.
 private struct SerenoMark: View {
     let phase: SkyPhase
 
@@ -816,8 +1198,7 @@ private struct SerenoMark: View {
             Part.trail.fill(trailGradient)
             Part.head.fill(phase.ink)
         }
-        // This mark replaced the only text that said the product's name, so the name
-        // lives on the mark now.
+        // Two shapes VoiceOver would otherwise read as two unlabelled images.
         .accessibilityElement()
         .accessibilityLabel("Sereno")
     }
@@ -1154,7 +1535,7 @@ private struct MenuContent: View {
     @State private var selectedID: String?
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismiss) private var dismiss
-    /// Not @Bindable and not @State, for the reason SettingsForm gives: an @Observable
+    /// Not @Bindable and not @State, for the reason SlackPane gives: an @Observable
     /// read during body is tracked either way, and this is the shared controller the
     /// whole app signs in through. Reading `state` here is what makes a sign-in that
     /// finishes in Settings swap this panel over to the list with no refresh and no
@@ -1264,15 +1645,10 @@ private struct MenuContent: View {
         // 7 rather than the original 9. A fourth button costs about 45pt and the bar was
         // only about 10pt from full, so the gaps give that back and nothing has to shrink.
         HStack(spacing: 7) {
-            // The mark, the title, the count and the gap after them, grouped so the drag
-            // gesture can own exactly that region. The buttons sit outside this group and
-            // so are never inside the gesture's view, which is what keeps them clickable.
+            // The title, the count and the gap after them, grouped so the drag gesture
+            // can own exactly that region. The buttons sit outside this group and so are
+            // never inside the gesture's view, which is what keeps them clickable.
             HStack(spacing: 7) {
-                // 24pt leaves the drawn art about 10 by 14, which is the optical weight
-                // the name beside it carries, and the bar's height does not move.
-                SerenoMark(phase: phase)
-                    .frame(width: 24, height: 24)
-
                 // Measured, not guessed: Schibsted Grotesk SemiBold at 15pt has an
                 // x-height of 7.91 against the 8.06 of the 15pt bold system font this
                 // replaced, and SemiBold is the lighter weight of the two, so 15.5

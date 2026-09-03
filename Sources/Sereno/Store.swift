@@ -37,6 +37,7 @@ final class Store {
     /// older Sereno versions decode without migration work.
     private var slackScanState: SlackScanState?
     private var restoredSlackScanState = false
+    private var resetGeneration = 0
 
     /// The one thing the undo bar can currently take back. Two paths lead here, and each
     /// clears the other's bookkeeping when it fires, so the bar always undoes the action
@@ -55,6 +56,7 @@ final class Store {
     /// A scan younger than this counts as fresh. Opening the panel in a loop must not
     /// re-run the on-device model every time.
     static let stalePeriod: TimeInterval = 30
+    nonisolated private static let currentSchemaVersion = 1
 
     /// Interval the scheduled timer is actually running at, so a check can prove it
     /// derives from the preference. nil only before the first schedule.
@@ -65,9 +67,31 @@ final class Store {
     var unavailableReason: String? { Triage.unavailableReason() }
 
     private struct State: Codable {
+        var schemaVersion: Int
         var todos: [TodoItem]
         var lastScan: Date
         var slackScanState: SlackScanState?
+
+        private enum CodingKeys: String, CodingKey {
+            case schemaVersion, todos, lastScan, slackScanState
+        }
+
+        init(todos: [TodoItem], lastScan: Date, slackScanState: SlackScanState?, schemaVersion: Int = Store.currentSchemaVersion) {
+            self.schemaVersion = schemaVersion
+            self.todos = todos
+            self.lastScan = lastScan
+            self.slackScanState = slackScanState
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            // A missing key is specifically the pre-schema format (version 0). Tying it
+            // to the current version would quietly skip this migration after a bump.
+            schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
+            todos = try container.decode([TodoItem].self, forKey: .todos)
+            lastScan = try container.decode(Date.self, forKey: .lastScan)
+            slackScanState = try container.decodeIfPresent(SlackScanState.self, forKey: .slackScanState)
+        }
     }
 
     /// Directory holding state.json. `urls(for:in:)` documents an array that can be
@@ -87,7 +111,7 @@ final class Store {
 
     // fileURL override lets tests point at a throwaway path instead of the real
     // app support directory. nil (the default) is unchanged production behavior.
-    init(source: any MessageSource = MockMessageSource(), fileURL: URL? = nil) {
+    init(source: any MessageSource, fileURL: URL? = nil) {
         self.source = source
         if let fileURL {
             self.fileURL = fileURL
@@ -139,7 +163,7 @@ final class Store {
     }
 
     /// For the panel-open path: skip the work when the last scan is recent. refresh()
-    /// itself stays unguarded, that is the explicit Refresh button and regenerate().
+    /// itself checks again because direct callers do not pass through this stale check.
     func refreshIfStale() async {
         guard !isRefreshing, Date().timeIntervalSince(lastScan) >= Self.stalePeriod else { return }
         await refresh()
@@ -164,9 +188,17 @@ final class Store {
         }
         do {
             let state = try JSONDecoder().decode(State.self, from: data)
-            todos = state.todos
+            if state.schemaVersion == 0 {
+                // These files predate the required source, so non-manual todos may be
+                // mock fixtures. Manual todos came from the user and must survive.
+                todos = state.todos.filter(\.isManual)
+                log.info("migrated pre-schema state dropped items=\(state.todos.count - self.todos.count, privacy: .public)")
+            } else {
+                todos = state.todos
+            }
             lastScan = state.lastScan
             slackScanState = state.slackScanState
+            if state.schemaVersion == 0 { save() }
         } catch {
             log.error("state file unreadable, starting empty bytes=\(data.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             todos = []
@@ -259,12 +291,15 @@ final class Store {
     }
 
     func refresh() async {
+        guard !isRefreshing else { return }
+        let refreshGeneration = resetGeneration
         isRefreshing = true
         defer { isRefreshing = false }
 
         let statefulSource = source as? any SlackScanStateSource
         if let statefulSource, !restoredSlackScanState {
             await statefulSource.restoreSlackScanState(slackScanState ?? SlackScanState())
+            guard refreshGeneration == resetGeneration else { return }
             restoredSlackScanState = true
         }
         let previousSlackState = slackScanState
@@ -272,18 +307,22 @@ final class Store {
         let messages: [SlackMessage]
         do {
             messages = try await source.unrepliedMessages(since: lastScan)
+            guard refreshGeneration == resetGeneration else { return }
         } catch {
+            guard refreshGeneration == resetGeneration else { return }
             // The connection floor is established when the connected scan begins and must
             // survive even if Slack fails. Conversation edges do not advance on a failed
             // source call because a fatal result may have hidden another child's messages.
             if let statefulSource {
                 let candidate = await statefulSource.currentSlackScanState()
+                guard refreshGeneration == resetGeneration else { return }
                 var rollback = candidate
                 rollback.conversations = previousSlackState?.accountKey == candidate.accountKey
                     ? previousSlackState?.conversations ?? [:]
                     : [:]
                 slackScanState = rollback
                 await statefulSource.restoreSlackScanState(rollback)
+                guard refreshGeneration == resetGeneration else { return }
                 save()
             }
             log.error("refresh failed, list left unchanged error=\(error.localizedDescription, privacy: .public)")
@@ -296,15 +335,18 @@ final class Store {
         } else {
             nil
         }
+        guard refreshGeneration == resetGeneration else { return }
 
         do {
             // Preferences is @MainActor and so is this, so read it straight.
             let addressed = Self.addressed(messages, ignoring: Preferences.shared.ignoredSignals)
             log.debug("addressing filter dropped messages=\(messages.count - addressed.count, privacy: .public) conversations=\(Set(messages.map(Self.conversationKey)).count - Set(addressed.map(Self.conversationKey)).count, privacy: .public)")
             let newItems = try await Triage.items(from: addressed)
+            guard refreshGeneration == resetGeneration else { return }
             todos = Self.merged(existing: todos, new: newItems)
             log.debug("refresh scanned messages=\(messages.count, privacy: .public) newItems=\(newItems.count, privacy: .public) fallbacks=\(newItems.filter { $0.reason.hasPrefix("Fallback") }.count, privacy: .public)")
         } catch {
+            guard refreshGeneration == resetGeneration else { return }
             // Fetching does not count as accounting for a message until triage accepts it.
             // Preserve cheap identity/name work and the connection floor, but put every
             // conversation edge back so the same messages are offered again next time.
@@ -314,6 +356,7 @@ final class Store {
                     : [:]
                 slackScanState = rollback
                 await statefulSource.restoreSlackScanState(rollback)
+                guard refreshGeneration == resetGeneration else { return }
                 save()
             }
             log.error("refresh failed, list left unchanged error=\(error.localizedDescription, privacy: .public)")
@@ -330,14 +373,17 @@ final class Store {
         let openIDs = todos.filter { !$0.done && $0.supportsReplyDetection }.map(\.id)
         do {
             let repliedIDs = try await source.repliedIDs(among: openIDs)
+            guard refreshGeneration == resetGeneration else { return }
             for index in todos.indices where repliedIDs.contains(todos[index].id) {
                 todos[index].done = true
             }
         } catch {
+            guard refreshGeneration == resetGeneration else { return }
             log.error("reply detection failed, done flags may be stale open=\(openIDs.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             errorText = error.localizedDescription
         }
 
+        guard refreshGeneration == resetGeneration else { return }
         save()
     }
 
@@ -354,6 +400,22 @@ final class Store {
         }
         save()
         await refresh()
+    }
+
+    /// A reset invalidates any refresh that was already waiting on Slack or the model, so
+    /// its result cannot repopulate the list after the user has cleared it.
+    func resetAll() {
+        resetGeneration += 1
+        todos = []
+        lastScan = .distantPast
+        slackScanState = nil
+        restoredSlackScanState = false
+        errorText = nil
+        lastRemoved = nil
+        lastRemovedIndex = nil
+        lastDoneID = nil
+        lastUndoable = nil
+        save()
     }
 
     func remove(_ item: TodoItem) {
@@ -486,7 +548,7 @@ final class Store {
 }
 
 @MainActor
-func demoStoreMerge() {
+func demoStoreMerge() async {
     let oldDate = Date(timeIntervalSinceReferenceDate: 0)
     let newDate = oldDate.addingTimeInterval(60)
     func todo(_ id: String, action: String, priority: Int, reason: String, date: Date = oldDate,
@@ -554,13 +616,49 @@ func demoStoreMerge() {
     let tempURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("sereno-undo-\(UUID().uuidString).json")
     defer { try? FileManager.default.removeItem(at: tempURL) }
-    let store = Store(fileURL: tempURL)
+    let store = Store(source: MockMessageSource(), fileURL: tempURL)
     let first = store.addManual("First", priority: 3, detail: "")
     _ = store.addManual("Second", priority: 4, detail: "")
     store.remove(first)
     assert(store.lastRemoved == first && store.todos.count == 1)
     store.undoRemove()
     assert(store.lastRemoved == nil && store.todos.map(\.action) == ["First", "Second"])
+
+    struct LegacyState: Codable {
+        var todos: [TodoItem]
+        var lastScan: Date
+        var slackScanState: SlackScanState?
+    }
+    let migrationURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-migration-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: migrationURL) }
+    let legacy = LegacyState(todos: [manual, existingOnly], lastScan: newDate, slackScanState: nil)
+    try! JSONEncoder().encode(legacy).write(to: migrationURL, options: .atomic)
+    let migratedStore = Store(source: MockMessageSource(), fileURL: migrationURL)
+    assert(migratedStore.todos == [manual])
+    migratedStore.resetAll()
+    assert(migratedStore.todos.isEmpty && migratedStore.lastScan == .distantPast)
+    let resetStore = Store(source: MockMessageSource(), fileURL: migrationURL)
+    assert(resetStore.todos.isEmpty && resetStore.lastScan == .distantPast)
+
+    final class ResettingEmptySource: MessageSource, @unchecked Sendable {
+        var reset: (@MainActor @Sendable () -> Void)?
+
+        func unrepliedMessages(since: Date) async throws -> [SlackMessage] {
+            await reset?()
+            return []
+        }
+
+        func repliedIDs(among ids: [String]) async throws -> Set<String> { [] }
+    }
+    let refreshURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-reset-refresh-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: refreshURL) }
+    let staleSource = ResettingEmptySource()
+    let staleStore = Store(source: staleSource, fileURL: refreshURL)
+    staleSource.reset = { staleStore.resetAll() }
+    await staleStore.refresh()
+    assert(staleStore.todos.isEmpty && staleStore.lastScan == .distantPast && staleStore.errorText == nil)
     print("demoStoreMerge: PASS")
 }
 

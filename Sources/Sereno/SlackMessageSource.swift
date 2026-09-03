@@ -178,9 +178,11 @@ actor SlackMessageSource: SlackScanStateSource {
     private var budget = 0
 
     private var identity: Identity?
+    private var identityTask: Task<Identity, Error>?
     private var permalinkHost = "app.slack.com"
     private var conversations: [SlackConversation] = []
     private var hasConversationCache = false
+    private var conversationsTask: Task<[SlackConversation], Error>?
     private var refreshCount = 0
     private var userNames: [String: String] = [:]
     private var scanState = SlackScanState()
@@ -236,39 +238,45 @@ actor SlackMessageSource: SlackScanStateSource {
            !observesStoredAccount || Self.storedUserID().map({ $0 == identity.userID }) ?? true {
             return identity
         }
-        guard spend() else { throw SlackSourceError.rateLimited }
-        let auth = try await get("auth.test")
-        guard let userID = auth["user_id"] as? String, !userID.isEmpty else {
-            throw SlackSourceError.badResponse
-        }
-        if let host = (auth["url"] as? String).flatMap({ URL(string: $0)?.host }) {
-            permalinkHost = host
-        }
+        if let identityTask { return try await identityTask.value }
+        let task = Task {
+            defer { identityTask = nil }
+            guard spend() else { throw SlackSourceError.rateLimited }
+            let auth = try await get("auth.test")
+            guard let userID = auth["user_id"] as? String, !userID.isEmpty else {
+                throw SlackSourceError.badResponse
+            }
+            if let host = (auth["url"] as? String).flatMap({ URL(string: $0)?.host }) {
+                permalinkHost = host
+            }
 
-        var display = "", real = ""
-        if spend(), let info = try? await get("users.info", [("user", userID)]),
-           let user = info["user"] as? [String: Any] {
-            real = user["real_name"] as? String ?? ""
-            display = ((user["profile"] as? [String: Any])?["display_name"] as? String) ?? ""
-        }
+            var display = "", real = ""
+            if spend(), let info = try? await get("users.info", [("user", userID)]),
+               let user = info["user"] as? [String: Any] {
+                real = user["real_name"] as? String ?? ""
+                display = ((user["profile"] as? [String: Any])?["display_name"] as? String) ?? ""
+            }
 
-        // usergroups.list needs its own scope and is missing on most plans, so a failure
-        // degrades to no groups rather than losing the whole refresh. The cost is that
-        // .userGroup never fires, not that the app stops working.
-        var groups: Set<String> = []
-        if spend(), let list = try? await get("usergroups.list", [("include_users", "true")]),
-           let raw = list["usergroups"] as? [[String: Any]] {
-            groups = Set(raw.compactMap { group in
-                let members = group["users"] as? [String] ?? []
-                return members.contains(userID) ? group["id"] as? String : nil
-            })
-        }
+            // usergroups.list needs its own scope and is missing on most plans, so a failure
+            // degrades to no groups rather than losing the whole refresh. The cost is that
+            // .userGroup never fires, not that the app stops working.
+            var groups: Set<String> = []
+            if spend(), let list = try? await get("usergroups.list", [("include_users", "true")]),
+               let raw = list["usergroups"] as? [[String: Any]] {
+                groups = Set(raw.compactMap { group in
+                    let members = group["users"] as? [String] ?? []
+                    return members.contains(userID) ? group["id"] as? String : nil
+                })
+            }
 
-        // role is deliberately left empty: Triage fills it from Preferences.
-        let built = Identity(userID: userID, displayName: display, realName: real, userGroupIDs: groups)
-        identity = built
-        log.info("identity resolved user=\(userID, privacy: .public) groups=\(groups.count, privacy: .public)")
-        return built
+            // role is deliberately left empty: Triage fills it from Preferences.
+            let built = Identity(userID: userID, displayName: display, realName: real, userGroupIDs: groups)
+            identity = built
+            log.info("identity resolved user=\(userID, privacy: .public) groups=\(groups.count, privacy: .public)")
+            return built
+        }
+        identityTask = task
+        return try await task.value
     }
 
     private nonisolated static func storedUserID() -> String? {
@@ -301,26 +309,32 @@ actor SlackMessageSource: SlackScanStateSource {
         if hasConversationCache, refreshCount % Self.conversationCacheRefreshes != 0 {
             return conversations
         }
-        var found: [SlackConversation] = []
-        var cursor: String?
-        var pages = 0
-        repeat {
-            guard spend(reserve: nameReserve) else { break }
-            var query = [("types", "public_channel,private_channel,im,mpim"),
-                         ("exclude_archived", "true"),
-                         ("limit", "200")]
-            if let cursor { query.append(("cursor", cursor)) }
-            let page = try await get("users.conversations", query)
-            found += Self.parseConversations(page)
-            cursor = Self.nextCursor(page)
-            pages += 1
-        } while cursor != nil && pages < 5
+        if let conversationsTask { return try await conversationsTask.value }
+        let task = Task {
+            defer { conversationsTask = nil }
+            var found: [SlackConversation] = []
+            var cursor: String?
+            var pages = 0
+            repeat {
+                guard spend(reserve: nameReserve) else { break }
+                var query = [("types", "public_channel,private_channel,im,mpim"),
+                             ("exclude_archived", "true"),
+                             ("limit", "200")]
+                if let cursor { query.append(("cursor", cursor)) }
+                let page = try await get("users.conversations", query)
+                found += Self.parseConversations(page)
+                cursor = Self.nextCursor(page)
+                pages += 1
+            } while cursor != nil && pages < 5
 
-        guard !found.isEmpty else { return conversations }
-        conversations = found.sorted { ($0.priority, $0.id) < ($1.priority, $1.id) }
-        hasConversationCache = true
-        log.info("conversations cached count=\(self.conversations.count, privacy: .public)")
-        return conversations
+            guard !found.isEmpty else { return conversations }
+            conversations = found.sorted { ($0.priority, $0.id) < ($1.priority, $1.id) }
+            hasConversationCache = true
+            log.info("conversations cached count=\(self.conversations.count, privacy: .public)")
+            return conversations
+        }
+        conversationsTask = task
+        return try await task.value
     }
 
     // MARK: MessageSource
@@ -945,6 +959,8 @@ func demoSlackSource() async {
             case "usergroups.list":
                 body = #"{"ok":true,"usergroups":[{"id":"S1","users":["U_ME"]},{"id":"S9","users":["U_X"]}]}"#
             case "users.conversations":
+                // Keep this call suspended so concurrent scans overlap at the cache boundary.
+                try await Task.sleep(for: .milliseconds(20))
                 body = conversationList
             case "conversations.replies":
                 body = threadReplies
@@ -961,6 +977,15 @@ func demoSlackSource() async {
             return Data(body.utf8)
         }, budget: budget)
     }
+
+    let concurrentLog = CallLog()
+    let concurrentSource = cannedSource(budget: 40, log: concurrentLog)
+    async let concurrentFirst = concurrentSource.unrepliedMessages(since: now)
+    async let concurrentSecond = concurrentSource.unrepliedMessages(since: now)
+    _ = try! await (concurrentFirst, concurrentSecond)
+    let concurrentConversationCalls = await concurrentLog.count(of: "users.conversations")
+    assert(concurrentConversationCalls == 1,
+           "concurrent refreshes requested users.conversations \(concurrentConversationCalls) times")
 
     let fullLog = CallLog()
     let source = cannedSource(budget: 40, log: fullLog)

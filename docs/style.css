@@ -45,10 +45,6 @@ nav {
   margin-bottom: 40px;
 }
 
-/* The icon carries its own squircle and its own ~6% margin, so it needs no radius
-   and no colour: it reads on both themes because the mark is a dark night sky. */
-.mark { display: block; width: 22px; height: 22px; }
-
 footer {
   max-width: 30rem;
   margin-top: 56px;

@@ -52,10 +52,11 @@ enum SlackOAuth {
 
     /// Read-only, and `user_scope`, never `scope`: a desktop redirect may not request bot
     /// scopes, and Sereno reads as the signed-in human anyway.
+    /// `search:read` lets discovery avoid Slack's one-request-per-minute cap on history calls.
     static let userScopes = [
         "channels:history", "groups:history", "im:history", "mpim:history",
         "channels:read", "groups:read", "im:read", "mpim:read",
-        "users:read", "usergroups:read",
+        "users:read", "usergroups:read", "search:read",
     ].joined(separator: ",")
 
     private static let authorizeEndpoint = "https://slack.com/oauth/v2/authorize"
@@ -647,6 +648,7 @@ func demoSlackAuth() {
     assert(url.absoluteString.hasPrefix("https://slack.com/oauth/v2/authorize?"), "wrong authorize endpoint")
     assert(query.contains("client_id=11965903665317.11964850390275"), "authorize URL carries the wrong client_id")
     assert(query.contains("user_scope=channels%3Ahistory"), "user_scope missing or unencoded")
+    assert(query.contains("search%3Aread"), "search:read missing or unencoded")
     // `scope=` on its own would be the bot-scope parameter. `user_scope=` contains it as a
     // substring, so the check has to be anchored to a parameter boundary.
     assert(!query.contains("&scope=") && !query.hasPrefix("scope="), "sends bot scope, not user_scope")

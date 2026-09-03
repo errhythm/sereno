@@ -164,6 +164,7 @@ first:
 - Whether the window physically drags, and whether its resize edges are grabbable, both need a
   human. A borderless window has no frame border and the outer 12pt is transparent content.
 - `SlackMessageSource` is wired in. `App.swift` hands `Store` a `LiveMessageSource`, which
-  picks Slack or the mock **per call** by asking the Keychain, so connecting or
-  disconnecting takes effect on the next refresh rather than the next launch. Fixtures are
-  now the not-connected path, not the only path.
+  checks the Keychain per call, uses Slack when a token exists, and reports `notConnected`
+  when it does not. Only demos construct `MockMessageSource`, and `Store.init` has no mock
+  default, so production cannot serve fixtures. State files from before the schema-version
+  migration drop non-manual todos on load.
