@@ -34,17 +34,21 @@ enum Triage {
     static func items(from messages: [SlackMessage]) async throws -> [TodoItem] {
         guard !messages.isEmpty else { return [] }
         let conversations = grouped(messages)
-        if let reason = unavailableReason() {
-            log.error("model unavailable, every conversation falls back: \(reason, privacy: .public)")
-            return assemble(results: [], conversations: conversations)
-        }
         let now = Date()
         let timeZone = TimeZone.current
+        var calendar = Calendar.current
+        calendar.timeZone = timeZone
         let currentTime = promptTime(at: now, timeZone: timeZone)
         // Preferences is @MainActor, the generate path below is not. Read it ONCE here
         // and pass plain Sendable values down, rather than hopping to the main actor
         // from inside the task group.
         let context = await MainActor.run { PromptContext(preferences: .shared) }
+        let onDeviceUnavailableReason = unavailableReason()
+        if context.modelProvider == .onDevice, let reason = onDeviceUnavailableReason {
+            log.error("model unavailable, every conversation falls back: \(reason, privacy: .public)")
+            return assemble(results: [], conversations: conversations, now: now, calendar: calendar)
+        }
+        let remoteClient = RemoteModelClient()
 
         var results: [GeneratedResult] = []
 
@@ -59,7 +63,9 @@ enum Triage {
                         conversation: conversation,
                         context: context,
                         currentTime: currentTime,
-                        timeZone: timeZone
+                        timeZone: timeZone,
+                        remoteClient: remoteClient,
+                        onDeviceUnavailableReason: onDeviceUnavailableReason
                     )
                 }
             }
@@ -75,7 +81,7 @@ enum Triage {
             }
         }
 
-        return assemble(results: results, conversations: conversations)
+        return assemble(results: results, conversations: conversations, now: now, calendar: calendar)
     }
 
     private struct Conversation: Sendable {
@@ -95,6 +101,50 @@ enum Triage {
         let yours: String?
     }
 
+    private struct StageOneFields: Sendable {
+        let verb: String
+        let topic: String
+        let reason: String
+        let yours: String?
+        let category: String
+
+        init(_ remote: RemoteModel.Fields) {
+            verb = remote.verb
+            topic = remote.topic
+            reason = remote.reason
+            yours = remote.yours
+            category = remote.category
+        }
+
+        init(verb: String, topic: String, reason: String, yours: String?, category: String) {
+            self.verb = verb
+            self.topic = topic
+            self.reason = reason
+            self.yours = yours
+            self.category = category
+        }
+    }
+
+    private enum ModelSource: String, Sendable, Equatable {
+        case onDevice
+        case openRouter
+        case custom
+
+        init(_ provider: RemoteModelProvider) {
+            switch provider {
+            case .onDevice: self = .onDevice
+            case .openRouter: self = .openRouter
+            case .custom: self = .custom
+            }
+        }
+    }
+
+    private struct AcceptedStageOne: Sendable {
+        let task: GeneratedTask
+        let yours: String?
+        let source: ModelSource
+    }
+
     /// Everything the prompt needs from user settings, snapshotted on the main actor.
     struct PromptContext: Sendable {
         /// The user's own description of what they do. The only basis the model has for
@@ -104,15 +154,43 @@ enum Triage {
         /// Signals the user switched off. Detection still records them, they just do not
         /// reach the model.
         var ignoredSignals: Set<Addressing> = []
+        var modelProvider: RemoteModelProvider = .onDevice
+        var remoteConfig: RemoteModel.Config?
+        var remoteAPIKey: String = ""
 
-        init(role: String = "", ignoredSignals: Set<Addressing> = []) {
+        init(
+            role: String = "",
+            ignoredSignals: Set<Addressing> = [],
+            modelProvider: RemoteModelProvider = .onDevice,
+            remoteConfig: RemoteModel.Config? = nil,
+            remoteAPIKey: String = ""
+        ) {
             self.role = role.trimmingCharacters(in: .whitespacesAndNewlines)
             self.ignoredSignals = ignoredSignals
+            self.modelProvider = modelProvider
+            self.remoteConfig = remoteConfig
+            self.remoteAPIKey = remoteAPIKey
         }
 
         @MainActor
         init(preferences: Preferences) {
-            self.init(role: preferences.role, ignoredSignals: preferences.ignoredSignals)
+            let provider = preferences.modelProvider
+            let config: RemoteModel.Config?
+            switch RemoteModel.config(
+                provider: provider,
+                modelID: preferences.remoteModelID,
+                customBaseURLString: preferences.customBaseURLString
+            ) {
+            case .success(let value): config = value
+            case .failure: config = nil
+            }
+            self.init(
+                role: preferences.role,
+                ignoredSignals: preferences.ignoredSignals,
+                modelProvider: provider,
+                remoteConfig: config,
+                remoteAPIKey: provider == .onDevice ? "" : RemoteModelKeychain.load() ?? ""
+            )
         }
     }
 
@@ -129,37 +207,6 @@ enum Triage {
             }
         }
         return conversations.map { Conversation(id: $0.id, messages: $0.messages.sorted { $0.date < $1.date }) }
-    }
-
-    private static func generate(
-        index: Int,
-        conversation: Conversation,
-        context: PromptContext,
-        currentTime: String,
-        timeZone: TimeZone
-    ) async -> GeneratedResult? {
-        let task = DynamicGenerationSchema(name: "SingleTaskFields", properties: [
-            .init(name: "verb", description: "The action verb", schema: .init(name: "verb", anyOf: ["Reply", "Review", "Approve", "Send", "Sign off", "Read", "Update", "Help"])),
-            .init(name: "topic", description: "A 2 to 6 word noun phrase from the message, preserving identifiers verbatim", schema: .init(type: String.self)),
-            // reason before category so the label is generated after the evidence for it.
-            .init(name: "reason", description: "Say what the messages ask of you, or that they ask nothing", schema: .init(type: String.self)),
-            .init(name: "yours", description: "Whether this asks the reader personally to act", schema: .init(name: "yours", anyOf: ["yes", "no"])),
-            .init(name: "category", description: "What the messages ask of you", schema: .init(name: "category", anyOf: ["blocked", "deadlineToday", "directRequest", "social", "fyi"])),
-        ])
-        do {
-            let schema = try GenerationSchema(root: task, dependencies: [])
-            return await generate(
-                index: index,
-                conversation: conversation,
-                firstSchema: schema,
-                context: context,
-                currentTime: currentTime,
-                timeZone: timeZone
-            )
-        } catch {
-            log.error("stage 1 schema build failed, conversation falls back id=\(conversation.id, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            return nil
-        }
     }
 
     /// Pure so the prompt can be checked without the model.
@@ -231,10 +278,11 @@ enum Triage {
     private static func generate(
         index: Int,
         conversation: Conversation,
-        firstSchema: GenerationSchema,
         context: PromptContext,
         currentTime: String,
-        timeZone: TimeZone
+        timeZone: TimeZone,
+        remoteClient: RemoteModelClient,
+        onDeviceUnavailableReason: String?
     ) async -> GeneratedResult? {
         let messages = conversationText(
             conversation,
@@ -248,29 +296,137 @@ enum Triage {
             role: context.role
         )
 
-        do {
-            let session = LanguageModelSession(
-                instructions: "Turn unanswered Slack messages into a prioritized action list."
+        let remoteSource = context.modelProvider == .onDevice
+            ? nil
+            : ModelSource(context.modelProvider)
+        let remoteFields: RemoteModel.Fields?
+        if let remoteSource, let config = context.remoteConfig {
+            remoteFields = await remoteClient.fields(
+                conversationText: messages,
+                config: config,
+                apiKey: context.remoteAPIKey
             )
-            let response = try await session.respond(
-                to: prompt,
-                schema: firstSchema,
-                options: GenerationOptions(sampling: .greedy)
-            )
-            log.debug("stage 1 id=\(conversation.id, privacy: .public) category=\((try? response.content.value(String.self, forProperty: "category")) ?? "?", privacy: .public)")
-            let yours = try? response.content.value(String.self, forProperty: "yours")
-            let first = try generatedTask(from: response.content, combinedText: combinedText)
-            let second = await secondTask(for: conversation, messages: messages, combinedText: combinedText, first: first)
-            return GeneratedResult(index: index, tasks: tasks(first: first, second: second), yours: yours)
-        } catch let error as LanguageModelSession.GenerationError {
-            // The label is a closed set, safe to make public. The framework's own message
-            // can quote the prompt, so it stays at default (redacted) privacy.
-            log.error("stage 1 failed, conversation falls back id=\(conversation.id, privacy: .public) reason=\(label(for: error), privacy: .public) detail=\(error.localizedDescription, privacy: .private)")
-            return nil
-        } catch {
-            log.error("stage 1 failed, conversation falls back id=\(conversation.id, privacy: .public) reason=other detail=\(error.localizedDescription, privacy: .private)")
+            if remoteFields == nil {
+                log.info("remote model produced no usable fields, trying on-device id=\(conversation.id, privacy: .public) provider=\(remoteSource.rawValue, privacy: .public)")
+            }
+        } else {
+            remoteFields = nil
+            if let remoteSource {
+                log.info("remote model is not configured, trying on-device id=\(conversation.id, privacy: .public) provider=\(remoteSource.rawValue, privacy: .public)")
+            }
+        }
+
+        let accepted = await acceptedStageOne(
+            remoteFields: remoteFields,
+            remoteSource: remoteSource,
+            combinedText: combinedText
+        ) {
+            guard let reason = onDeviceUnavailableReason else {
+                return await onDeviceFields(prompt: prompt, conversationID: conversation.id)
+            }
+            log.error("on-device fallback unavailable id=\(conversation.id, privacy: .public) reason=\(reason, privacy: .public)")
             return nil
         }
+        guard let accepted else { return nil }
+        log.info("stage 1 produced item id=\(conversation.id, privacy: .public) provider=\(accepted.source.rawValue, privacy: .public)")
+        let second: GeneratedTask? = if onDeviceUnavailableReason == nil {
+            await secondTask(
+                for: conversation,
+                messages: messages,
+                combinedText: combinedText,
+                first: accepted.task
+            )
+        } else {
+            nil
+        }
+        if second != nil {
+            log.info("stage 2 produced item id=\(conversation.id, privacy: .public) provider=\(ModelSource.onDevice.rawValue, privacy: .public)")
+        }
+        return GeneratedResult(
+            index: index,
+            tasks: tasks(first: accepted.task, second: second),
+            yours: accepted.yours
+        )
+    }
+
+    private static func acceptedStageOne(
+        remoteFields: RemoteModel.Fields?,
+        remoteSource: ModelSource?,
+        combinedText: String,
+        onDeviceFields: @Sendable () async -> StageOneFields?
+    ) async -> AcceptedStageOne? {
+        if let remoteFields, let remoteSource {
+            let fields = StageOneFields(remoteFields)
+            if case .success(let task) = validatedTask(from: fields, combinedText: combinedText) {
+                return AcceptedStageOne(task: task, yours: fields.yours, source: remoteSource)
+            }
+        }
+        guard let fields = await onDeviceFields(),
+              case .success(let task) = validatedTask(from: fields, combinedText: combinedText) else {
+            return nil
+        }
+        return AcceptedStageOne(task: task, yours: fields.yours, source: .onDevice)
+    }
+
+    private static func onDeviceFields(
+        prompt: String,
+        conversationID: String
+    ) async -> StageOneFields? {
+        let task = DynamicGenerationSchema(name: "SingleTaskFields", properties: [
+            .init(name: "verb", description: "The action verb", schema: .init(name: "verb", anyOf: ["Reply", "Review", "Approve", "Send", "Sign off", "Read", "Update", "Help"])),
+            .init(name: "topic", description: "A 2 to 6 word noun phrase from the message, preserving identifiers verbatim", schema: .init(type: String.self)),
+            // reason before category so the label is generated after the evidence for it.
+            .init(name: "reason", description: "Say what the messages ask of you, or that they ask nothing", schema: .init(type: String.self)),
+            .init(name: "yours", description: "Whether this asks the reader personally to act", schema: .init(name: "yours", anyOf: ["yes", "no"])),
+            .init(name: "category", description: "What the messages ask of you", schema: .init(name: "category", anyOf: ["blocked", "deadlineToday", "directRequest", "social", "fyi"])),
+        ])
+        let schema: GenerationSchema
+        do {
+            schema = try GenerationSchema(root: task, dependencies: [])
+        } catch {
+            log.error("stage 1 schema build failed id=\(conversationID, privacy: .public) detail=\(error.localizedDescription, privacy: .private)")
+            return nil
+        }
+
+        do {
+            let content: GeneratedContent
+            do {
+                content = try await stageOneContent(prompt: prompt, schema: schema)
+            } catch let error as LanguageModelSession.GenerationError {
+                guard case .guardrailViolation = error else { throw error }
+                log.warning("retrying stage 1 after guardrail id=\(conversationID, privacy: .public) attempt=\(1, privacy: .public)")
+                do {
+                    content = try await stageOneContent(prompt: prompt, schema: schema)
+                    log.info("stage 1 guardrail retry finished id=\(conversationID, privacy: .public) succeeded=\(true, privacy: .public)")
+                } catch {
+                    log.error("stage 1 guardrail retry finished id=\(conversationID, privacy: .public) succeeded=\(false, privacy: .public) detail=\(error.localizedDescription, privacy: .private)")
+                    throw error
+                }
+            }
+            let fields = try fields(from: content)
+            log.debug("stage 1 id=\(conversationID, privacy: .public) category=\(fields.category, privacy: .public)")
+            return fields
+        } catch let error as LanguageModelSession.GenerationError {
+            log.error("stage 1 failed, conversation falls back id=\(conversationID, privacy: .public) reason=\(label(for: error), privacy: .public) detail=\(error.localizedDescription, privacy: .private)")
+            return nil
+        } catch {
+            log.error("stage 1 failed, conversation falls back id=\(conversationID, privacy: .public) reason=other detail=\(error.localizedDescription, privacy: .private)")
+            return nil
+        }
+    }
+
+    /// Every call owns a new session. In particular, the one permitted guardrail retry
+    /// must not reuse the session that refused the first generation.
+    private static func stageOneContent(prompt: String, schema: GenerationSchema) async throws -> GeneratedContent {
+        let session = LanguageModelSession(
+            instructions: "Turn unanswered Slack messages into a prioritized action list."
+        )
+        let response = try await session.respond(
+            to: prompt,
+            schema: schema,
+            options: GenerationOptions(sampling: .greedy)
+        )
+        return response.content
     }
 
     /// Stable, content-free name for a model failure, so the log says which one happened
@@ -415,39 +571,59 @@ enum Triage {
         }.joined(separator: "\n\n")
     }
 
-    private static func generatedTask(from value: GeneratedContent, combinedText: String) throws -> GeneratedTask {
-        let verb = try value.value(String.self, forProperty: "verb")
-        let topic = try value.value(String.self, forProperty: "topic")
-        let category = try value.value(String.self, forProperty: "category")
-        let reason = try value.value(String.self, forProperty: "reason")
-        // Each guardrail logs which one rejected the result: the conversation then falls
-        // back, and "why" is the only thing that makes that recoverable after the fact.
-        guard let action = composeAction(verb: verb, topic: topic) else {
-            log.warning("rejected: bare verb or empty topic verb=\(verb, privacy: .public) topic=\(topic, privacy: .private)")
-            throw InvalidTask()
+    private enum TaskRejection: Error, Equatable {
+        case invalidAction
+        case unmappedCategory
+        case schemaName
+        case personOnlyTopic
+        case inventedIdentifier
+        case ungroundedTopic
+    }
+
+    private static func fields(from value: GeneratedContent) throws -> StageOneFields {
+        StageOneFields(
+            verb: try value.value(String.self, forProperty: "verb"),
+            topic: try value.value(String.self, forProperty: "topic"),
+            reason: try value.value(String.self, forProperty: "reason"),
+            yours: try? value.value(String.self, forProperty: "yours"),
+            category: try value.value(String.self, forProperty: "category")
+        )
+    }
+
+    /// The single trust boundary for every stage-one provider. Keep these guards in this
+    /// order: remote and on-device fields both enter here, so neither provider can skip a
+    /// check or gain a different precedence when more than one field is invalid.
+    private static func validatedTask(
+        from fields: StageOneFields,
+        combinedText: String
+    ) -> Result<GeneratedTask, TaskRejection> {
+        guard let action = composeAction(verb: fields.verb, topic: fields.topic) else {
+            log.warning("rejected: bare verb or empty topic verb=\(fields.verb, privacy: .public) topic=\(fields.topic, privacy: .private)")
+            return .failure(.invalidAction)
         }
-        guard let priority = priority(for: category) else {
-            log.warning("rejected: unmapped category=\(category, privacy: .public)")
-            throw InvalidTask()
+        guard let priority = priority(for: fields.category) else {
+            // A remote provider is not schema-constrained, so an unmapped value is
+            // arbitrary model output rather than a closed-set label.
+            log.warning("rejected: unmapped category=\(fields.category, privacy: .private)")
+            return .failure(.unmappedCategory)
         }
-        guard !isSchemaName(topic), !isSchemaName(action) else {
+        guard !isSchemaName(fields.topic), !isSchemaName(action) else {
             log.warning("rejected: schema name echoed back as the topic")
-            throw InvalidTask()
+            return .failure(.schemaName)
         }
-        guard !topicIsOnlyAPerson(topic) else {
-            log.warning("rejected: topic names only a person topic=\(topic, privacy: .private)")
-            throw InvalidTask()
+        guard !topicIsOnlyAPerson(fields.topic) else {
+            log.warning("rejected: topic names only a person topic=\(fields.topic, privacy: .private)")
+            return .failure(.personOnlyTopic)
         }
         guard !actionInventsIdentifier(action, notIn: combinedText) else {
             log.warning("rejected: action invents an identifier absent from the messages")
-            throw InvalidTask()
+            return .failure(.inventedIdentifier)
         }
-        // Only the pure rule is asserted; this GeneratedContent wiring remains unasserted.
-        guard primaryTopicIsGrounded(topic, in: combinedText) else {
-            log.warning("rejected: topic not grounded in the conversation topic=\(topic, privacy: .private)")
-            throw InvalidTask()
+        guard primaryTopicIsGrounded(fields.topic, in: combinedText) else {
+            log.warning("rejected: topic not grounded in the conversation topic=\(fields.topic, privacy: .private)")
+            return .failure(.ungroundedTopic)
         }
-        return GeneratedTask(action: action, priority: priority, reason: reason)
+        return .success(GeneratedTask(action: action, priority: priority, reason: fields.reason))
     }
 
     /// The model picks a label, Swift picks the number. nil for anything unrecognised,
@@ -476,6 +652,86 @@ enum Triage {
         }
     }
 
+    /// Returns the earliest stated date that has not already passed. NSDataDetector covers
+    /// calendar dates and clock times; the narrow regex only fills its measured relative-
+    /// time gaps. Date intervals such as "before 5pm today" end at the actual deadline, so
+    /// use the interval's upper bound rather than its start.
+    static func statedDeadline(in text: String, now: Date, calendar: Calendar) -> Date? {
+        guard !text.isEmpty else { return nil }
+
+        // ponytail: Relative parsing intentionally understands only these English one-hour
+        // idioms and whole-number minutes/hours up to three digits. It does not guess about
+        // business days or the ambiguous "end of day"; widen it only with measured fixtures.
+        let relativePattern = #"\b(?:within\s+(?:the\s+)?(?:next\s+)?hour|next\s+hour|in\s+([0-9]{1,3})\s+(minutes?|mins?|hours?|hrs?))\b"#
+        let endOfDayPattern = #"\b(?:by\s+)?end\s+of\s+(?:the\s+)?day\b"#
+        guard let relativeRegex = try? NSRegularExpression(
+            pattern: relativePattern,
+            options: [.caseInsensitive]
+        ), let endOfDayRegex = try? NSRegularExpression(
+            pattern: endOfDayPattern,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+
+        let fullRange = NSRange(text.startIndex..., in: text)
+        let relativeMatches = relativeRegex.matches(in: text, range: fullRange)
+        let relativeDates = relativeMatches.compactMap { match -> Date? in
+            if match.range(at: 1).location == NSNotFound {
+                return calendar.date(byAdding: .hour, value: 1, to: now)
+            }
+            guard let numberRange = Range(match.range(at: 1), in: text),
+                  let unitRange = Range(match.range(at: 2), in: text),
+                  let number = Int(text[numberRange]), number > 0 else {
+                return nil
+            }
+            let component: Calendar.Component = text[unitRange].lowercased().hasPrefix("h")
+                ? .hour
+                : .minute
+            return calendar.date(byAdding: component, value: number, to: now)
+        }
+
+        // Mask phrases handled above so a future NSDataDetector version cannot reinterpret
+        // them against its own clock. Mask the deliberately unsupported phrase for the same
+        // reason, while preserving UTF-16 offsets for the detector.
+        let detectorText = NSMutableString(string: text)
+        let maskedMatches = relativeMatches + endOfDayRegex.matches(in: text, range: fullRange)
+        for match in maskedMatches.sorted(by: { $0.range.location > $1.range.location }) {
+            detectorText.replaceCharacters(
+                in: match.range,
+                with: String(repeating: " ", count: match.range.length)
+            )
+        }
+
+        var candidates = relativeDates
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) {
+            let value = detectorText as String
+            let detectorRange = NSRange(value.startIndex..., in: value)
+            candidates += detector.matches(in: value, range: detectorRange).compactMap { match in
+                guard let date = match.date else { return nil }
+                let deadline = date.addingTimeInterval(max(0, match.duration))
+                return deadline >= now ? deadline : nil
+            }
+        }
+        return candidates.filter { $0 >= now }.min()
+    }
+
+    /// A deterministic deadline may only make an item more urgent. A later deadline or no
+    /// deadline leaves the model's category-derived priority untouched.
+    static func escalatedPriority(
+        _ priority: Int,
+        for deadline: Date?,
+        now: Date,
+        calendar: Calendar
+    ) -> Int {
+        guard let deadline, deadline >= now,
+              let oneHourFromNow = calendar.date(byAdding: .hour, value: 1, to: now),
+              calendar.isDate(deadline, inSameDayAs: now) || deadline <= oneHourFromNow else {
+            return priority
+        }
+        return 1
+    }
+
     private static func shouldRunSecondStage(messageCount: Int) -> Bool {
         messageCount > 1
     }
@@ -484,15 +740,13 @@ enum Triage {
         second.map { [first, $0] } ?? [first]
     }
 
-    private struct InvalidTask: Error {}
-
-    private static func isSchemaName(_ value: String) -> Bool {
+    static func isSchemaName(_ value: String) -> Bool {
         ["Triage", "Item", "Result", "OutputFields", "TaskFields", "ConversationOutput", "tasks", "SingleTaskFields", "SecondTaskFields", "hasSecondTask", "secondVerb", "secondTopic", "yours", "category"].contains {
             value.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare($0) == .orderedSame
         }
     }
 
-    private static func composeAction(verb: String, topic: String) -> String? {
+    static func composeAction(verb: String, topic: String) -> String? {
         var topic = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !topic.isEmpty, topic.caseInsensitiveCompare(verb) != .orderedSame else {
             return nil
@@ -536,7 +790,9 @@ enum Triage {
 
     private static func assemble(
         results: [GeneratedResult],
-        conversations: [Conversation]
+        conversations: [Conversation],
+        now: Date = Date(),
+        calendar: Calendar = .current
     ) -> [TodoItem] {
         var counts: [Int: Int] = [:]
         for result in results where conversations.indices.contains(result.index) {
@@ -563,8 +819,12 @@ enum Triage {
                 log.warning("skipping an empty conversation id=\(conversation.id, privacy: .public)")
                 return []
             }
+            let combinedText = conversation.messages.map(\.text).joined(separator: "\n")
             let detail = conversation.messages.map { "\($0.sender): \($0.text)" }.joined(separator: "\n")
-            let common = (detail: detail, links: extractLinks(from: conversation.messages.map(\.text).joined(separator: "\n")), sender: newest.sender, channel: newest.channel, date: newest.date, permalink: newest.permalink, avatarURL: newest.avatarURL)
+            let deadline = statedDeadline(in: combinedText, now: now, calendar: calendar)
+            let deadlineEscalates = escalatedPriority(2, for: deadline, now: now, calendar: calendar) == 1
+            let deadlineReason = "A stated deadline was found in the conversation."
+            let common = (detail: detail, links: extractLinks(from: combinedText), sender: newest.sender, channel: newest.channel, date: newest.date, permalink: newest.permalink, avatarURL: newest.avatarURL)
             if let result = accepted[index] {
                 if shouldDrop(yours: result.yours, messages: conversation.messages) {
                     log.info("model declined conversation id=\(conversation.id, privacy: .public)")
@@ -575,8 +835,8 @@ enum Triage {
                     TodoItem(
                         id: taskIndex == 0 ? conversation.id : "\(conversation.id)#\(taskIndex)",
                         action: task.action,
-                        priority: task.priority,
-                        reason: task.reason,
+                        priority: escalatedPriority(task.priority, for: deadline, now: now, calendar: calendar),
+                        reason: deadlineEscalates ? "\(task.reason) \(deadlineReason)" : task.reason,
                         detail: common.detail,
                         links: common.links,
                         sender: common.sender,
@@ -588,13 +848,15 @@ enum Triage {
                     )
                 }
             }
-            let fallbackPriority = conversation.messages.contains(where: \.directlyAddressed) ? 2 : 3
+            let baseFallbackPriority = conversation.messages.contains(where: \.directlyAddressed) ? 2 : 3
+            let fallbackPriority = escalatedPriority(baseFallbackPriority, for: deadline, now: now, calendar: calendar)
+            let fallbackReason = "Fallback: Apple Intelligence could not identify a specific action."
             log.warning("falling back to a non-model item id=\(conversation.id, privacy: .public) priority=\(fallbackPriority, privacy: .public)")
             return [TodoItem(
                 id: conversation.id,
                 action: "Review message",
                 priority: fallbackPriority,
-                reason: "Fallback: Apple Intelligence could not identify a specific action.",
+                reason: deadlineEscalates ? "\(fallbackReason) \(deadlineReason)" : fallbackReason,
                 detail: common.detail,
                 links: common.links,
                 sender: common.sender,
@@ -617,7 +879,7 @@ enum Triage {
         }
     }
 
-    static func demo() {
+    static func demo() async {
         assert(priority(for: "blocked") == 1)
         assert(priority(for: "deadlineToday") == 1)
         assert(priority(for: "directRequest") == 2)
@@ -634,6 +896,78 @@ enum Triage {
         assert(Set(categories.compactMap(priority(for:))) == [1, 2, 4, 5])
         assert(categories.compactMap(priority(for:)).count == categories.count)
         assert(!categories.compactMap(priority(for:)).contains(3))
+
+        var deadlineCalendar = Calendar.current
+        deadlineCalendar.timeZone = TimeZone.current
+        let deadlineDay = deadlineCalendar.startOfDay(for: Date())
+        let deadlineNow = deadlineCalendar.date(
+            bySettingHour: 8,
+            minute: 0,
+            second: 0,
+            of: deadlineDay
+        )!
+
+        let absoluteDeadlineFixtures: [(text: String, isToday: Bool)] = [
+            ("before 5pm today", true),
+            ("by next Friday", false),
+            ("deploy is at 14:00 today", true),
+        ]
+        for fixture in absoluteDeadlineFixtures {
+            let deadline = statedDeadline(
+                in: fixture.text,
+                now: deadlineNow,
+                calendar: deadlineCalendar
+            )
+            assert(deadline != nil, "expected a deadline in: \(fixture.text)")
+            assert(deadlineCalendar.isDate(deadline!, inSameDayAs: deadlineNow) == fixture.isToday,
+                   "wrong deadline day for: \(fixture.text)")
+        }
+
+        let relativeDeadlineFixtures: [(text: String, component: Calendar.Component, value: Int)] = [
+            ("within the hour", .hour, 1),
+            ("in 30 minutes", .minute, 30),
+            ("in 45 mins", .minute, 45),
+            ("in 2 hours", .hour, 2),
+            ("in 3 hrs", .hour, 3),
+            ("next hour", .hour, 1),
+        ]
+        for fixture in relativeDeadlineFixtures {
+            let expected = deadlineCalendar.date(
+                byAdding: fixture.component,
+                value: fixture.value,
+                to: deadlineNow
+            )
+            assert(statedDeadline(in: fixture.text, now: deadlineNow, calendar: deadlineCalendar) == expected,
+                   "wrong relative deadline for: \(fixture.text)")
+        }
+
+        let noDeadlineFixtures = [
+            "version 2.0",
+            "release Sequoia 15",
+            "Q3",
+            "ENG-204",
+            "2026",
+            "at 07:00 today",
+            "by end of day",
+            "",
+        ]
+        for fixture in noDeadlineFixtures {
+            assert(statedDeadline(in: fixture, now: deadlineNow, calendar: deadlineCalendar) == nil,
+                   "unexpected deadline in: \(fixture)")
+        }
+
+        let todayDeadline = deadlineCalendar.date(byAdding: .hour, value: 2, to: deadlineNow)!
+        let nextWeekDeadline = deadlineCalendar.date(byAdding: .day, value: 7, to: deadlineNow)!
+        assert(escalatedPriority(5, for: todayDeadline, now: deadlineNow, calendar: deadlineCalendar) == 1,
+               "a deadline today must force priority 1")
+        assert(escalatedPriority(2, for: nextWeekDeadline, now: deadlineNow, calendar: deadlineCalendar) == 2,
+               "a next-week deadline must not escalate")
+        assert(escalatedPriority(1, for: nil, now: deadlineNow, calendar: deadlineCalendar) == 1,
+               "blocked must remain priority 1 without a deadline")
+        let lateNow = deadlineCalendar.date(bySettingHour: 23, minute: 30, second: 0, of: deadlineDay)!
+        let earlyTomorrow = deadlineCalendar.date(byAdding: .minute, value: 45, to: lateNow)!
+        assert(escalatedPriority(4, for: earlyTomorrow, now: lateNow, calendar: deadlineCalendar) == 1,
+               "a deadline within an hour must force priority 1 across midnight")
 
         // Every label the prompt offers is one the mapping knows, listed LEAST-URGENT-FIRST.
         // Listing them the other way collapsed every conversation onto the first label, and
@@ -704,6 +1038,150 @@ enum Triage {
         assert(actionInventsIdentifier("Review #123", notIn: "Please review #1234."))
         assert(actionInventsIdentifier("Review ENG-204", notIn: "Please review ENG-2040."))
         assert(actionInventsIdentifier("Review PR 88", notIn: "Please review PR 880."))
+
+        // Remote and on-device stage one share validatedTask. Feed every remote fixture
+        // through RemoteModelClient.Call first so this exercises the real defensive parser
+        // without a network request or Keychain access.
+        func cannedRemoteFields(
+            verb: String = "Review",
+            topic: String,
+            reason: String = "Asked directly.",
+            yours: String = "yes",
+            category: String = "directRequest"
+        ) async -> RemoteModel.Fields? {
+            let contentData = try! JSONSerialization.data(withJSONObject: [
+                "verb": verb,
+                "topic": topic,
+                "reason": reason,
+                "yours": yours,
+                "category": category,
+            ])
+            let content = String(decoding: contentData, as: UTF8.self)
+            let envelope = try! JSONSerialization.data(withJSONObject: [
+                "choices": [["message": ["content": content]]]
+            ])
+            let client = RemoteModelClient { _ in envelope }
+            let config = RemoteModel.Config(
+                baseURL: RemoteModel.openRouterBaseURL,
+                modelID: "demo-model"
+            )
+            return await client.fields(
+                conversationText: "fixture",
+                config: config,
+                apiKey: "demo-key-not-real"
+            )
+        }
+
+        func rejection(
+            _ fields: RemoteModel.Fields?,
+            text: String
+        ) -> TaskRejection? {
+            guard let fields,
+                  case .failure(let reason) = validatedTask(
+                    from: StageOneFields(fields),
+                    combinedText: text
+                  ) else {
+                return nil
+            }
+            return reason
+        }
+
+        let remoteText = "Please review the deployment checklist."
+        let validRemote = await cannedRemoteFields(topic: "deployment checklist")
+        let validOnDevice = validRemote.map(StageOneFields.init)
+        let acceptedRemote = await acceptedStageOne(
+            remoteFields: validRemote,
+            remoteSource: .openRouter,
+            combinedText: remoteText
+        ) {
+            assertionFailure("a valid remote result must not call the on-device path")
+            return nil
+        }
+        assert(acceptedRemote?.task.action == "Review deployment checklist")
+        assert(acceptedRemote?.task.priority == 2)
+        assert(acceptedRemote?.source == .openRouter)
+        let remoteDeadlineMessage = SlackMessage(
+            id: "remote-deadline",
+            conversationID: "D_REMOTE_DEADLINE",
+            sender: "Sam",
+            channel: nil,
+            text: "Please review the deployment checklist within the hour",
+            date: deadlineNow,
+            directlyAddressed: true,
+            permalink: nil
+        )
+        let remoteDeadlineItems = assemble(
+            results: [GeneratedResult(
+                index: 0,
+                tasks: [acceptedRemote!.task],
+                yours: acceptedRemote!.yours
+            )],
+            conversations: grouped([remoteDeadlineMessage]),
+            now: deadlineNow,
+            calendar: deadlineCalendar
+        )
+        assert(remoteDeadlineItems.first?.priority == 1,
+               "deterministic deadline escalation must apply after remote selection")
+
+        let bareVerb = await cannedRemoteFields(topic: "Review", category: "urgent")
+        assert(rejection(bareVerb, text: remoteText) == .invalidAction,
+               "composeAction must reject first, before the also-invalid category")
+        let rejectedThenOnDevice = await acceptedStageOne(
+            remoteFields: bareVerb,
+            remoteSource: .openRouter,
+            combinedText: remoteText
+        ) { validOnDevice }
+        assert(rejectedThenOnDevice?.source == .onDevice,
+               "a remote guard rejection must try on-device before the fallback row")
+
+        let schemaName = await cannedRemoteFields(topic: "SingleTaskFields")
+        assert(rejection(schemaName, text: "Please review SingleTaskFields") == .schemaName,
+               "an echoed schema name must be rejected")
+
+        let personOnly = await cannedRemoteFields(topic: "@rhythm")
+        assert(rejection(personOnly, text: "Please ask @rhythm") == .personOnlyTopic,
+               "a person-only topic must be rejected")
+
+        let inventedIdentifier = await cannedRemoteFields(topic: "MR !41")
+        assert(rejection(inventedIdentifier, text: remoteText) == .inventedIdentifier,
+               "an identifier absent from the conversation must be rejected")
+
+        let ungrounded = await cannedRemoteFields(topic: "launch plan")
+        assert(rejection(ungrounded, text: remoteText) == .ungroundedTopic,
+               "a topic absent from the conversation must be rejected")
+
+        let unmapped = await cannedRemoteFields(topic: "deployment checklist", category: "urgent")
+        assert(rejection(unmapped, text: remoteText) == .unmappedCategory,
+               "an unmapped category must be rejected")
+
+        let acceptedOnDevice = await acceptedStageOne(
+            remoteFields: nil,
+            remoteSource: nil,
+            combinedText: remoteText
+        ) { validOnDevice }
+        assert(acceptedOnDevice?.task.action == acceptedRemote?.task.action)
+        assert(acceptedOnDevice?.task.priority == acceptedRemote?.task.priority)
+        assert(acceptedOnDevice?.source == .onDevice,
+               "the same validator and guard order must accept both providers identically")
+
+        let nilClient = RemoteModelClient { _ in Data("{}".utf8) }
+        let nilConfig = RemoteModel.Config(
+            baseURL: RemoteModel.openRouterBaseURL,
+            modelID: "demo-model"
+        )
+        let nilRemote = await nilClient.fields(
+            conversationText: "fixture",
+            config: nilConfig,
+            apiKey: "demo-key-not-real"
+        )
+        let nilThenOnDevice = await acceptedStageOne(
+            remoteFields: nilRemote,
+            remoteSource: .openRouter,
+            combinedText: remoteText
+        ) { validOnDevice }
+        assert(nilThenOnDevice?.source == .onDevice)
+        assert(nilThenOnDevice?.task.action == "Review deployment checklist",
+               "a nil remote result must route through on-device, not to the fallback row")
 
         let first = GeneratedTask(action: "Review MR !88", priority: 2, reason: "Direct request.")
         let noSecond = secondTask(hasSecondTask: "no", verb: "Reply", topic: "about Lecol", combinedText: "please review MR !88 and reply to Lecol", first: first)

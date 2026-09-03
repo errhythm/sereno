@@ -33,6 +33,9 @@ final class Preferences {
         roleHintDismissed = store.object(forKey: Key.roleHintDismissed) as? Bool ?? false
         hasCompletedOnboarding = store.object(forKey: Key.hasCompletedOnboarding) as? Bool ?? false
         popoverHeight = store.object(forKey: Key.popoverHeight) as? Double
+        modelProvider = RemoteModelProvider(rawValue: store.string(forKey: Key.modelProvider) ?? "") ?? .onDevice
+        remoteModelID = store.string(forKey: Key.remoteModelID) ?? ""
+        customBaseURLString = store.string(forKey: Key.customBaseURLString) ?? ""
     }
 
     /// What the user does, in their own words. Passed to the model so it can judge whether
@@ -118,14 +121,17 @@ final class Preferences {
     /// accessory app has no ordinary launch window where first-run guidance can live.
     var hasCompletedOnboarding: Bool { didSet { store.set(hasCompletedOnboarding, forKey: Key.hasCompletedOnboarding) } }
 
-    /// The popover height the user dragged its bottom edge to, in points. nil means they
-    /// never did, which is the only state where auto-fit is allowed to touch the height:
-    /// two mechanisms writing one number is how the panel ended up stuck at one card tall.
+    /// The popover height the user dragged its bottom edge to, in points, as a CONTENT
+    /// height: the panel asks its content to be this tall and MenuBarExtra sizes the
+    /// window from that. nil means the user never dragged one, and then the content sizes
+    /// itself. There is no second mechanism — setting the window's frame was measured
+    /// being overwritten a moment later, so it was removed (see Foreground.panelHeight).
     ///
-    /// Stored raw and clamped nowhere near here. The real limits — never taller than the
-    /// screen's visible frame, never shorter than the chrome plus one row — need the live
-    /// window and its screen, so they live in `Foreground.manualPopoverFrame`, which every
-    /// path that applies this value goes through. That also keeps this a plain didSet:
+    /// Stored already clamped, by the only writer, `Foreground.setPopoverHeight`: the
+    /// limits — never taller than the screen has room for, never shorter than the chrome
+    /// plus one row — need the live window and its screen. Reading it back applies the
+    /// same clamp again, which is stable, so a value stored on a big screen cannot come
+    /// back as an impossible one on a small screen. Clamping HERE is what is ruled out:
     /// clamping inside a didSet would have to assign to the property it fired from, and
     /// @Observable routes that back through the generated setter and recurses until the
     /// stack dies (see refreshMinutes for the shape that needs the explicit setter).
@@ -135,6 +141,23 @@ final class Preferences {
     var canFetchWeather: Bool {
         weatherEnabled && weatherLatitude != nil && weatherLongitude != nil
     }
+
+    /// Which model triages a conversation. On-device by default: a user who never opens
+    /// Settings must never trigger a network call, and the on-device path is the only one
+    /// wired into Triage today (see RemoteModel.swift's header comment for the wiring this
+    /// still needs). A plain didSet, not the explicit-setter shape refreshMinutes uses:
+    /// there is nothing to clamp here, `RemoteModelProvider` is a closed Swift enum, and an
+    /// invalid stored rawValue can only arise from decoding old UserDefaults data, which is
+    /// handled once in init above, not on every set.
+    var modelProvider: RemoteModelProvider { didSet { store.set(modelProvider.rawValue, forKey: Key.modelProvider) } }
+
+    /// The model id the user typed, e.g. an OpenRouter slug. Plain string, not a picker:
+    /// OpenRouter's catalog, including its free models, changes too often to hardcode.
+    var remoteModelID: String { didSet { store.set(remoteModelID, forKey: Key.remoteModelID) } }
+
+    /// Base URL for `.custom` only; `.openRouter` uses RemoteModel.openRouterBaseURL, a
+    /// fixed constant, not a preference. Empty and unread while `.custom` is not selected.
+    var customBaseURLString: String { didSet { store.set(customBaseURLString, forKey: Key.customBaseURLString) } }
 
     /// Addressing signals the user has switched off. Detection still records every signal,
     /// this only decides which ones are allowed to create a task.
@@ -165,8 +188,13 @@ final class Preferences {
         roleHintDismissed = false
         hasCompletedOnboarding = false
         popoverHeight = nil
+        modelProvider = .onDevice
+        remoteModelID = ""
+        customBaseURLString = ""
         // The assignments above run didSet and write defaults back, so this second sweep
-        // is what leaves the UserDefaults domain clean after a reset.
+        // is what leaves the UserDefaults domain clean after a reset. The API key is not
+        // touched here: it lives in the Keychain, not UserDefaults, and RemoteModelKeychain
+        // owns clearing it (App.swift's reset flow calls it alongside SlackAuth.disconnect()).
         Key.all.forEach(store.removeObject)
     }
 
@@ -187,12 +215,15 @@ final class Preferences {
         static let roleHintDismissed = "roleHintDismissed"
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
         static let popoverHeight = "popoverHeight"
+        static let modelProvider = "modelProvider"
+        static let remoteModelID = "remoteModelID"
+        static let customBaseURLString = "customBaseURLString"
 
         static let all = [
             role, refreshMinutes, notifyNewItems, notifySnoozeWake, countBroadcast,
             countNameMentions, snoozeHours, morningHour, windowAlwaysOnTop, weatherEnabled,
             weatherCity, weatherLatitude, weatherLongitude, roleHintDismissed, hasCompletedOnboarding,
-            popoverHeight
+            popoverHeight, modelProvider, remoteModelID, customBaseURLString
         ]
     }
 }
@@ -211,8 +242,11 @@ func demoPreferences() {
     assert(prefs.countNameMentions)
     assert(!prefs.roleHintDismissed, "the role hint should show until dismissed")
     assert(!prefs.hasCompletedOnboarding, "onboarding should begin incomplete")
-    assert(prefs.popoverHeight == nil, "no manual height means auto-fit owns the popover")
+    assert(prefs.popoverHeight == nil, "no manual height means the content sizes itself")
     assert(prefs.ignoredSignals == [.broadcast])
+    assert(prefs.modelProvider == .onDevice, "a user who never opens Settings must stay on-device")
+    assert(prefs.remoteModelID.isEmpty)
+    assert(prefs.customBaseURLString.isEmpty)
 
     // Clamping, so a bad value cannot wedge the refresh timer.
     prefs.refreshMinutes = 0
@@ -232,12 +266,27 @@ func demoPreferences() {
     assert(reloaded.hasCompletedOnboarding)
     assert(reloaded.ignoredSignals == [.broadcast, .nameMentioned])
 
+    // Remote model choice round-trips like any other preference. The API key never does:
+    // it is not stored here at all, see RemoteModelKeychain.
+    prefs.modelProvider = .openRouter
+    prefs.remoteModelID = "meta-llama/llama-3.3-70b-instruct:free"
+    let reloadedProvider = Preferences(store: suite)
+    assert(reloadedProvider.modelProvider == .openRouter)
+    assert(reloadedProvider.remoteModelID == "meta-llama/llama-3.3-70b-instruct:free")
+    prefs.modelProvider = .custom
+    prefs.customBaseURLString = "http://localhost:1234/v1/chat/completions"
+    assert(Preferences(store: suite).customBaseURLString == "http://localhost:1234/v1/chat/completions")
+    // An old UserDefaults domain with no modelProvider key must default to on-device, not
+    // decode a garbage rawValue into some arbitrary case.
+    suite.removeObject(forKey: "modelProvider")
+    assert(Preferences(store: suite).modelProvider == .onDevice)
+
     // The dragged popover height has to survive a relaunch, and clearing it has to put
-    // auto-fit back in charge rather than leave a stale number behind.
+    // content sizing back in charge rather than leave a stale number behind.
     prefs.popoverHeight = 420
     assert(Preferences(store: suite).popoverHeight == 420, "a dragged height must persist")
     prefs.popoverHeight = nil
-    assert(Preferences(store: suite).popoverHeight == nil, "clearing it must return to auto-fit")
+    assert(Preferences(store: suite).popoverHeight == nil, "clearing it must return to content sizing")
 
     assert(prefs.windowAlwaysOnTop, "the window should float by default")
     prefs.windowAlwaysOnTop = false
@@ -267,6 +316,8 @@ func demoPreferences() {
     assert(prefs.weatherLatitude == nil && prefs.weatherLongitude == nil && !prefs.roleHintDismissed)
     assert(!prefs.hasCompletedOnboarding && prefs.ignoredSignals == [.broadcast])
     assert(prefs.popoverHeight == nil)
+    assert(prefs.modelProvider == .onDevice && prefs.remoteModelID.isEmpty && prefs.customBaseURLString.isEmpty,
+           "reset must fall back to on-device, never leave a remote provider selected")
     let reset = Preferences(store: suite)
     assert(reset.role.isEmpty && reset.refreshMinutes == 5 && reset.notifyNewItems && reset.notifySnoozeWake)
     assert(!reset.countBroadcast && reset.countNameMentions && reset.snoozeHours == 3 && reset.morningHour == 9)
@@ -274,6 +325,7 @@ func demoPreferences() {
     assert(reset.weatherLatitude == nil && reset.weatherLongitude == nil && !reset.roleHintDismissed)
     assert(!reset.hasCompletedOnboarding && reset.ignoredSignals == [.broadcast])
     assert(reset.popoverHeight == nil)
+    assert(reset.modelProvider == .onDevice && reset.remoteModelID.isEmpty && reset.customBaseURLString.isEmpty)
 
     print("demoPreferences: PASS")
 }

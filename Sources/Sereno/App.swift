@@ -214,226 +214,127 @@ enum Foreground {
         window.styleMask.insert(.resizable)
     }
 
-    /// Where a popover showing `idealHeight` of content belongs, given where it sits now
-    /// and what the screen allows. Returns nil when it is already the right size.
+    /// The height the popover's CONTENT asks for: `nil` while the user has not dragged
+    /// one, which means the content sizes itself and the panel is exactly as tall as the
+    /// list, the banners and the chrome make it.
     ///
-    /// Pure, and takes the current content height as well as the frame so it never assumes
-    /// the two are equal: `chrome` is whatever the window adds around its content, and the
-    /// frame grows by exactly the amount the content wants. demoPopoverFit checks it.
+    /// This is the ONLY thing that decides the panel's height, and it is deliberately a
+    /// content height and not a window frame. Measured on the owner's machine, one
+    /// continuous drag of the grip: every `setFrame` took effect (`got=` matched what was
+    /// asked for) and every following line still read `from=321.000`, 321 being the live
+    /// content height. So MenuBarExtra re-derives its window's size from the content
+    /// continuously, not once at presentation, and it wins every time. Setting the
+    /// NSWindow's frame is therefore the wrong lever — it was overwritten before the next
+    /// mouse event, and the leftover origin (we moved y to hold the top edge, then the
+    /// height snapped back) is exactly the "section goes to the top, half of it off the
+    /// screen" the owner saw. That same overwrite is why auto-fit never worked either:
+    /// both bugs were one bug. Sizing the content instead makes the framework's own
+    /// re-derivation do the work.
     ///
-    /// The TOP edge is the anchor, not the origin. An NSWindow's frame origin is its
-    /// bottom-left, so growing the height in place would push the popover UP through the
-    /// menu bar; a popover hangs downwards from its status item, so maxY is what has to
-    /// stay put.
-    nonisolated static func popoverFrame(current: NSRect, contentHeight: CGFloat,
-                                         idealHeight: CGFloat, visible: NSRect,
-                                         growOnly: Bool = false) -> NSRect? {
-        let top = current.maxY
-        let chrome = current.height - contentHeight
-        // How far down the screen the popover may reach. Beyond this the list scrolls,
-        // which is what the ScrollView is for.
-        let room = top - visible.minY
-        guard room > 0 else { return nil }
-        let height = min(idealHeight + chrome, room)
-        // growOnly is a deliberate safety catch, not a preference: see fitPopover. A
-        // measurement this code cannot verify can only do harm by shrinking, and the
-        // reported symptom is a panel that is too short.
-        if growOnly, height < current.height { return nil }
-        // A point of slack, and it is load-bearing: resizing makes SwiftUI lay the content
-        // out again, which calls back in here, and this is what stops that from looping.
-        guard abs(height - current.height) > 1 else { return nil }
-        return NSRect(x: current.minX, y: top - height, width: current.width, height: height)
+    /// Pure, so demoPopoverHeight can check it without a window. `room` is how far down
+    /// the screen the panel may reach, and beyond it the list scrolls, which is what the
+    /// ScrollView is for. The floor is chrome plus one row, so a drag cannot leave a panel
+    /// with nothing in it. When the two disagree the SCREEN wins, because the bottom half
+    /// of a panel taller than the screen cannot be reached to drag back. A room of 0 or
+    /// less means "no screen to measure", which must not collapse the panel, so only the
+    /// floor applies.
+    nonisolated static func panelHeight(manual: Double?, room: CGFloat,
+                                        minimum: CGFloat) -> CGFloat? {
+        guard let manual else { return nil }
+        let floored = max(CGFloat(manual), minimum)
+        guard room > 0 else { return floored }
+        return min(floored, room)
     }
 
-    /// Resize the popover to fit its content. MenuBarExtra frames its window from the
-    /// content once, when it opens, and then never asks again: a to-do arriving while the
-    /// panel was open landed below the fold and the user could not see it. Reported from
-    /// the field as "it keeps the old height so I can not see the new one".
-    ///
-    /// This is the fourth entry in the same family as applyWindowTraits above — a
-    /// scene-level behaviour that does not do what its name implies, fixed by reading the
-    /// real NSWindow. There is no scene modifier for it at all: `.defaultSize` is
-    /// documented for other scene types and silently does nothing on MenuBarExtra (see the
-    /// note in SerenoApp.body), and no SwiftUI expression can make an NSWindow re-measure.
-    ///
-    /// Driven by `fittingSize`, which is the content's own ideal height, so every one of
-    /// the things that changes it — rows, both banners, the role hint, the compose area,
-    /// the undo bar, the snoozed section — is accounted for without this knowing they
-    /// exist. Measured: with the window pinned at 161 and the content grown from one row
-    /// to three, fittingSize reports 233 while the frame is still 161, and it reports 485
-    /// at twelve rows (the list's own 400 cap) and back down to 161 at one, so it tracks
-    /// shrinking as well as growing.
-    ///
-    /// GROW ONLY, deliberately, and this is the second attempt. The first shipped both
-    /// directions and the field report came back "showing the height of 1 card". Measured
-    /// afterwards, the SwiftUI side is NOT at fault: the panel's own ideal height is 161,
-    /// 233 and 485 at one, three and twelve rows, so it does track its rows, and the
-    /// ScrollView's frame modifier does not swallow that. What no headless harness can
-    /// observe is the live popover's `contentView`, which is where both inputs above come
-    /// from. A wrong reading there can only do harm by SHRINKING, and too-short is exactly
-    /// the symptom, so shrinking stays off until the log lines below report the real
-    /// numbers from a running app. Re-enable by dropping growOnly once they do.
-    ///
-    /// ponytail: it fires on every content change, including each frame of a row's insert
-    /// animation, so the panel's height animates along with the row. If that reads as
-    /// jitter, the upgrade path is to coalesce on the next runloop turn rather than to
-    /// start guessing heights.
-    ///
-    /// And it defers entirely to a height the user dragged the bottom edge to. Auto-fit
-    /// applies only while `Preferences.popoverHeight` is nil; see popoverTarget, which is
-    /// the one place that decides between the two.
-    static func fitPopover() {
-        // The FIRST thing, before any guard, so silence can no longer be misread. Every
-        // return below says which of them it was: a nil handed-over reference, an
-        // invisible window, a missing contentView and a missing screen used to be four
-        // different failures and the visibleFrame one returned without a word.
-        //
-        // .info, not .debug: debug is not persisted on the machine this has to be
-        // diagnosed on — eight hours of unified log held zero debug lines — so every
-        // earlier round of these went nowhere. Still all .public, because every value
-        // here is geometry or a view class name and never message content.
-        let manual = Preferences.shared.popoverHeight
-        let target = popover ?? NSApp.windows.first {
-            $0.isVisible && $0.level == .popUpMenu && $0.identifier == nil
-        }
-        let wanted = manual.map { String(format: "%.0f", $0) } ?? "auto"
-        popoverLog.info("""
-            fitPopover enter handed=\(popover != nil, privacy: .public) \
-            found=\(target != nil, privacy: .public) height=\(wanted, privacy: .public)
-            """)
+    /// The same, reading the live preference and the live screen. Called from the panel's
+    /// body, so the `popoverHeight` read is what registers the @Observable dependency that
+    /// makes a drag redraw the content at the new height.
+    static func panelHeight() -> CGFloat? {
+        panelHeight(manual: Preferences.shared.popoverHeight, room: popoverRoom(),
+                    minimum: popoverMinimumHeight)
+    }
 
-        guard let window = target else {
-            popoverLog.info("fitPopover skip: no popover window, panel keeps the height it has")
-            return
-        }
-        guard window.isVisible else {
-            popoverLog.info("fitPopover skip: popover window is not visible")
-            return
-        }
-        guard let content = window.contentView else {
-            popoverLog.info("fitPopover skip: popover window has no contentView")
-            return
-        }
-        guard let visible = (window.screen ?? NSScreen.main)?.visibleFrame else {
-            popoverLog.info("fitPopover skip: popover window has no screen and NSScreen.main is nil")
-            return
-        }
-
-        // Numbers and a class name, so all .public: this is geometry, never message
-        // content. These are the two reads no headless harness can observe — the LIVE
-        // popover's contentView — and the field failure is in one of them, so they get
-        // logged rather than guessed at a second time.
-        let ideal = content.fittingSize.height
-        let kind = String(describing: type(of: content))
-        popoverLog.info("""
-            fitPopover frame=\(window.frame.height, privacy: .public) \
-            content=\(content.frame.height, privacy: .public) \
-            ideal=\(ideal, privacy: .public) \
-            room=\(window.frame.maxY - visible.minY, privacy: .public) \
-            view=\(kind, privacy: .public) height=\(wanted, privacy: .public)
-            """)
-
-        guard let frame = popoverTarget(manual: manual, current: window.frame,
-                                        contentHeight: content.frame.height,
-                                        idealHeight: ideal, visible: visible,
-                                        minimum: popoverMinimumHeight)
-        else {
-            popoverLog.info("""
-                fitPopover skip: already the right size \
-                (\(wanted, privacy: .public) against \(window.frame.height, privacy: .public)), \
-                or growOnly refused a shrink
-                """)
-            return
-        }
-        window.setFrame(frame, display: true)
-        // Read back AFTER the set, because that is the whole question: a height here that
-        // does not match `to` means MenuBarExtra refused the frame outright, and a later
-        // line whose frame= has fallen back means it reasserted its own asynchronously.
-        popoverLog.info("""
-            fitPopover set to=\(frame.height, privacy: .public) \
-            got=\(window.frame.height, privacy: .public) \
-            height=\(wanted, privacy: .public)
-            """)
+    /// How far the panel may reach down the screen from its pinned top edge. Measured off
+    /// the live window when there is one — read-only, this no longer sets anything — and
+    /// off the whole visible frame before the first presentation resolves it, which is the
+    /// most room there could be. Off by the window's chrome, since it bounds a content
+    /// height with a window measurement; that is a point or two of slack in a clamp, not a
+    /// size anything is set to.
+    static func popoverRoom() -> CGFloat {
+        guard let window = popover,
+              let visible = (window.screen ?? NSScreen.main)?.visibleFrame
+        else { return NSScreen.main?.visibleFrame.height ?? 0 }
+        return window.frame.maxY - visible.minY
     }
 
     /// The smallest the panel may be dragged to: the popover's chrome plus one whole row.
-    /// 161 is measured, not chosen — it is the popover's own ideal height at one row (see
-    /// fitPopover's note), and the list's 72pt floor is one section header plus one row of
-    /// it, so the remaining 89 is the header, both dividers and the footer. Below this the
-    /// drag would produce a panel with nothing in it.
+    /// 161 is measured, not chosen — the content's own ideal height at one row under
+    /// NSHostingView, of which the list's 72pt floor is one section header plus one row,
+    /// leaving 89 for the header, both dividers and the footer. It is a FLOOR and not a
+    /// typical height: the live panel reports 321 at one to-do because the owner's machine
+    /// has an error banner up on nearly every refresh, plus the role hint and the snoozed
+    /// section. Do not read the harness's numbers as the live ones.
     nonisolated static let popoverMinimumHeight: CGFloat = 161
 
-    /// Where a popover the user has dragged the bottom edge of belongs. Same top-edge
-    /// anchor and same point of slack as popoverFrame, and the clamp the requirement
-    /// names: never past the bottom of the screen, never shorter than `minimum`. The
-    /// screen wins if the two ever disagree, because a panel taller than the screen has
-    /// its bottom half out of reach. Returns nil when it is already there.
-    nonisolated static func manualPopoverFrame(current: NSRect, height: CGFloat,
-                                               visible: NSRect,
-                                               minimum: CGFloat) -> NSRect? {
-        let top = current.maxY
-        let room = top - visible.minY
-        guard room > 0 else { return nil }
-        let clamped = min(max(height, minimum), room)
-        guard abs(clamped - current.height) > 1 else { return nil }
-        return NSRect(x: current.minX, y: top - clamped, width: current.width, height: clamped)
-    }
-
-    /// Which of the two mechanisms owns the popover's height, in ONE place. A manual
-    /// height wins outright and auto-fit is not consulted at all; auto-fit runs only
-    /// while there is none. Two mechanisms writing one number is the shape of the bug
-    /// this panel is already suffering from, so there is exactly one branch and it is
-    /// pure — demoPopoverGrip checks the precedence without needing a window.
-    nonisolated static func popoverTarget(manual: Double?, current: NSRect,
-                                          contentHeight: CGFloat, idealHeight: CGFloat,
-                                          visible: NSRect, minimum: CGFloat) -> NSRect? {
-        if let manual {
-            return manualPopoverFrame(current: current, height: CGFloat(manual),
-                                      visible: visible, minimum: minimum)
-        }
-        return popoverFrame(current: current, contentHeight: contentHeight,
-                            idealHeight: idealHeight, visible: visible, growOnly: true)
-    }
-
     /// Called from the grab strip on every mouse move, which is what makes it feel like a
-    /// resize rather than a commit on release. Stores the CLAMPED height, so a drag that
-    /// ran past the screen edge does not come back after a relaunch as an impossible one.
+    /// resize rather than a commit on release. All it does is store the clamped height:
+    /// the preference is @Observable, so the panel redraws at that height, and
+    /// MenuBarExtra resizes its window to the content. Nothing here touches a frame.
     static func setPopoverHeight(_ wanted: CGFloat) {
-        guard let window = popover, window.isVisible,
-              let visible = (window.screen ?? NSScreen.main)?.visibleFrame
-        else {
-            popoverLog.info("popover drag: no popover window to resize")
-            return
-        }
-        guard let frame = manualPopoverFrame(current: window.frame, height: wanted,
-                                             visible: visible,
-                                             minimum: popoverMinimumHeight) else { return }
-        let before = window.frame.height
-        window.setFrame(frame, display: true)
-        Preferences.shared.popoverHeight = frame.height
-        // THE measurement this whole feature exists to take. from= is the live frame just
-        // before the set, got= just after. from= stuck at one value while to= keeps
-        // climbing means MenuBarExtra owns this geometry and reasserts it, and the answer
-        // is to size the CONTENT so SwiftUI grows the popover. from= tracking to= means
-        // setFrame works, and auto-fit's failure is about measurement or triggering.
+        let room = popoverRoom()
+        guard let height = panelHeight(manual: Double(wanted), room: room,
+                                       minimum: popoverMinimumHeight) else { return }
+        guard Preferences.shared.popoverHeight != Double(height) else { return }
+        Preferences.shared.popoverHeight = Double(height)
+        // .info, not .debug: debug is not persisted on the machine this has to be
+        // diagnosed on — eight hours of unified log held zero debug lines. All .public,
+        // because every value here is geometry and never message content.
+        //
+        // window= is the frame as it stands BEFORE SwiftUI has laid the content out
+        // again, so across a drag it is the PREVIOUS request, one line behind. That is
+        // the tell: window= climbing behind request= means the content is driving the
+        // window, which is the fix working. window= stuck at one value while request=
+        // climbs means the content height is not reaching the window at all.
         popoverLog.info("""
             popover drag wanted=\(wanted, privacy: .public) \
-            from=\(before, privacy: .public) \
-            to=\(frame.height, privacy: .public) \
-            got=\(window.frame.height, privacy: .public)
+            request=\(height, privacy: .public) \
+            room=\(room, privacy: .public) \
+            window=\(popover?.frame.height ?? -1, privacy: .public)
             """)
     }
 
-    /// Double-clicking the grip: forget the dragged height and hand the panel back to
-    /// auto-fit. The escape hatch from a drag that left it a useless size.
+    /// Double-clicking the grip: forget the dragged height and let the content size
+    /// itself again. The escape hatch from a drag that left it a useless size.
     static func clearPopoverHeight() {
         Preferences.shared.popoverHeight = nil
-        popoverLog.info("popover drag cleared, auto-fit owns the height again")
-        fitPopover()
+        popoverLog.info("popover drag cleared, the content sizes itself again")
     }
 
-    /// One logger for the popover's geometry, shared by fitPopover and the grab strip so
-    /// both land in the same category for a single `log show` predicate.
+    /// What the window did with the height the content asked for. Runs from the panel's
+    /// WindowReader, so on every content change, which is exactly when the answer can
+    /// have moved.
+    ///
+    /// This is the line that replaces `fitPopover`'s. The old one reported a frame we had
+    /// just set, which told us nothing once it turned out the framework overwrote it a
+    /// moment later. This one reports a frame nothing here sets: window= following
+    /// request= (and, with no request, following content=) is the mechanism working, and
+    /// window= sitting at one value while the other two climb is it not reaching the
+    /// window at all.
+    static func logPanelHeight(_ window: NSWindow?, request: CGFloat?) {
+        guard let window else {
+            popoverLog.info("popover content: no window yet")
+            return
+        }
+        let asked = request.map { String(format: "%.0f", $0) } ?? "auto"
+        popoverLog.info("""
+            popover content request=\(asked, privacy: .public) \
+            window=\(window.frame.height, privacy: .public) \
+            content=\(window.contentView?.fittingSize.height ?? -1, privacy: .public)
+            """)
+    }
+
+    /// One logger for the popover's geometry, shared by the grab strip and the panel's
+    /// own window reader so both land in the same category for one `log show` predicate.
     private static let popoverLog = Logger(subsystem: "com.rhystart.sereno", category: "popover")
 
     /// The live menu bar popover, handed over by the WindowReader the popover's own content
@@ -549,7 +450,13 @@ private struct PopoverResizeGrip: View {
                     .exclusively(before: DragGesture(minimumDistance: 1)
                         .onChanged { _ in
                             let y = NSEvent.mouseLocation.y
-                            let start = anchor ?? (y, Foreground.popover?.frame.height
+                            // The anchor is the height this WRITES, not the window's, so
+                            // a second drag carries on from where the first left off
+                            // instead of drifting by the window's chrome each time. Only
+                            // the very first drag has no stored height, and the live
+                            // window is the closest thing to it.
+                            let start = anchor ?? (y, Foreground.panelHeight()
+                                                      ?? Foreground.popover?.frame.height
                                                       ?? Foreground.popoverMinimumHeight)
                             anchor = start
                             // Screen y counts upwards and the panel grows downwards from
@@ -619,6 +526,9 @@ private struct SettingsView: View {
             Tab("Slack", systemImage: "link", value: SettingsTab.slack) {
                 SlackPane()
             }
+            Tab("Model", systemImage: "cpu", value: SettingsTab.model) {
+                ModelPane()
+            }
             Tab("Notifications", systemImage: "bell", value: SettingsTab.notifications) {
                 NotificationsPane()
             }
@@ -635,7 +545,7 @@ private struct SettingsView: View {
 /// String raw values, not the case order, because this is written to UserDefaults and
 /// inserting a tab later must not land an existing user on a different one.
 private enum SettingsTab: String {
-    case general, slack, notifications, appearance, about
+    case general, slack, model, notifications, appearance, about
 }
 
 /// The shape every pane shares. The width is fixed so the tab bar does not jump as the
@@ -762,6 +672,105 @@ private struct SlackPane: View {
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+}
+
+/// Which model triages a conversation, and its credentials. On-device is the default and
+/// the only choice that makes zero network calls; the footer under the picker says so in
+/// plain language for every other choice, per this app's one rule about staying a Slack
+/// helper and CLAUDE.md's disclosure requirement for this pane specifically.
+///
+/// The API key never touches `Preferences`/UserDefaults: it round-trips through
+/// `RemoteModelKeychain` directly, loaded once into local `@State` on appear and written back
+/// only on an explicit Save, the same shape SlackPane already uses for its own credential
+/// (there the token never surfaces in Settings at all; here it has to, so the user can type
+/// it, but it is never bound directly to a persisted preference).
+@MainActor
+private struct ModelPane: View {
+    @Bindable private var prefs = Preferences.shared
+    @State private var apiKey = ""
+    @State private var keyStatus: String?
+
+    var body: some View {
+        Pane {
+            Section {
+                Picker("Model", selection: $prefs.modelProvider) {
+                    ForEach(RemoteModelProvider.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+            } header: {
+                Text("Model")
+            } footer: {
+                // Not softened and not a tooltip: this is the one place the app says a
+                // network call is about to start carrying message text off the Mac.
+                if let disclosure = prefs.modelProvider.disclosure {
+                    Text(disclosure)
+                } else {
+                    Text("Runs entirely on this Mac. Nothing about your Slack messages ever leaves it.")
+                }
+            }
+
+            if prefs.modelProvider != .onDevice {
+                Section {
+                    TextField("Model ID", text: $prefs.remoteModelID,
+                              prompt: Text(prefs.modelProvider == .openRouter
+                                           ? "meta-llama/llama-3.3-70b-instruct:free"
+                                           : "the model name your endpoint expects"))
+                    if prefs.modelProvider == .custom {
+                        TextField("Base URL", text: $prefs.customBaseURLString,
+                                  prompt: Text("http://localhost:1234/v1/chat/completions"))
+                    }
+                } header: {
+                    Text(prefs.modelProvider == .openRouter ? "OpenRouter" : "Endpoint")
+                } footer: {
+                    Text(prefs.modelProvider == .openRouter
+                         ? "Model names on OpenRouter change often, free ones included, so type the exact id from openrouter.ai/models."
+                         : "Any OpenAI-compatible /chat/completions endpoint, including one you run yourself.")
+                }
+
+                Section {
+                    SecureField("API key", text: $apiKey, prompt: Text("stored in your Keychain, not in Settings"))
+                        .onSubmit(saveKey)
+                    HStack {
+                        Button("Save key", action: saveKey)
+                            .disabled(apiKey.isEmpty)
+                            .pointerCursor()
+                        Button("Clear key", role: .destructive, action: clearKey)
+                            .pointerCursor()
+                        Spacer()
+                        if let keyStatus {
+                            Text(keyStatus)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("API key")
+                } footer: {
+                    Text("Kept in your Keychain, never in a file or in Settings' own storage.")
+                }
+            }
+        }
+        .onAppear { apiKey = RemoteModelKeychain.load() ?? "" }
+    }
+
+    private func saveKey() {
+        guard !apiKey.isEmpty else { return }
+        do {
+            try RemoteModelKeychain.save(apiKey)
+            keyStatus = "Saved."
+        } catch {
+            keyStatus = "Could not save the key to your Keychain."
+        }
+    }
+
+    private func clearKey() {
+        do {
+            try RemoteModelKeychain.delete()
+            apiKey = ""
+            keyStatus = "Removed."
+        } catch {
+            keyStatus = "Could not remove the key."
         }
     }
 }
@@ -893,7 +902,7 @@ private struct AboutPane: View {
             Button("Reset Sereno", role: .destructive, action: reset)
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Every to-do Sereno has collected is deleted, every setting goes back to its default, and the Slack token is removed from your Keychain. Nothing in Slack itself changes. This cannot be undone.")
+            Text("Every to-do Sereno has collected is deleted, every setting goes back to its default, and the Slack token and any remote model API key are removed from your Keychain. Nothing in Slack itself changes. This cannot be undone.")
         }
     }
 
@@ -912,6 +921,9 @@ private struct AboutPane: View {
         // A completed browser round trip must not put a fresh token back after reset.
         SlackAuth.shared.cancelConnect()
         SlackAuth.shared.disconnect()
+        // Preferences.resetAll() already put modelProvider back to .onDevice; this is the
+        // Keychain half of that same reset, same as the Slack disconnect two lines up.
+        try? RemoteModelKeychain.delete()
         showOnboarding()
     }
 }
@@ -1849,6 +1861,22 @@ private struct MenuContent: View {
         _undoShown = State(initialValue: undoShown)
     }
 
+    /// The explicit height the popover's content asks for, or nil to size itself. Read
+    /// in `panel`, which is what registers the @Observable dependency on the preference,
+    /// so dragging the grip redraws this panel at the new height. Always nil in the
+    /// window scene, which is resizable by its own frame and has no grip.
+    private var panelHeight: CGFloat? { windowed ? nil : Foreground.panelHeight() }
+
+    /// The list's height cap. 400 is the popover's own limit on how far the list may
+    /// grow the panel by itself; once a height is dragged the panel's height is decided
+    /// and the list is the one thing that can absorb the difference, so the cap has to
+    /// come off — leaving it on is what would put dead space above and below the content
+    /// of a 600pt panel. Pure and static so demoPopoverHeight can check it without
+    /// building a body. The window scene has always been uncapped.
+    nonisolated static func listCap(windowed: Bool, panelHeight: CGFloat?) -> CGFloat {
+        windowed || panelHeight != nil ? .infinity : 400
+    }
+
     /// Done and snoozed items are not part of the list, the count, or the badge. The
     /// predicate itself lives in one place (`Store.visible`) and the badge reads the same
     /// one; nothing here keeps a copy of it.
@@ -1919,30 +1947,31 @@ private struct MenuContent: View {
                 .padding(12)
         } else {
             core
-                .frame(width: 360)
+                // THE height of the panel, and the only place one is set. nil is the
+                // normal case and means the content sizes itself, which is also what
+                // makes a to-do arriving while the panel is open grow it: MenuBarExtra
+                // re-derives its window from the content continuously (measured — see
+                // Foreground.panelHeight), so a taller content is a taller window. A
+                // dragged height becomes an explicit one here instead, and .top so any
+                // slack falls at the bottom rather than being split above the header.
+                .frame(width: 360, height: panelHeight, alignment: .top)
                 .background(Color(nsColor: .textBackgroundColor))
                 // The bottom edge, made draggable. Overlaid rather than stacked so it
-                // costs no layout height and cannot change what fittingSize reports.
+                // costs no layout height and cannot change the height asked for above.
                 .overlay(alignment: .bottom) { PopoverResizeGrip() }
                 // Popover branch only. In the window branch this would hand the window
                 // scene's own window to closePopover, which would then order out the window
                 // the button had just opened.
                 //
-                // OPEN QUESTION, needs a human with the app running: whether this popover's
-                // window re-measures when the content grows after it is presented. It is
-                // framed from its content, and the panel opens while the list is still
-                // empty because `refreshIfStale` has not returned, so if the frame does not
-                // grow when the rows land, the list absorbs the whole difference (hence the
-                // floor above). This file's own trap list has three cases of a scene-level
-                // behaviour not matching its modifier name where the fix was to read the
-                // real NSWindow — and `Foreground.capture` below already holds this one, so
-                // the lever is here if it turns out the frame is stale.
-                // capture first, fitPopover reads what it stored. updateNSView runs on
-                // every content change, which is exactly when the ideal height can have
-                // moved, so no observer or timer of its own is needed.
-                .background(WindowReader {
-                    Foreground.capture($0)
-                    Foreground.fitPopover()
+                // Nothing here sets a frame any more: the reference is for closePopover,
+                // and for the read-only screen-room measurement the drag clamp needs.
+                // updateNSView runs on every content change, so this is also the one place
+                // that can report what the window actually did with the height the content
+                // asked for — the line that proves the mechanism, since the frame= that
+                // used to fall back to 321 is now expected to follow request=.
+                .background(WindowReader { window in
+                    Foreground.capture(window)
+                    Foreground.logPanelHeight(window, request: panelHeight)
                 })
         }
     }
@@ -2235,7 +2264,8 @@ private struct MenuContent: View {
             // ponytail: what shortens the popover in the first place is not established
             // (see the note in `panel`). The floor makes the symptom impossible either way,
             // which is the part that can be fixed from inside SwiftUI.
-            .frame(minHeight: 72, maxHeight: windowed ? .infinity : 400)
+            .frame(minHeight: 72, maxHeight: Self.listCap(windowed: windowed,
+                                                          panelHeight: panelHeight))
             .animation(.spring(duration: 0.25), value: items.map(\.id))
             .focusable()
             .focusEffectDisabled()
@@ -2526,162 +2556,75 @@ func demoVisibleSelector() {
           + " == rows \(MenuContent(store: store).items.count)")
 }
 
-/// The popover's resize arithmetic. The window itself needs a human, but the geometry does
-/// not: what has to hold is that the top edge never moves, that the screen is respected,
-/// that it works in both directions, and that it stops asking once it fits — that last one
-/// is what keeps resizing (which relayouts the content, which calls back in) from looping.
-func demoPopoverFit() {
-    // A 1440x900 screen with the menu bar taken off the top, and a popover hanging under
-    // the status item: 360 wide, 161 tall, its top edge just below the menu bar.
-    let visible = NSRect(x: 0, y: 0, width: 1440, height: 875)
-    let start = NSRect(x: 900, y: 875 - 161, width: 360, height: 161)
+/// The popover's height, which is now one number: the height the CONTENT asks for.
+///
+/// This replaces demoPopoverFit and demoPopoverGrip, which asserted NSWindow frame
+/// arithmetic — top-edge anchoring, origins, growOnly. Every one of those asserts passed
+/// while the live panel was broken, because the framework discarded the frames they were
+/// describing (see Foreground.panelHeight for the measurement). A check that cannot fail
+/// when the thing it covers fails is worse than none, so the arithmetic is gone and what
+/// is left is the value that actually decides the outcome.
+///
+/// Still not covered, honestly: whether MenuBarExtra grows its window when the content
+/// gets taller. That is the framework's side of the contract, it needs the app running,
+/// and the `popover content request=/window=/content=` log line is what answers it.
+func demoPopoverHeight() {
+    let floor = Foreground.popoverMinimumHeight
+    let room: CGFloat = 875
 
-    // Grows when a to-do arrives, downwards, keeping the top edge exactly where it was.
-    let grown = Foreground.popoverFrame(current: start, contentHeight: start.height,
-                                        idealHeight: 233, visible: visible)!
-    assert(grown.height == 233, "must take the content's ideal height, got \(grown.height)")
-    assert(grown.maxY == start.maxY, "the top edge must not move, a popover hangs downwards")
-    assert(grown.minX == start.minX && grown.width == start.width, "only the height changes")
+    // No dragged height: no explicit height at all, so the content sizes itself. This is
+    // the normal case and the one that lets a to-do arriving while the panel is open grow
+    // it — an explicit height here would be exactly the bug.
+    assert(Foreground.panelHeight(manual: nil, room: room, minimum: floor) == nil,
+           "with no dragged height the content must size itself")
 
-    // And shrinks again when the list empties, same anchor.
-    let shrunk = Foreground.popoverFrame(current: grown, contentHeight: grown.height,
-                                         idealHeight: 161, visible: visible)!
-    assert(shrunk.height == 161 && shrunk.maxY == start.maxY,
-           "shrinking must work too, and from the same edge")
+    // A dragged height is taken as asked when the screen has the room for it.
+    assert(Foreground.panelHeight(manual: 600, room: room, minimum: floor) == 600,
+           "a dragged height must be the height the content asks for")
 
-    // Already the right size: no frame set, so the relayout it would cause cannot loop.
-    assert(Foreground.popoverFrame(current: grown, contentHeight: grown.height,
-                                   idealHeight: 233, visible: visible) == nil,
-           "a popover that already fits must not be resized")
-    assert(Foreground.popoverFrame(current: grown, contentHeight: grown.height,
-                                   idealHeight: 233.5, visible: visible) == nil,
-           "half a point is not a resize, or every relayout starts another one")
+    // Never shorter than the chrome plus one whole row, or the drag reaches a panel with
+    // nothing in it.
+    assert(Foreground.panelHeight(manual: 10, room: room, minimum: floor) == floor,
+           "must floor at chrome plus one row")
 
-    // Taller than the screen: clamped to what is actually visible, and the list scrolls
-    // the rest. 875 - (875 - 161) = 161pt of room below the top edge... which is the whole
-    // screen below it, so ask for far more than the screen holds.
-    let huge = Foreground.popoverFrame(current: start, contentHeight: start.height,
-                                       idealHeight: 4000, visible: visible)!
-    assert(huge.maxY == start.maxY, "clamping must not move the top edge either")
-    assert(huge.minY >= visible.minY, "must not run off the bottom of the screen")
-    assert(huge.height == start.maxY - visible.minY, "must use exactly the room available")
+    // Never taller than the screen can show. Beyond the cap the list scrolls.
+    assert(Foreground.panelHeight(manual: 4000, room: room, minimum: floor) == room,
+           "must not ask for more than the screen has room for")
 
-    // Chrome is whatever the window adds around its content, so the frame grows by what
-    // the CONTENT asked for, not by the ideal read as a frame height.
-    let titled = NSRect(x: 0, y: 700, width: 360, height: 189)
-    let withChrome = Foreground.popoverFrame(current: titled, contentHeight: 161,
-                                             idealHeight: 233, visible: visible)!
-    assert(withChrome.height == 233 + 28, "must carry the 28pt of chrome across, got \(withChrome.height)")
-    assert(withChrome.maxY == titled.maxY, "the top edge is the anchor whatever the chrome")
+    // When the two limits disagree the screen wins: the bottom half of a panel taller
+    // than the screen cannot be reached to drag back.
+    let cramped = Foreground.panelHeight(manual: 10, room: 120, minimum: floor)!
+    assert(cramped == 120, "the screen must win over the floor, got \(cramped)")
+    assert(cramped < floor, "and this case is only meaningful below the floor")
 
-    // growOnly, the safety catch fitPopover ships with: it must still grow and still
-    // clamp, and must refuse every shrink. That refusal is the whole point — the field
-    // symptom was a panel too SHORT, so an unverifiable measurement must not be allowed
-    // to make it shorter.
-    let grownSafely = Foreground.popoverFrame(current: start, contentHeight: start.height,
-                                              idealHeight: 233, visible: visible, growOnly: true)!
-    assert(grownSafely == grown, "growOnly must not change how growing works")
-    assert(Foreground.popoverFrame(current: grown, contentHeight: grown.height,
-                                   idealHeight: 161, visible: visible, growOnly: true) == nil,
-           "growOnly must refuse to shrink the panel")
-    let clampedSafely = Foreground.popoverFrame(current: start, contentHeight: start.height,
-                                                idealHeight: 4000, visible: visible, growOnly: true)!
-    assert(clampedSafely == huge, "growOnly must still respect the screen")
+    // No screen to measure must not collapse the panel: only the floor applies.
+    assert(Foreground.panelHeight(manual: 600, room: 0, minimum: floor) == 600)
+    assert(Foreground.panelHeight(manual: 10, room: -5, minimum: floor) == floor,
+           "an unmeasurable screen must still respect the floor")
 
-    print("demoPopoverFit: PASS grow \(start.height)->\(grown.height),"
-          + " shrink ->\(shrunk.height), clamp ->\(huge.height),"
-          + " growOnly refuses shrink")
-}
-
-/// The dragged height: its clamp, and which of the two mechanisms wins. Both are pure,
-/// which is the point — the drag itself needs a live popover and a human, but nothing
-/// here does, and "manual wins outright" is the rule that keeps this from becoming a
-/// second copy of the bug where two mechanisms fight over one number.
-func demoPopoverGrip() {
-    let visible = NSRect(x: 0, y: 0, width: 1440, height: 875)
-    let minimum = Foreground.popoverMinimumHeight
-    // The popover 400pt down the screen, so there is real room below it to drag into.
-    let start = NSRect(x: 900, y: 875 - 400, width: 360, height: 400)
-
-    // A drag downwards, top edge pinned, only the height moving.
-    let taller = Foreground.manualPopoverFrame(current: start, height: 600,
-                                               visible: visible, minimum: minimum)!
-    assert(taller.height == 600, "must take the dragged height, got \(taller.height)")
-    assert(taller.maxY == start.maxY, "the top edge is the anchor, a popover hangs downwards")
-    assert(taller.minX == start.minX && taller.width == start.width, "only the height changes")
-
-    // And upwards, which auto-fit is not allowed to do but a drag must be: growOnly is
-    // auto-fit's safety catch against a measurement it cannot verify, and a hand on the
-    // edge is not that.
-    let shorter = Foreground.manualPopoverFrame(current: start, height: 250,
-                                                visible: visible, minimum: minimum)!
-    assert(shorter.height == 250 && shorter.maxY == start.maxY, "a drag must shrink too")
-
-    // Never taller than the screen's visible frame. Room is measured from the pinned top
-    // edge down to visibleFrame.minY, so here it is the whole 875pt below the menu bar.
-    let past = Foreground.manualPopoverFrame(current: start, height: 4000,
-                                             visible: visible, minimum: minimum)!
-    assert(past.minY >= visible.minY, "must not run off the bottom of the screen")
-    assert(past.height == start.maxY - visible.minY, "must use exactly the room available")
-    assert(past.maxY == start.maxY, "clamping must not move the top edge either")
-
-    // Never shorter than the chrome plus one whole row, or the drag can reach a state
-    // where nothing at all is visible.
-    let floored = Foreground.manualPopoverFrame(current: start, height: 10,
-                                                visible: visible, minimum: minimum)!
-    assert(floored.height == minimum, "must floor at chrome + one row, got \(floored.height)")
-    assert(floored.maxY == start.maxY)
-
-    // When the two limits disagree the screen wins, because the bottom half of a panel
-    // taller than the screen cannot be reached to drag back.
-    // A screen with only 120pt below the popover's top edge, which is less than the
-    // 161pt floor. Start shorter than that so there is a real resize to check.
-    let cramped = NSRect(x: 0, y: 875 - 90, width: 360, height: 90)
-    let tight = Foreground.manualPopoverFrame(current: cramped, height: 10,
-                                              visible: NSRect(x: 0, y: 875 - 120, width: 1440, height: 120),
-                                              minimum: minimum)!
-    assert(tight.height == 120, "the screen wins over the floor, got \(tight.height)")
-    assert(tight.height < minimum, "and this case is only meaningful below the floor")
-
-    // Already there: no frame set, so the relayout it would cause cannot loop, same
-    // point of slack auto-fit uses.
-    assert(Foreground.manualPopoverFrame(current: taller, height: 600,
-                                         visible: visible, minimum: minimum) == nil,
-           "a panel already at the dragged height must not be resized")
-    assert(Foreground.manualPopoverFrame(current: taller, height: 600.5,
-                                         visible: visible, minimum: minimum) == nil,
-           "half a point is not a resize")
-
-    // Precedence. Auto-fit wants 233 here and would get it, but a dragged height is set,
-    // so 600 is what happens and the ideal is not consulted at all.
-    let manual = Foreground.popoverTarget(manual: 600, current: start, contentHeight: start.height,
-                                          idealHeight: 233, visible: visible, minimum: minimum)!
-    assert(manual.height == 600, "a dragged height must beat the auto-fit ideal, got \(manual.height)")
-
-    // The same call with no dragged height is plain auto-fit, growOnly and all.
-    let auto = Foreground.popoverTarget(manual: nil, current: start, contentHeight: start.height,
-                                        idealHeight: 233, visible: visible, minimum: minimum)
-    assert(auto == nil, "auto-fit is grow-only, so a 233pt ideal must not shorten a 400pt panel")
-    let autoGrown = Foreground.popoverTarget(manual: nil, current: start, contentHeight: start.height,
-                                             idealHeight: 520, visible: visible, minimum: minimum)!
-    assert(autoGrown.height == 520, "with no dragged height auto-fit still grows")
-
-    // And auto-fit must not creep back once a height is chosen: whatever the ideal says,
-    // including a huge one, the dragged height is what comes out.
-    for ideal in [0.0, 161.0, 233.0, 485.0, 4000.0] as [CGFloat] {
-        let held = Foreground.popoverTarget(manual: 300, current: taller, contentHeight: taller.height,
-                                            idealHeight: ideal, visible: visible, minimum: minimum)!
-        assert(held.height == 300, "ideal \(ideal) must not override the dragged 300, got \(held.height)")
+    // Stable, which is what makes the stored preference safe: the drag stores the clamped
+    // height, so reading it back after a relaunch must not clamp it a second time into
+    // something different.
+    for wanted in [0.0, 10.0, 161.0, 321.0, 600.0, 4000.0] {
+        let once = Foreground.panelHeight(manual: wanted, room: room, minimum: floor)!
+        let twice = Foreground.panelHeight(manual: Double(once), room: room, minimum: floor)!
+        assert(once == twice, "clamping \(wanted) must be stable, \(once) became \(twice)")
     }
 
-    // Clearing it (double-click on the grip) hands the number back to auto-fit.
-    let released = Foreground.popoverTarget(manual: nil, current: taller, contentHeight: taller.height,
-                                            idealHeight: 700, visible: visible, minimum: minimum)!
-    assert(released.height == 700, "clearing the dragged height must let auto-fit act again")
+    // And the other half of the height reaching the screen: with a height dragged, the
+    // list's own cap has to come off, because the list is the only thing in the panel
+    // that can absorb the difference. Leaving it on is what would leave dead space in a
+    // 600pt panel — the same displaced-content symptom, from the opposite direction.
+    assert(MenuContent.listCap(windowed: false, panelHeight: nil) == 400,
+           "with no dragged height the list keeps the popover's own 400pt cap")
+    assert(MenuContent.listCap(windowed: false, panelHeight: 600) == .infinity,
+           "a dragged height must uncap the list so it can absorb the height")
+    assert(MenuContent.listCap(windowed: true, panelHeight: nil) == .infinity,
+           "the window scene has always been uncapped")
 
-    print("demoPopoverGrip: PASS drag \(start.height)->\(taller.height),"
-          + " clamp ->\(past.height), floor ->\(floored.height), screen wins ->\(tight.height),"
-          + " manual beats ideal, cleared returns to auto-fit")
+    print("demoPopoverHeight: PASS auto=nil, 600->600, 10->\(floor),"
+          + " 4000->\(room), screen wins ->\(cramped), clamp is stable,"
+          + " dragged height uncaps the list")
 }
 
 /// The bands must partition the priority range: exactly one band per priority, never two
