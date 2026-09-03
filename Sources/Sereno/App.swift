@@ -3,6 +3,8 @@ import AppKit
 import Carbon.HIToolbox
 import Observation
 import UserNotifications
+import CoreText
+import OSLog
 
 /// Pointing-hand cursor on hover. `.pointerStyle(.link)` is the modern SwiftUI
 /// equivalent of NSCursor.pointingHand.set(), confirmed present in the macOS 26
@@ -16,11 +18,45 @@ private extension View {
 /// Window menu command.
 let serenoWindowID = "sereno-panel"
 
+/// The wordmark's font, shipped in the app rather than assumed to be installed.
+///
+/// Deliberately not `Bundle.module`: its generated accessor calls `fatalError` when the
+/// resource bundle is missing, and a missing font must fall back to the system font
+/// rather than take the app down. This walks the same two candidate roots by hand.
+/// Nothing here reads `Bundle.main.bundleIdentifier`, which is nil in a bare binary.
+private func registerBundledFonts() {
+    let log = Logger(subsystem: "com.rhystart.sereno", category: "fonts")
+    let roots = [Bundle.main.resourceURL, Bundle.main.bundleURL].compactMap { $0 }
+    guard let resources = roots
+            .map({ $0.appendingPathComponent("Sereno_Sereno.bundle") })
+            .compactMap(Bundle.init(url:)).first,
+          let fonts = resources.urls(forResourcesWithExtension: "ttf", subdirectory: "Fonts"),
+          !fonts.isEmpty
+    else {
+        log.error("no bundled fonts found, wordmark falls back to the system font")
+        return
+    }
+    for url in fonts {
+        var error: Unmanaged<CFError>?
+        if CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error) {
+            log.info("registered font \(url.lastPathComponent, privacy: .public)")
+        } else {
+            // .private on the message only: a CFError can quote the path, and the
+            // failure itself is all that has to reach the log in the clear.
+            log.error("""
+                font registration failed for \(url.lastPathComponent, privacy: .public): \
+                \(error?.takeRetainedValue().localizedDescription ?? "unknown", privacy: .private)
+                """)
+        }
+    }
+}
+
 @main
 struct SerenoApp: App {
     @State private var store: Store
 
     init() {
+        registerBundledFonts()
         GlobalHotkey.install()
         // LiveMessageSource asks the Keychain on every call, so connecting or
         // disconnecting Slack takes effect on the next refresh instead of the next launch.
@@ -250,6 +286,12 @@ private func openSettings() {
         else { return }
         appMenu.performActionForItem(at: index)
     }
+    // Every caller is a button inside the popover, so this belongs here and not at the
+    // call sites: the gear and the role hint both needed it, and a third caller cannot
+    // forget it now. Same order as the window button, open first so the app is never
+    // left with nothing on screen mid activation-policy change, and closePopover hops
+    // to the next main queue turn regardless.
+    Foreground.closePopover()
 }
 
 /// "1 hour", "3 hours".
@@ -759,6 +801,84 @@ private enum Brand {
     ]
 }
 
+/// The app's mark, traced from `icon/sereno.svg` because SwiftUI cannot load an SVG. A
+/// falling star: a stroked trail that fades into the night behind a solid head. Written
+/// in the artwork's 1024-unit space and normalised against whatever rect it is handed,
+/// so it is resolution independent at any frame.
+///
+/// Takes the phase for the same reason every other foreground in the header does: the
+/// artwork's near-white is right on a night sky and invisible on a noon one.
+private struct SerenoMark: View {
+    let phase: SkyPhase
+
+    var body: some View {
+        ZStack {
+            Part.trail.fill(trailGradient)
+            Part.head.fill(phase.ink)
+        }
+        // This mark replaced the only text that said the product's name, so the name
+        // lives on the mark now.
+        .accessibilityElement()
+        .accessibilityLabel("Sereno")
+    }
+
+    /// The SVG's own ramp, faint tail to bright head. Kept rather than flattened to one
+    /// colour: the ground under it is a moving starfield, and a flat fill loses the
+    /// direction the star is falling in. Its axis is the SVG's, converted out of that
+    /// path's bounding box, which is what SVG measures a gradient against, into the
+    /// 1024-unit canvas the shapes draw in.
+    private var trailGradient: LinearGradient {
+        let pale = phase.lightGround
+        let cream = pale ? phase.ink : Color(red: 1.00, green: 0.94, blue: 0.84) // #FFEFD6
+        let ivory = pale ? phase.ink : Color(red: 1.00, green: 0.97, blue: 0.93) // #FFF8EC
+        return LinearGradient(
+            stops: [
+                .init(color: phase.ink.opacity(0.10), location: 0.00),
+                .init(color: cream.opacity(0.72), location: 0.22),
+                .init(color: ivory.opacity(0.97), location: 0.55),
+                .init(color: phase.ink, location: 1.00),
+            ],
+            startPoint: UnitPoint(x: 0.403, y: 0.688),
+            endPoint: UnitPoint(x: 0.587, y: 0.342)
+        )
+    }
+
+    /// One shape per fill, since the trail carries a gradient and the head does not.
+    /// The stroke is taken inside `path(in:)` rather than by a `.stroke` modifier so
+    /// its 78-unit width scales with the rect like every other coordinate here.
+    /// fileprivate rather than private so demoMark can measure the two paths.
+    fileprivate struct Part: Shape {
+        static let trail = Part(stroked: true)
+        static let head = Part(stroked: false)
+        let stroked: Bool
+
+        func path(in rect: CGRect) -> Path {
+            let s = min(rect.width, rect.height) / 1024
+            func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+                CGPoint(x: rect.minX + x * s, y: rect.minY + y * s)
+            }
+            var path = Path()
+            if stroked {
+                path.move(to: p(672, 336))
+                path.addCurve(to: p(406, 326), control1: p(672, 244), control2: p(460, 226))
+                path.addCurve(to: p(520, 514), control1: p(356, 420), control2: p(462, 480))
+                path.addCurve(to: p(620, 690), control1: p(598, 558), control2: p(644, 610))
+                path.addCurve(to: p(348, 718), control1: p(594, 778), control2: p(420, 792))
+                return path.strokedPath(StrokeStyle(lineWidth: 78 * s, lineCap: .round))
+            }
+            // Sits exactly on the trail's start point, so it leads the trail instead of
+            // looking stuck onto the letter. Both contours wind the same way, so the
+            // disc and the glyph fill as one shape.
+            path.addEllipse(in: CGRect(origin: p(638, 302), size: CGSize(width: 68 * s, height: 68 * s)))
+            path.move(to: p(672, 268))
+            path.addLines([p(681, 327), p(740, 336), p(681, 345),
+                           p(672, 404), p(663, 345), p(604, 336), p(663, 327)])
+            path.closeSubpath()
+            return path
+        }
+    }
+}
+
 /// Time of day, as the header draws it. Five phases, each owning its own ground AND
 /// its own ink: the sky swings from near-black at midnight to pale blue at noon, so a
 /// single fixed foreground colour is unreadable at one end of the day or the other.
@@ -942,6 +1062,35 @@ func demoSky() {
     print("demoSky: PASS \(SkyPhase.allCases.map { "\($0)/\($0.lightGround ? "dark ink" : "white ink")" }.joined(separator: ", "))")
 }
 
+/// The mark is pure geometry, so what can break is the normalisation: an offset left in
+/// 1024-unit space, or a stroke width that does not scale with the rect.
+func demoMark() {
+    func art(_ side: CGFloat) -> (trail: CGRect, head: CGRect) {
+        let rect = CGRect(x: 0, y: 0, width: side, height: side)
+        return (SerenoMark.Part.trail.path(in: rect).boundingRect,
+                SerenoMark.Part.head.path(in: rect).boundingRect)
+    }
+
+    let small = art(24), big = art(240)
+    // Nothing spills out of the frame it was given, at either size.
+    for box in [small.trail, small.head] {
+        assert(box.minX >= 0 && box.minY >= 0 && box.maxX <= 24 && box.maxY <= 24)
+    }
+    // Ten times the rect is ten times the art, which is what resolution independent
+    // means here. A hardcoded offset or lineWidth would fail this and not the one above.
+    for (a, b) in [(small.trail, big.trail), (small.head, big.head)] {
+        assert(abs(b.minX - a.minX * 10) < 0.01 && abs(b.minY - a.minY * 10) < 0.01)
+        assert(abs(b.width - a.width * 10) < 0.01 && abs(b.height - a.height * 10) < 0.01)
+    }
+    // The head leads the trail, so it has to sit on the trail's start point, 672/336.
+    assert(small.head.contains(CGPoint(x: 672 / 1024.0 * 24, y: 336 / 1024.0 * 24)))
+    // The 78-unit stroke, taken inside path(in:), is what widens the trail past the
+    // 348...672 the curve itself spans.
+    assert(small.trail.width > (672 - 348) / 1024.0 * 24)
+    print("demoMark: PASS trail \(small.trail.size), head \(small.head.size) in a 24pt frame")
+}
+
+
 /// Urgency band. Priority is 1...5, shown as three sections so the section
 /// header carries the urgency and rows can carry identity instead.
 private enum Band: CaseIterable {
@@ -1005,6 +1154,12 @@ private struct MenuContent: View {
     @State private var selectedID: String?
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismiss) private var dismiss
+    /// Not @Bindable and not @State, for the reason SettingsForm gives: an @Observable
+    /// read during body is tracked either way, and this is the shared controller the
+    /// whole app signs in through. Reading `state` here is what makes a sign-in that
+    /// finishes in Settings swap this panel over to the list with no refresh and no
+    /// relaunch.
+    private let slack = SlackAuth.shared
 
     // ponytail: the three flags are parameters only so the render harness can shoot
     // the compose area, the snoozed list and the undo bar. ImageRenderer cannot click.
@@ -1019,6 +1174,14 @@ private struct MenuContent: View {
 
     /// Done and snoozed items are not part of the list, the count, or the badge.
     private var items: [TodoItem] { TodoItem.ranked(store.todos.filter { !$0.done && !$0.isSnoozed }) }
+
+    /// Gated on `state` alone and not on `hasToken`: hasToken reads the Keychain, and
+    /// body runs on every store change and every animation frame. `state` already
+    /// carries the token check, since SlackAuth's init seeds it from the Keychain.
+    private var connected: Bool {
+        if case .connected = slack.state { return true }
+        return false
+    }
 
     private var snoozed: [TodoItem] {
         store.todos.filter { !$0.done && $0.isSnoozed }
@@ -1105,31 +1268,24 @@ private struct MenuContent: View {
             // gesture can own exactly that region. The buttons sit outside this group and
             // so are never inside the gesture's view, which is what keeps them clickable.
             HStack(spacing: 7) {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Brand.aubergine)
+                // 24pt leaves the drawn art about 10 by 14, which is the optical weight
+                // the name beside it carries, and the bar's height does not move.
+                SerenoMark(phase: phase)
                     .frame(width: 24, height: 24)
-                    // Aubergine on an aubergine ground has nothing to separate it, so the
-                    // mark keeps its brand fill and gains a hairline to hold its shape.
-                    // The hairline follows the ink: white on a night sky, dark on a pale
-                    // one, where a white edge would vanish.
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .strokeBorder(phase.ink.opacity(0.22), lineWidth: 0.8)
-                    }
-                    .overlay {
-                        Image(systemName: "bolt.fill")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
 
+                // Measured, not guessed: Schibsted Grotesk SemiBold at 15pt has an
+                // x-height of 7.91 against the 8.06 of the 15pt bold system font this
+                // replaced, and SemiBold is the lighter weight of the two, so 15.5
+                // brings both the x-height and the stroke back to where they were.
+                // fixedSize, not size: a wordmark must not grow with Dynamic Type.
+                // The only brand-font text in the app; everything else stays on the
+                // system font, which is what a macOS app should do.
                 Text("Sereno")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 15.5))
                     .foregroundStyle(phase.ink)
-                    // The app's own name never wraps and never truncates. If the bar runs
-                    // out of room the count below gives way instead.
-                    .fixedSize()
 
-                Text(items.isEmpty ? "all clear" : "\(items.count) to reply")
+                Text(!connected ? "not connected"
+                     : items.isEmpty ? "all clear" : "\(items.count) to reply")
                     .font(.caption)
                     .foregroundStyle(phase.inkSoft)
                     // A fourth button in the header leaves this narrow enough to wrap,
@@ -1220,25 +1376,34 @@ private struct MenuContent: View {
 
     @ViewBuilder private var content: some View {
         VStack(spacing: 8) {
-            if let reason = store.unavailableReason {
-                Banner(text: reason, symbol: "exclamationmark.triangle.fill", tint: Brand.yellow)
-            }
-            if let error = store.errorText {
-                Banner(text: error, symbol: "xmark.octagon.fill", tint: Brand.red)
-            }
-            if showRoleHint {
-                roleHint
-            }
-            if items.isEmpty {
-                empty
+            if !connected {
+                // Alone, with no banner and no role hint above it. A refresh that could
+                // not run leaves an error in the store, and the role hint asks for
+                // something that only sharpens triage; neither may compete with the one
+                // step that has to happen first.
+                signIn
             } else {
-                list
+                if let reason = store.unavailableReason {
+                    Banner(text: reason, symbol: "exclamationmark.triangle.fill", tint: Brand.yellow)
+                }
+                if let error = store.errorText {
+                    Banner(text: error, symbol: "xmark.octagon.fill", tint: Brand.red)
+                }
+                if showRoleHint {
+                    roleHint
+                }
+                if items.isEmpty {
+                    empty
+                } else {
+                    list
+                }
+                snoozedSection
             }
-            snoozedSection
             // The popover is sized by its content, the window is not. With a list the
-            // list itself absorbs the extra height, so this is only for the empty state,
-            // which would otherwise float in the middle of the window.
-            if windowed && items.isEmpty { Spacer(minLength: 0) }
+            // list itself absorbs the extra height, so this is only for the states that
+            // draw one short block, which would otherwise float in the middle of the
+            // window.
+            if windowed && (!connected || items.isEmpty) { Spacer(minLength: 0) }
         }
         .padding(.top, 8)
         .padding(.bottom, 6)
@@ -1500,6 +1665,69 @@ private struct MenuContent: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 34)
+        .frame(maxWidth: .infinity)
+    }
+
+    /// Sereno cannot see anything until Slack is connected, so this stands in for the
+    /// whole list until it is. Deliberately not shaped like `empty` above: that one is a
+    /// finished day, this one is a setup step, and reading them as the same thing is the
+    /// bug this exists to prevent. Hence the link-blue chain link, the aubergine call to
+    /// action and a paragraph, against the empty state's green tick and two calm lines.
+    ///
+    /// The action is SlackAuth.connect(), the same one Settings runs. There is nothing to
+    /// configure first: the client_id is compiled in.
+    @ViewBuilder private var signIn: some View {
+        VStack(spacing: 9) {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Brand.link.opacity(0.14))
+                .frame(width: 46, height: 46)
+                .overlay {
+                    Image(systemName: "link")
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(Brand.link)
+                }
+            Text("Connect Slack").font(.headline)
+            Text("Sereno reads the messages you can already see and works out which ones you still owe a reply to. Read-only, and the triage runs on your Mac.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                // Three lines at 360pt. Without this the text is measured as one line
+                // and truncated instead of wrapping.
+                .fixedSize(horizontal: false, vertical: true)
+
+            switch slack.state {
+            case .connecting:
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for Slack in your browser…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Cancel") { slack.cancelConnect() }
+                        .font(.caption)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Brand.link)
+                        .pointerCursor()
+                }
+            default:
+                Button("Connect Slack") {
+                    Task { await slack.connect() }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Brand.aubergine)
+                .pointerCursor()
+                // The panel is the whole app until this succeeds, so a failure that said
+                // nothing would be a dead end. Same plain-language reason Settings shows.
+                if case .failed(let reason) = slack.state {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(Brand.red)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 30)
         .frame(maxWidth: .infinity)
     }
 

@@ -43,6 +43,12 @@ PLIST
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp icon/Sereno.icns "$APP_BUNDLE/Contents/Resources/Sereno.icns"
 
+# The resource bundle SwiftPM generates for the Fonts directory. It has to land in
+# Contents/Resources because that is Bundle.main.resourceURL, the first place the
+# lookup in App.swift searches. It carries OFL.txt in beside the font, which is what
+# keeps the shipped app compliant with the licence.
+cp -R ".build/release/${APP_NAME}_${APP_NAME}.bundle" "$APP_BUNDLE/Contents/Resources/"
+
 codesign -s - --force --deep "$APP_BUNDLE"
 
 echo "Built $(pwd)/$APP_BUNDLE"

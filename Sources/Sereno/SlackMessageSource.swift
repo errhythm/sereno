@@ -15,8 +15,7 @@ private let log = Logger(subsystem: "com.rhystart.sereno", category: "slack")
 /// would act on. `Store.refresh()` shows `localizedDescription`, which LocalizedError
 /// routes to `errorDescription`.
 enum SlackSourceError: LocalizedError, Equatable {
-    /// No token on this machine. The source router avoids this, so it means a disconnect
-    /// landed mid-refresh.
+    /// No token on this machine, either before connection or after a disconnect.
     case notConnected
     /// invalid_auth, token_revoked, account_inactive. The credential is dead.
     case reconnect
@@ -52,12 +51,21 @@ enum SlackSourceError: LocalizedError, Equatable {
     }
 
     /// A dead token or a missing scope will fail identically for every conversation, so
-    /// there is nothing to salvage. Everything else is per-conversation bad luck.
+    /// there is nothing to salvage. Other failures can still leave useful rows to return.
     var isFatal: Bool {
         switch self {
         case .notConnected, .reconnect, .missingScope: true
         default: false
         }
+    }
+
+    /// Slack can list a conversation that is no longer readable by the time history is
+    /// fetched. That conversation says nothing about whether the rest of the refresh worked.
+    var nonReportableConversationSlug: String? {
+        guard case .slack(let slug) = self,
+              ["channel_not_found", "is_archived", "not_in_channel"].contains(slug)
+        else { return nil }
+        return slug
     }
 }
 
@@ -113,12 +121,35 @@ struct SlackConversation: Sendable, Equatable {
     }
 }
 
+/// The durable edge of one logical Slack conversation. Channel ids checkpoint history;
+/// thread timestamps checkpoint the settlement proof learned while reading replies.
+struct SlackConversationCheckpoint: Codable, Sendable, Equatable {
+    var newestTS: String
+    var settled: Bool
+}
+
+/// Slack scan state lives in Store's state.json. Keeping it beside the todos makes an app
+/// relaunch continue from the same edge instead of turning every launch into a cold scan.
+struct SlackScanState: Codable, Sendable, Equatable {
+    var accountKey: String? = nil
+    var connectedAt: Date? = nil
+    var conversations: [String: SlackConversationCheckpoint] = [:]
+    var userNames: [String: String] = [:]
+}
+
+/// Store uses this refinement without widening MessageSource, so simple fixtures keep the
+/// base protocol while the live source can round-trip its rate-limit state.
+protocol SlackScanStateSource: MessageSource {
+    func restoreSlackScanState(_ state: SlackScanState) async
+    func currentSlackScanState() async -> SlackScanState
+}
+
 // MARK: - The source
 
 /// The real Slack client. An `actor` because the caches (identity, conversation list, user
 /// names) outlive one refresh and three requests are in flight at once; actor isolation is
 /// the whole of the locking.
-actor SlackMessageSource: MessageSource {
+actor SlackMessageSource: SlackScanStateSource {
     /// The single seam. Returns raw response bytes for one Web API method, having already
     /// dealt with 429 and 5xx. `Data` rather than a parsed dictionary so nothing
     /// non-Sendable crosses back into the actor, and so the demo can hand over canned JSON.
@@ -131,14 +162,15 @@ actor SlackMessageSource: MessageSource {
     static let callBudget = 40
     /// Three in flight. Enough to hide latency, low enough that a 429 is a surprise.
     private static let maxInFlight = 3
-    /// How far back one conversation is read. `since` picks WHICH conversations to return,
-    /// this window decides how much of each one is in hand, and it has to be wide enough to
-    /// contain the user's last message so the unreplied tail can be found at all.
+    /// How far back a conversation without a checkpoint may be read. After that first look,
+    /// its own watermark replaces this window. The connection floor can make the first look
+    /// smaller, which is deliberate for a newly connected installation.
     private static let historyWindow: TimeInterval = 7 * 24 * 60 * 60
     /// The conversation list changes rarely, so it is refetched every tenth refresh.
     private static let conversationCacheRefreshes = 10
 
     private let call: Call
+    private let observesStoredAccount: Bool
     private let totalBudget: Int
     /// Requests held back for display-name lookups, so a workspace big enough to eat the
     /// budget still shows names rather than a column of user ids.
@@ -148,8 +180,10 @@ actor SlackMessageSource: MessageSource {
     private var identity: Identity?
     private var permalinkHost = "app.slack.com"
     private var conversations: [SlackConversation] = []
+    private var hasConversationCache = false
     private var refreshCount = 0
     private var userNames: [String: String] = [:]
+    private var scanState = SlackScanState()
 
     /// Conversations whose newest real message this cycle was the user's own, which is
     /// exactly the question `repliedIDs(among:)` asks. Filled during the scan so reply
@@ -158,8 +192,21 @@ actor SlackMessageSource: MessageSource {
 
     init(call: Call? = nil, budget: Int = SlackMessageSource.callBudget) {
         self.call = call ?? SlackMessageSource.httpCall
+        observesStoredAccount = call == nil
         totalBudget = budget
         nameReserve = max(1, budget / 5)
+    }
+
+    func restoreSlackScanState(_ state: SlackScanState) {
+        scanState = state
+        userNames = state.userNames
+        identity = nil
+        permalinkHost = "app.slack.com"
+    }
+
+    func currentSlackScanState() -> SlackScanState {
+        scanState.userNames = userNames
+        return scanState
     }
 
     // MARK: Budget
@@ -185,7 +232,8 @@ actor SlackMessageSource: MessageSource {
     private func ensureIdentity() async throws -> Identity {
         // A disconnect followed by a sign-in as someone else in the same app run must not
         // keep the old identity: addressing detection would then answer for the wrong human.
-        if let identity, Self.storedUserID().map({ $0 == identity.userID }) ?? true {
+        if let identity,
+           !observesStoredAccount || Self.storedUserID().map({ $0 == identity.userID }) ?? true {
             return identity
         }
         guard spend() else { throw SlackSourceError.rateLimited }
@@ -227,10 +275,30 @@ actor SlackMessageSource: MessageSource {
         UserDefaults.standard.string(forKey: "slackUserID")
     }
 
+    private nonisolated static func storedAccountKey() -> String? {
+        guard let userID = storedUserID() else { return nil }
+        let workspace = UserDefaults.standard.string(forKey: "slackWorkspaceName") ?? ""
+        return "\(workspace)\u{0}\(userID)"
+    }
+
+    /// A different stored account must not inherit channel watermarks or a connection floor
+    /// from the previous one. Canned sources do not consult process UserDefaults.
+    private func synchronizeStoredAccount() {
+        guard observesStoredAccount else { return }
+        let accountKey = Self.storedAccountKey()
+        guard scanState.accountKey != accountKey else { return }
+        scanState = SlackScanState(accountKey: accountKey)
+        identity = nil
+        permalinkHost = "app.slack.com"
+        conversations = []
+        hasConversationCache = false
+        userNames = [:]
+    }
+
     // MARK: Conversation list
 
     private func ensureConversations() async throws -> [SlackConversation] {
-        if !conversations.isEmpty, refreshCount % Self.conversationCacheRefreshes != 0 {
+        if hasConversationCache, refreshCount % Self.conversationCacheRefreshes != 0 {
             return conversations
         }
         var found: [SlackConversation] = []
@@ -250,6 +318,7 @@ actor SlackMessageSource: MessageSource {
 
         guard !found.isEmpty else { return conversations }
         conversations = found.sorted { ($0.priority, $0.id) < ($1.priority, $1.id) }
+        hasConversationCache = true
         log.info("conversations cached count=\(self.conversations.count, privacy: .public)")
         return conversations
     }
@@ -258,31 +327,39 @@ actor SlackMessageSource: MessageSource {
 
     func unrepliedMessages(since: Date) async throws -> [SlackMessage] {
         budget = totalBudget
-        settled = []
+        synchronizeStoredAccount()
+        if scanState.connectedAt == nil { scanState.connectedAt = Date() }
+        settled = Set(scanState.conversations.compactMap { $0.value.settled ? $0.key : nil })
         defer { refreshCount += 1 }
 
         let identity = try await ensureIdentity()
         let all = try await ensureConversations()
 
-        var results: [Result<[Pending], Error>] = []
+        var results: [(conversationID: String, result: Result<ScanResult, Error>)] = []
         var index = 0
         var skipped = 0
 
         // Three conversations in flight, refilled as each one lands, so the budget is
         // spent in priority order rather than all at once. A child never throws: one
         // unreadable channel must not cost the other thirty-nine.
-        await withTaskGroup(of: Result<[Pending], Error>.self) { group in
+        await withTaskGroup(of: (String, Result<ScanResult, Error>).self) { group in
             var inFlight = 0
             while index < all.count {
-                guard budget > nameReserve else {
+                // Reserve the history call before launching the child. Reserving inside
+                // scan made the three children race for the last call, defeating priority.
+                guard spend(reserve: nameReserve) else {
                     skipped = all.count - index
                     break
                 }
                 let conversation = all[index]
                 index += 1
                 group.addTask {
-                    do { return .success(try await self.scan(conversation, since: since, identity: identity)) }
-                    catch { return .failure(error) }
+                    do {
+                        return (conversation.id,
+                                .success(try await self.scan(conversation, since: since, identity: identity)))
+                    } catch {
+                        return (conversation.id, .failure(error))
+                    }
                 }
                 inFlight += 1
                 if inFlight == Self.maxInFlight, let result = await group.next() {
@@ -297,17 +374,30 @@ actor SlackMessageSource: MessageSource {
 
         var pending: [Pending] = []
         var firstError: Error?
-        var failed = 0
-        for result in results {
+        var reportableFailures = 0
+        for (conversationID, result) in results {
             switch result {
             case .success(let batch):
-                pending += batch
+                pending += batch.pending
+                for (key, checkpoint) in batch.checkpoints {
+                    scanState.conversations[key] = checkpoint
+                    if checkpoint.settled { settled.insert(key) } else { settled.remove(key) }
+                }
             case .failure(let error):
                 // A dead token or a missing scope fails identically everywhere, so there
                 // is nothing left to salvage from this refresh.
                 if let slack = error as? SlackSourceError, slack.isFatal { throw slack }
+                if let slug = (error as? SlackSourceError)?.nonReportableConversationSlug {
+                    // Keeping a conversation Slack says is unreadable would spend the same
+                    // history call again on every refresh without yielding a usable message.
+                    conversations.removeAll { $0.id == conversationID }
+                    scanState.conversations.removeValue(forKey: conversationID)
+                    settled.remove(conversationID)
+                    log.info("conversation dropped id=\(conversationID, privacy: .public) error=\(slug, privacy: .public)")
+                    continue
+                }
                 firstError = firstError ?? error
-                failed += 1
+                reportableFailures += 1
             }
         }
 
@@ -318,7 +408,7 @@ actor SlackMessageSource: MessageSource {
             refresh done conversations=\(all.count, privacy: .public) \
             messages=\(pending.count, privacy: .public) \
             skippedForBudget=\(skipped, privacy: .public) \
-            failedConversations=\(failed, privacy: .public) \
+            failedConversations=\(reportableFailures, privacy: .public) \
             callsLeft=\(self.budget, privacy: .public)
             """)
 
@@ -373,6 +463,11 @@ actor SlackMessageSource: MessageSource {
         }
     }
 
+    private struct ScanResult: Sendable {
+        let pending: [Pending]
+        let checkpoints: [String: SlackConversationCheckpoint]
+    }
+
     struct ThreadContext: Sendable {
         let ts: String
         let parentAuthorID: String?
@@ -383,13 +478,26 @@ actor SlackMessageSource: MessageSource {
         _ conversation: SlackConversation,
         since: Date,
         identity: Identity
-    ) async throws -> [Pending] {
-        guard spend(reserve: nameReserve) else { return [] }
+    ) async throws -> ScanResult {
+        // The caller reserves this history request before launching the child, so priority
+        // order cannot be overturned by task scheduling.
+        let scanStartedAt = Date()
+        let previous = scanState.conversations[conversation.id]
+        let floor = scanState.connectedAt ?? scanStartedAt
+        let backfill = scanStartedAt.addingTimeInterval(-Self.historyWindow)
+        let previousDate = previous.flatMap { Date(timeIntervalSince1970: Double($0.newestTS) ?? 0) }
+        let oldest = max(floor, previousDate ?? backfill)
         let base = [("channel", conversation.id),
-                    ("oldest", Self.slackTS(Date().addingTimeInterval(-Self.historyWindow))),
+                    ("oldest", Self.slackTS(oldest)),
                     ("limit", "200")]
         let page = try await get("conversations.history", base)
-        var raw = Self.parseMessages(page)
+        let lowerTS = previous?.newestTS
+        func isNew(_ message: RawMessage) -> Bool {
+            if let lowerTS { return message.ts > lowerTS }
+            return message.date >= floor
+        }
+        var raw = Self.parseMessages(page).filter(isNew)
+        var historyComplete = page["has_more"] as? Bool != true
 
         // One extra page, and only when the first page holds nothing of the user's own.
         // History comes back newest first, so a second page is OLDER, and the only reason
@@ -399,32 +507,42 @@ actor SlackMessageSource: MessageSource {
            page["has_more"] as? Bool == true,
            let cursor = Self.nextCursor(page),
            spend(reserve: nameReserve) {
-            raw += Self.parseMessages(try await get("conversations.history", base + [("cursor", cursor)]))
+            let second = try await get("conversations.history", base + [("cursor", cursor)])
+            raw += Self.parseMessages(second).filter(isNew)
+            historyComplete = second["has_more"] as? Bool != true
         }
 
         let ordered = Self.ordered(raw)
         // "Settled" needs positive proof that the user's own message is the newest thing
         // here. An empty window proves nothing, and treating it as settled would silently
         // mark an old open task done.
-        if let newest = ordered.last, newest.user == identity.userID {
-            settled.insert(conversation.id)
-        }
+        var channelSettled = previous?.settled ?? false
+        if let newest = ordered.last { channelSettled = newest.user == identity.userID }
 
         var pending: [Pending] = []
         // Threads first, so a parent whose thread was read is not ALSO reported as a
         // channel message. A thread parent is a channel message, and emitting both would
         // put the same obligation on the list twice under two different conversation ids.
         var handled: Set<String> = []
+        var checkpoints: [String: SlackConversationCheckpoint] = [:]
 
         for parent in ordered where Self.shouldFetchReplies(parent, userID: identity.userID) {
-            guard spend(reserve: nameReserve) else { break }
+            guard spend(reserve: nameReserve) else {
+                historyComplete = false
+                break
+            }
             let replies = Self.ordered(Self.parseMessages(
                 try await get("conversations.replies",
                               [("channel", conversation.id), ("ts", parent.ts), ("limit", "200")])))
             guard let root = replies.first else { continue }
             handled.insert(parent.ts)
             let key = root.threadTS ?? root.ts
-            if let newest = replies.last, newest.user == identity.userID { settled.insert(key) }
+            if let newest = replies.last {
+                checkpoints[key] = SlackConversationCheckpoint(
+                    newestTS: newest.ts,
+                    settled: newest.user == identity.userID
+                )
+            }
 
             let threadTail = Self.unrepliedTail(replies, userID: identity.userID)
             if let newest = threadTail.last, newest.date > since {
@@ -442,12 +560,21 @@ actor SlackMessageSource: MessageSource {
         if let newest = tail.last, newest.date > since {
             pending += tail.map { Pending(raw: $0, conversation: conversation, thread: nil) }
         }
-        return pending
+        if historyComplete {
+            let newestAccounted = max(
+                previous?.newestTS ?? "",
+                raw.map(\.ts).max() ?? Self.slackTS(scanStartedAt)
+            )
+            checkpoints[conversation.id] = SlackConversationCheckpoint(
+                newestTS: newestAccounted,
+                settled: channelSettled
+            )
+        }
+        return ScanResult(pending: pending, checkpoints: checkpoints)
     }
 
-    /// Display names, cached for the life of the process. ponytail: one users.info per
-    /// unknown author, sequential, because after the first refresh this is nearly always
-    /// zero calls. Switch to one paginated users.list if a cold cache ever costs real time.
+    /// Display names are persisted with the scan state, so an app relaunch is not a cold
+    /// users.info pass. Unknown authors stay sequential because they are normally few.
     private func resolveNames(_ ids: Set<String>) async -> [String: String] {
         for id in ids.sorted() where userNames[id] == nil {
             guard spend() else { break }
@@ -626,27 +753,37 @@ actor SlackMessageSource: MessageSource {
 
 // MARK: - What App.swift installs
 
-/// The source Store is given at launch. Store holds `let source` for the whole app run, so
-/// the mock-or-Slack choice cannot be made once at startup: it is made per call, by asking
-/// the Keychain. That is what makes connecting or disconnecting Slack take effect on the
-/// next refresh instead of on the next launch. The caches live in the SlackMessageSource
-/// instance, so switching back and forth costs nothing.
-struct LiveMessageSource: MessageSource {
-    private let slack = SlackMessageSource()
-    private let mock = MockMessageSource()
+/// The source Store is given at launch. It checks the Keychain per call so connecting or
+/// disconnecting Slack takes effect on the next refresh instead of the next launch. When
+/// there is no token it reports notConnected; canned messages belong only to demos.
+struct LiveMessageSource: SlackScanStateSource {
+    private let slack: SlackMessageSource
+    private let tokenAvailable: @Sendable () -> Bool
 
-    private var connected: Bool { SlackKeychain.load() != nil }
+    init(
+        slack: SlackMessageSource = SlackMessageSource(),
+        tokenAvailable: @escaping @Sendable () -> Bool = { SlackKeychain.load() != nil }
+    ) {
+        self.slack = slack
+        self.tokenAvailable = tokenAvailable
+    }
 
     func unrepliedMessages(since: Date) async throws -> [SlackMessage] {
-        connected
-            ? try await slack.unrepliedMessages(since: since)
-            : try await mock.unrepliedMessages(since: since)
+        guard tokenAvailable() else { throw SlackSourceError.notConnected }
+        return try await slack.unrepliedMessages(since: since)
     }
 
     func repliedIDs(among ids: [String]) async throws -> Set<String> {
-        connected
-            ? try await slack.repliedIDs(among: ids)
-            : try await mock.repliedIDs(among: ids)
+        guard tokenAvailable() else { throw SlackSourceError.notConnected }
+        return try await slack.repliedIDs(among: ids)
+    }
+
+    func restoreSlackScanState(_ state: SlackScanState) async {
+        await slack.restoreSlackScanState(state)
+    }
+
+    func currentSlackScanState() async -> SlackScanState {
+        await slack.currentSlackScanState()
     }
 }
 
@@ -725,6 +862,10 @@ func demoSlackSource() async {
            == .missingScope("channels:history"))
     assert(slackError(#"{"ok":false,"error":"ratelimited"}"#) == .rateLimited)
     assert(slackError(#"{"ok":false,"error":"channel_not_found"}"#) == .slack("channel_not_found"))
+    assert(SlackSourceError.slack("channel_not_found").nonReportableConversationSlug != nil)
+    assert(SlackSourceError.slack("is_archived").nonReportableConversationSlug != nil)
+    assert(SlackSourceError.slack("not_in_channel").nonReportableConversationSlug != nil)
+    assert(SlackSourceError.slack("internal_error").nonReportableConversationSlug == nil)
     assert(SlackSourceError.reconnect.isFatal && SlackSourceError.missingScope("x").isFatal)
     assert(!SlackSourceError.rateLimited.isFatal)
     assert(SlackSourceError.reconnect.localizedDescription.contains("Reconnect"))
@@ -773,14 +914,26 @@ func demoSlackSource() async {
     /// Counts what the client asked for, so the budget can be asserted rather than trusted.
     actor CallLog {
         var methods: [String] = []
-        func record(_ method: String) { methods.append(method) }
+        var calls: [(String, [(String, String)])] = []
+        func record(_ method: String, _ query: [(String, String)] = []) {
+            methods.append(method)
+            calls.append((method, query))
+        }
         var count: Int { methods.count }
         func count(of method: String) -> Int { methods.filter { $0 == method }.count }
+        func oldest(channel: String) -> [String] {
+            calls.compactMap { method, query in
+                guard method == "conversations.history",
+                      query.first(where: { $0.0 == "channel" })?.1 == channel
+                else { return nil }
+                return query.first(where: { $0.0 == "oldest" })?.1
+            }
+        }
     }
 
     func cannedSource(budget: Int, log: CallLog) -> SlackMessageSource {
         SlackMessageSource(call: { method, query in
-            await log.record(method)
+            await log.record(method, query)
             let channel = query.first { $0.0 == "channel" }?.1 ?? ""
             let body: String
             switch method {
@@ -811,6 +964,8 @@ func demoSlackSource() async {
 
     let fullLog = CallLog()
     let source = cannedSource(budget: 40, log: fullLog)
+    let originalFloor = now.addingTimeInterval(-2 * 60 * 60)
+    await source.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
     let messages = try! await source.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
 
     // FULL CONTEXT: D_PAUL's newest message is inside the 20-minute window, so the whole
@@ -859,6 +1014,79 @@ func demoSlackSource() async {
     assert(after == before, "reply detection must not issue requests, spent \(after - before)")
     assert(S.conversationKey(ofItem: "C_X#2") == "C_X" && S.conversationKey(ofItem: "C_X") == "C_X")
 
+    // MARK: later scans start at each conversation's own edge
+    let firstState = await source.currentSlackScanState()
+    assert(firstState.conversations["D_PAUL"]?.newestTS == ts(2))
+    assert(firstState.conversations["C_SETTLED"]?.settled == true)
+    let repliesAfterFirst = await fullLog.count(of: "conversations.replies")
+    let usersAfterFirst = await fullLog.count(of: "users.info")
+    let next = try! await source.unrepliedMessages(since: now)
+    assert(next.isEmpty, "the canned old rows must be behind their watermarks")
+    let repliesAfterSecond = await fullLog.count(of: "conversations.replies")
+    let usersAfterSecond = await fullLog.count(of: "users.info")
+    assert(repliesAfterSecond == repliesAfterFirst,
+           "an old thread parent must not trigger another replies call")
+    assert(usersAfterSecond == usersAfterFirst,
+           "known names must not trigger another users.info call")
+    let remembered = try! await source.repliedIDs(among: ["C_SETTLED"])
+    assert(remembered == ["C_SETTLED"], "settled proof must survive an empty incremental window")
+    let paulOldest = await fullLog.oldest(channel: "D_PAUL")
+    assert(paulOldest.count == 2 && paulOldest[0] == S.slackTS(originalFloor) && paulOldest[1] == ts(2),
+           "history did not move from the connection floor to the per-conversation watermark")
+
+    // Persisted author names avoid refetching those profiles after a relaunch. Identity
+    // itself is deliberately refreshed so user-group membership cannot become permanent.
+    var savedState = await source.currentSlackScanState()
+    savedState.conversations["D_PAUL"] = SlackConversationCheckpoint(
+        newestTS: ts(3), settled: false
+    )
+    let relaunchLog = CallLog()
+    let relaunched = cannedSource(budget: 40, log: relaunchLog)
+    await relaunched.restoreSlackScanState(savedState)
+    let relaunchedRows = try! await relaunched.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    let relaunchedAuthCalls = await relaunchLog.count(of: "auth.test")
+    let relaunchedUserCalls = await relaunchLog.count(of: "users.info")
+    let relaunchedGroupCalls = await relaunchLog.count(of: "usergroups.list")
+    assert(relaunchedRows.count == 1 && relaunchedRows[0].sender == "nU_PAUL")
+    assert(relaunchedAuthCalls == 1 && relaunchedGroupCalls == 1)
+    assert(relaunchedUserCalls == 1,
+           "only the user's identity, not a cached author, should need users.info")
+
+    // MARK: a first connected scan establishes and obeys its floor
+    let floorLog = CallLog()
+    let beforeConnect = Date()
+    let oldTS = S.slackTS(beforeConnect.addingTimeInterval(-60))
+    let floorSource = SlackMessageSource(call: { method, query in
+        await floorLog.record(method, query)
+        let body: String
+        switch method {
+        case "auth.test":
+            body = #"{"ok":true,"user_id":"U_ME"}"#
+        case "users.info":
+            body = #"{"ok":true,"user":{"real_name":"","profile":{"display_name":""}}}"#
+        case "usergroups.list":
+            body = #"{"ok":true,"usergroups":[]}"#
+        case "users.conversations":
+            body = #"{"ok":true,"channels":[{"id":"C_NEW","name":"new"}]}"#
+        case "conversations.history":
+            body = """
+            {"ok":true,"messages":[{"ts":"\(oldTS)","user":"U_OTHER","text":"old"}]}
+            """
+        default:
+            body = #"{"ok":false,"error":"unknown_method"}"#
+        }
+        return Data(body.utf8)
+    })
+    let oldRows = try! await floorSource.unrepliedMessages(since: .distantPast)
+    let floorState = await floorSource.currentSlackScanState()
+    let afterConnect = Date()
+    let connectedAt = floorState.connectedAt!
+    assert(connectedAt >= beforeConnect && connectedAt <= afterConnect)
+    assert(oldRows.isEmpty, "a first connection must not return pre-connection messages")
+    let floorOldest = await floorLog.oldest(channel: "C_NEW")
+    assert(floorOldest == [S.slackTS(connectedAt)],
+           "the first history oldest must be the connection floor")
+
     // MARK: a dead token is an error, never an empty list
     let deadLog = CallLog()
     let dead = SlackMessageSource(call: { _, _ in
@@ -877,12 +1105,76 @@ func demoSlackSource() async {
     // MARK: the call budget stops work and returns partial results
     let tightLog = CallLog()
     let tight = cannedSource(budget: 6, log: tightLog)
+    await tight.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
     let partial = try! await tight.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
     let spent = await tightLog.count
     assert(spent <= 6, "the budget must be a hard cap, spent \(spent)")
     assert(!partial.isEmpty, "a partial list beats an empty one")
     assert(partial.count < messages.count, "budget exhausted, so some conversations were skipped")
     assert(partial.contains { $0.conversationID == "D_PAUL" }, "IMs are scanned first, so they survive")
+    let tightState = await tight.currentSlackScanState()
+    assert(tightState.conversations["D_PAUL"] != nil)
+    assert(tightState.conversations["C_ENG"] == nil,
+           "a conversation skipped for budget must keep its old watermark")
+
+    // MARK: an unreadable conversation is skipped and evicted, not reported as refresh failure
+    let goneLog = CallLog()
+    let gone = SlackMessageSource(call: { method, query in
+        await goneLog.record(method)
+        let body: String
+        switch method {
+        case "auth.test":
+            body = #"{"ok":true,"user_id":"U_ME","url":"https://acme.slack.com/"}"#
+        case "users.info":
+            body = #"{"ok":true,"user":{"real_name":"","profile":{"display_name":""}}}"#
+        case "usergroups.list":
+            body = #"{"ok":true,"usergroups":[]}"#
+        case "users.conversations":
+            body = #"{"ok":true,"channels":[{"id":"C_GONE","name":"gone"}]}"#
+        case "conversations.history":
+            let channel = query.first { $0.0 == "channel" }?.1 ?? ""
+            body = channel == "C_GONE"
+                ? #"{"ok":false,"error":"channel_not_found"}"#
+                : #"{"ok":true,"messages":[]}"#
+        default:
+            body = #"{"ok":false,"error":"unknown_method"}"#
+        }
+        return Data(body.utf8)
+    })
+    do {
+        let empty = try await gone.unrepliedMessages(since: .distantPast)
+        assert(empty.isEmpty, "one unreadable conversation must still allow inbox zero")
+    } catch {
+        assert(false, "channel_not_found must not escape the conversation scan: \(error)")
+    }
+    do {
+        _ = try await gone.unrepliedMessages(since: .distantPast)
+    } catch {
+        assert(false, "the evicted conversation must not fail the next refresh: \(error)")
+    }
+    let goneHistoryCalls = await goneLog.count(of: "conversations.history")
+    let goneListCalls = await goneLog.count(of: "users.conversations")
+    assert(goneHistoryCalls == 1, "the evicted conversation was scanned \(goneHistoryCalls) times")
+    assert(goneListCalls == 1, "an empty loaded cache must not be mistaken for no cache")
+
+    // MARK: the live source never substitutes sample rows for a missing token
+    let disconnected = LiveMessageSource(tokenAvailable: { false })
+    do {
+        let rows = try await disconnected.unrepliedMessages(since: .distantPast)
+        assert(false, "a disconnected live source returned \(rows.count) sample rows")
+    } catch let error as SlackSourceError {
+        assert(error == .notConnected, "got \(error)")
+    } catch {
+        assert(false, "wrong error type")
+    }
+    do {
+        let ids = try await disconnected.repliedIDs(among: ["C_ONE"])
+        assert(false, "a disconnected live source returned \(ids.count) replied ids")
+    } catch let error as SlackSourceError {
+        assert(error == .notConnected, "got \(error)")
+    } catch {
+        assert(false, "wrong error type")
+    }
 
     print("demoSlackSource: PASS (\(messages.count) messages, \(await fullLog.count) calls, partial \(partial.count) in \(spent))")
 }

@@ -33,6 +33,10 @@ final class Store {
     /// The id of the item the user last marked done by hand, so undoLast() can un-mark it.
     /// Auto-done items (reply detection) never touch this, so undo cannot reach them.
     private var lastDoneID: String?
+    /// Durable Slack call-reduction state. It is optional so state.json files written by
+    /// older Sereno versions decode without migration work.
+    private var slackScanState: SlackScanState?
+    private var restoredSlackScanState = false
 
     /// The one thing the undo bar can currently take back. Two paths lead here, and each
     /// clears the other's bookkeeping when it fires, so the bar always undoes the action
@@ -63,6 +67,7 @@ final class Store {
     private struct State: Codable {
         var todos: [TodoItem]
         var lastScan: Date
+        var slackScanState: SlackScanState?
     }
 
     /// Directory holding state.json. `urls(for:in:)` documents an array that can be
@@ -154,22 +159,27 @@ final class Store {
             }
             todos = []
             lastScan = .distantPast
+            slackScanState = nil
             return
         }
         do {
             let state = try JSONDecoder().decode(State.self, from: data)
             todos = state.todos
             lastScan = state.lastScan
+            slackScanState = state.slackScanState
         } catch {
             log.error("state file unreadable, starting empty bytes=\(data.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             todos = []
             lastScan = .distantPast
+            slackScanState = nil
         }
     }
 
     private func save() {
         do {
-            let data = try JSONEncoder().encode(State(todos: todos, lastScan: lastScan))
+            let data = try JSONEncoder().encode(
+                State(todos: todos, lastScan: lastScan, slackScanState: slackScanState)
+            )
             try data.write(to: fileURL, options: .atomic)
         } catch {
             log.error("state save failed, changes stay in memory only items=\(self.todos.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
@@ -252,8 +262,42 @@ final class Store {
         isRefreshing = true
         defer { isRefreshing = false }
 
+        let statefulSource = source as? any SlackScanStateSource
+        if let statefulSource, !restoredSlackScanState {
+            await statefulSource.restoreSlackScanState(slackScanState ?? SlackScanState())
+            restoredSlackScanState = true
+        }
+        let previousSlackState = slackScanState
+
+        let messages: [SlackMessage]
         do {
-            let messages = try await source.unrepliedMessages(since: lastScan)
+            messages = try await source.unrepliedMessages(since: lastScan)
+        } catch {
+            // The connection floor is established when the connected scan begins and must
+            // survive even if Slack fails. Conversation edges do not advance on a failed
+            // source call because a fatal result may have hidden another child's messages.
+            if let statefulSource {
+                let candidate = await statefulSource.currentSlackScanState()
+                var rollback = candidate
+                rollback.conversations = previousSlackState?.accountKey == candidate.accountKey
+                    ? previousSlackState?.conversations ?? [:]
+                    : [:]
+                slackScanState = rollback
+                await statefulSource.restoreSlackScanState(rollback)
+                save()
+            }
+            log.error("refresh failed, list left unchanged error=\(error.localizedDescription, privacy: .public)")
+            errorText = error.localizedDescription
+            return
+        }
+
+        let candidateSlackState: SlackScanState? = if let statefulSource {
+            await statefulSource.currentSlackScanState()
+        } else {
+            nil
+        }
+
+        do {
             // Preferences is @MainActor and so is this, so read it straight.
             let addressed = Self.addressed(messages, ignoring: Preferences.shared.ignoredSignals)
             log.debug("addressing filter dropped messages=\(messages.count - addressed.count, privacy: .public) conversations=\(Set(messages.map(Self.conversationKey)).count - Set(addressed.map(Self.conversationKey)).count, privacy: .public)")
@@ -261,11 +305,23 @@ final class Store {
             todos = Self.merged(existing: todos, new: newItems)
             log.debug("refresh scanned messages=\(messages.count, privacy: .public) newItems=\(newItems.count, privacy: .public) fallbacks=\(newItems.filter { $0.reason.hasPrefix("Fallback") }.count, privacy: .public)")
         } catch {
+            // Fetching does not count as accounting for a message until triage accepts it.
+            // Preserve cheap identity/name work and the connection floor, but put every
+            // conversation edge back so the same messages are offered again next time.
+            if let statefulSource, var rollback = candidateSlackState {
+                rollback.conversations = previousSlackState?.accountKey == rollback.accountKey
+                    ? previousSlackState?.conversations ?? [:]
+                    : [:]
+                slackScanState = rollback
+                await statefulSource.restoreSlackScanState(rollback)
+                save()
+            }
             log.error("refresh failed, list left unchanged error=\(error.localizedDescription, privacy: .public)")
             errorText = error.localizedDescription
             return
         }
 
+        if let candidateSlackState { slackScanState = candidateSlackState }
         lastScan = Date()
         errorText = nil
 
@@ -288,6 +344,14 @@ final class Store {
     func regenerate() async {
         todos = []
         lastScan = .distantPast
+        // Regeneration may re-read only the period since connection. It must never erase
+        // that floor and expose messages which predate installation.
+        slackScanState?.conversations = [:]
+        if let statefulSource = source as? any SlackScanStateSource,
+           let slackScanState {
+            await statefulSource.restoreSlackScanState(slackScanState)
+            restoredSlackScanState = true
+        }
         save()
         await refresh()
     }
@@ -550,6 +614,37 @@ private struct SilentSource: MessageSource {
     func repliedIDs(among ids: [String]) async throws -> Set<String> { [] }
 }
 
+/// A no-network stateful source for proving Store's Slack state round-trip.
+private actor StatefulSilentSource: SlackScanStateSource {
+    let connectionTime: Date
+    private var state = SlackScanState()
+    private var restoredState: SlackScanState?
+
+    init(connectionTime: Date) { self.connectionTime = connectionTime }
+
+    func restoreSlackScanState(_ state: SlackScanState) {
+        self.state = state
+        restoredState = state
+    }
+
+    func currentSlackScanState() -> SlackScanState { state }
+
+    func unrepliedMessages(since: Date) async throws -> [SlackMessage] {
+        if state.connectedAt == nil { state.connectedAt = connectionTime }
+        state.conversations["C_STATE"] = SlackConversationCheckpoint(
+            newestTS: "123.000001", settled: true
+        )
+        return []
+    }
+
+    func repliedIDs(among ids: [String]) async throws -> Set<String> { [] }
+
+    func restoredConnectionTime() -> Date? { restoredState?.connectedAt }
+    func restoredCheckpoint() -> SlackConversationCheckpoint? {
+        restoredState?.conversations["C_STATE"]
+    }
+}
+
 /// The refresh cadence: interval comes from the preference and follows it when it
 /// changes, and refreshIfStale() skips a scan that just happened.
 @MainActor
@@ -563,7 +658,9 @@ func demoRefreshTimer() async {
     defer { prefs.refreshMinutes = original }
 
     prefs.refreshMinutes = 5
-    let store = Store(source: SilentSource(), fileURL: tempURL)
+    let connectionTime = Date(timeIntervalSinceReferenceDate: 123_456)
+    let statefulSource = StatefulSilentSource(connectionTime: connectionTime)
+    let store = Store(source: statefulSource, fileURL: tempURL)
     assert(store.refreshInterval == 300,
            "timer must derive from refreshMinutes, got \(String(describing: store.refreshInterval))")
     assert(store.refreshInterval != 60 * 60 * 24, "the daily timer must be gone")
@@ -580,6 +677,12 @@ func demoRefreshTimer() async {
     await store.refreshIfStale()
     let firstScan = store.lastScan
     assert(firstScan > .distantPast, "refreshIfStale must run when lastScan is old")
+    let stateData = try! Data(contentsOf: tempURL)
+    let stateJSON = try! JSONSerialization.jsonObject(with: stateData) as! [String: Any]
+    let persistedSlack = stateJSON["slackScanState"] as? [String: Any]
+    assert(persistedSlack?["connectedAt"] != nil, "the connection floor must be in state.json")
+    assert((persistedSlack?["conversations"] as? [String: Any])?["C_STATE"] != nil,
+           "the conversation watermark must be in state.json")
 
     // Fresh: the same call again must not scan, so lastScan cannot move.
     await store.refreshIfStale()
@@ -589,5 +692,14 @@ func demoRefreshTimer() async {
     // And an explicit refresh() is never skipped, that is the Refresh button.
     await store.refresh()
     assert(store.lastScan > firstScan, "refresh() must always scan")
+
+    // A new Store and source receive the exact floor and checkpoint before scanning.
+    let relaunchedSource = StatefulSilentSource(connectionTime: .distantFuture)
+    let relaunchedStore = Store(source: relaunchedSource, fileURL: tempURL)
+    await relaunchedStore.refresh()
+    let restoredConnectionTime = await relaunchedSource.restoredConnectionTime()
+    let restoredCheckpoint = await relaunchedSource.restoredCheckpoint()
+    assert(restoredConnectionTime == connectionTime)
+    assert(restoredCheckpoint?.newestTS == "123.000001")
     print("demoRefreshTimer: PASS")
 }
