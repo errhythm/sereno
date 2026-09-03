@@ -32,6 +32,7 @@ final class Preferences {
         weatherLongitude = store.object(forKey: Key.weatherLongitude) as? Double
         roleHintDismissed = store.object(forKey: Key.roleHintDismissed) as? Bool ?? false
         hasCompletedOnboarding = store.object(forKey: Key.hasCompletedOnboarding) as? Bool ?? false
+        popoverHeight = store.object(forKey: Key.popoverHeight) as? Double
     }
 
     /// What the user does, in their own words. Passed to the model so it can judge whether
@@ -117,6 +118,19 @@ final class Preferences {
     /// accessory app has no ordinary launch window where first-run guidance can live.
     var hasCompletedOnboarding: Bool { didSet { store.set(hasCompletedOnboarding, forKey: Key.hasCompletedOnboarding) } }
 
+    /// The popover height the user dragged its bottom edge to, in points. nil means they
+    /// never did, which is the only state where auto-fit is allowed to touch the height:
+    /// two mechanisms writing one number is how the panel ended up stuck at one card tall.
+    ///
+    /// Stored raw and clamped nowhere near here. The real limits — never taller than the
+    /// screen's visible frame, never shorter than the chrome plus one row — need the live
+    /// window and its screen, so they live in `Foreground.manualPopoverFrame`, which every
+    /// path that applies this value goes through. That also keeps this a plain didSet:
+    /// clamping inside a didSet would have to assign to the property it fired from, and
+    /// @Observable routes that back through the generated setter and recurses until the
+    /// stack dies (see refreshMinutes for the shape that needs the explicit setter).
+    var popoverHeight: Double? { didSet { store.set(popoverHeight, forKey: Key.popoverHeight) } }
+
     /// True only when the user opted in AND we have somewhere to ask about.
     var canFetchWeather: Bool {
         weatherEnabled && weatherLatitude != nil && weatherLongitude != nil
@@ -150,6 +164,7 @@ final class Preferences {
         weatherLongitude = nil
         roleHintDismissed = false
         hasCompletedOnboarding = false
+        popoverHeight = nil
         // The assignments above run didSet and write defaults back, so this second sweep
         // is what leaves the UserDefaults domain clean after a reset.
         Key.all.forEach(store.removeObject)
@@ -171,11 +186,13 @@ final class Preferences {
         static let weatherLongitude = "weatherLongitude"
         static let roleHintDismissed = "roleHintDismissed"
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
+        static let popoverHeight = "popoverHeight"
 
         static let all = [
             role, refreshMinutes, notifyNewItems, notifySnoozeWake, countBroadcast,
             countNameMentions, snoozeHours, morningHour, windowAlwaysOnTop, weatherEnabled,
-            weatherCity, weatherLatitude, weatherLongitude, roleHintDismissed, hasCompletedOnboarding
+            weatherCity, weatherLatitude, weatherLongitude, roleHintDismissed, hasCompletedOnboarding,
+            popoverHeight
         ]
     }
 }
@@ -194,6 +211,7 @@ func demoPreferences() {
     assert(prefs.countNameMentions)
     assert(!prefs.roleHintDismissed, "the role hint should show until dismissed")
     assert(!prefs.hasCompletedOnboarding, "onboarding should begin incomplete")
+    assert(prefs.popoverHeight == nil, "no manual height means auto-fit owns the popover")
     assert(prefs.ignoredSignals == [.broadcast])
 
     // Clamping, so a bad value cannot wedge the refresh timer.
@@ -213,6 +231,13 @@ func demoPreferences() {
     assert(!reloaded.countNameMentions)
     assert(reloaded.hasCompletedOnboarding)
     assert(reloaded.ignoredSignals == [.broadcast, .nameMentioned])
+
+    // The dragged popover height has to survive a relaunch, and clearing it has to put
+    // auto-fit back in charge rather than leave a stale number behind.
+    prefs.popoverHeight = 420
+    assert(Preferences(store: suite).popoverHeight == 420, "a dragged height must persist")
+    prefs.popoverHeight = nil
+    assert(Preferences(store: suite).popoverHeight == nil, "clearing it must return to auto-fit")
 
     assert(prefs.windowAlwaysOnTop, "the window should float by default")
     prefs.windowAlwaysOnTop = false
@@ -234,18 +259,21 @@ func demoPreferences() {
 
     prefs.snoozeHours = 99
     prefs.morningHour = 30
+    prefs.popoverHeight = 500
     prefs.resetAll()
     assert(prefs.role.isEmpty && prefs.refreshMinutes == 5 && prefs.notifyNewItems && prefs.notifySnoozeWake)
     assert(!prefs.countBroadcast && prefs.countNameMentions && prefs.snoozeHours == 3 && prefs.morningHour == 9)
     assert(prefs.windowAlwaysOnTop && !prefs.weatherEnabled && prefs.weatherCity.isEmpty)
     assert(prefs.weatherLatitude == nil && prefs.weatherLongitude == nil && !prefs.roleHintDismissed)
     assert(!prefs.hasCompletedOnboarding && prefs.ignoredSignals == [.broadcast])
+    assert(prefs.popoverHeight == nil)
     let reset = Preferences(store: suite)
     assert(reset.role.isEmpty && reset.refreshMinutes == 5 && reset.notifyNewItems && reset.notifySnoozeWake)
     assert(!reset.countBroadcast && reset.countNameMentions && reset.snoozeHours == 3 && reset.morningHour == 9)
     assert(reset.windowAlwaysOnTop && !reset.weatherEnabled && reset.weatherCity.isEmpty)
     assert(reset.weatherLatitude == nil && reset.weatherLongitude == nil && !reset.roleHintDismissed)
     assert(!reset.hasCompletedOnboarding && reset.ignoredSignals == [.broadcast])
+    assert(reset.popoverHeight == nil)
 
     print("demoPreferences: PASS")
 }

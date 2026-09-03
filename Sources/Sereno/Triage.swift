@@ -175,6 +175,36 @@ enum Triage {
     /// semantic label here and Swift maps that label to a number in priority(for:). The
     /// category labels stay LEAST-URGENT-FIRST, listing them the other way collapsed every
     /// conversation onto the first label.
+    ///
+    /// The category block discriminates on the ASK, not on breakage words, because it had
+    /// to: a blocked line that named a broken/stopped state up front pulled every message
+    /// merely mentioning something broken to priority 1, a joke about a broken machine
+    /// included. Measured over 8 rubric variants at 3-5 runs per fixture, the model keys on
+    /// the state words and not on the trailing "and they need you to act", so blocked leads
+    /// with the ask and fyi/social explicitly claim a fault that is only reported. Known
+    /// limit, still measured as failing: an unaddressed channel outage report ("something
+    /// shared is down") is ranked 1 rather than 4/5, and no variant tried separated it from
+    /// a genuine addressed plea for help without also demoting the plea. Reverting to the
+    /// pre-widening line is measurably worse, not better: it fails that case too AND drops
+    /// the joke to 2.
+    ///
+    /// directRequest states its time test FIRST for the same reason. It used to trail the
+    /// clause ("with no deadline stated") and deadlineToday then never fired: a message
+    /// naming a deadline landed on directRequest in 40 of 40 runs, which looked like the
+    /// dead questionAsked rung. It is not dead, it was shadowed. With the test leading, and
+    /// scoped to *today* so a next-week ask still belongs to directRequest, deadlineToday
+    /// fires 15 of 15 on a clock time today and stays off a next-week ask 15 of 15.
+    /// Known soft edge: a relative, impersonal phrasing ("we need it inside the hour")
+    /// reaches deadlineToday only 6 times in 15. That is up from 0 in 40, and the failure
+    /// is lenient (it lands on directRequest, one band down), so it is left measured rather
+    /// than chased: the two rewordings that firmed it up both made a next-week ask urgent,
+    /// which is the worse error. Do not drop "today" from either line, and do not soften
+    /// deadlineToday's "when you must act" tail: a person-neutral tail ("when it must be
+    /// done") pulled a next-week ask to priority 1 in 3 of 7 runs.
+    ///
+    /// Measuring hazard, not a prompt rule: the fixture "can you send the tax numbers
+    /// before 5pm today?" tripped Apple's guardrail 3 of 3 (guardrailViolation, which
+    /// silently falls back and measures nothing). Same class as "by end of day".
     static func stageOnePrompt(messages: String, currentTime: String, role: String) -> String {
         let roleLine = role.isEmpty ? "" : "\nAbout the person reading this: \(role)"
         return """
@@ -189,12 +219,12 @@ enum Triage {
         yours: yes only when the messages ask the person reading this personally to act; otherwise no.
 
         category, the one label that fits what the messages ask:
-        fyi they only share news, a state, or an outcome, and ask nothing of you.
-        social they chat, joke, or invite, and any reply is optional.
-        directRequest they ask you personally for work, with no deadline stated.
-        deadlineToday they state a deadline falling today or within the hour.
-        blocked something is broken, down, or stopped, or work cannot continue, and they need you to act.
-        Category follows what is asked, never who asked.
+        fyi they only pass on news, a state, an outcome, or a fault, and ask nothing of you.
+        social they chat, joke, grumble, or invite, and any reply is optional.
+        directRequest no time today is stated, and they ask you personally for work.
+        deadlineToday they state a time today, or within the hour, when you must act.
+        blocked they say work has stopped and ask you for urgent help now.
+        Category follows what is asked of you, never who asked. A fault only reported is fyi or social.
         """
     }
 
@@ -629,11 +659,26 @@ enum Triage {
         // private and inline, so it is not checked here and the two can still drift apart
         // unnoticed.
         assert(rubric.contains("Help."))
-        // The blocked line was widened to also catch an outage/breakage, not just a stated
-        // blocker. Guard against the verbatim-copy trap: no concrete example answer.
-        assert(rubric.contains("blocked something is broken, down, or stopped, or work cannot continue, and they need you to act."))
+        // These three lines are one measured unit: blocked leads with the ask, fyi claims a
+        // merely passed-on fault, and the closing rule sends an unasked fault away from
+        // blocked. Measured (5 runs per fixture): this combination is what keeps a joke
+        // about something broken at 4 instead of 1. Guard against the verbatim-copy trap
+        // too: the rubric names no concrete subject that could pass as a real answer.
+        assert(rubric.contains("blocked they say work has stopped and ask you for urgent help now."))
+        assert(rubric.contains("fyi they only pass on news, a state, an outcome, or a fault, and ask nothing of you."))
+        assert(rubric.contains("A fault only reported is fyi or social."))
+        // directRequest's time test must LEAD, and must stay scoped to today. Trailing it
+        // shadowed deadlineToday into never firing (0 of 40 runs); dropping "today" pulled
+        // a next-week ask up to priority 1. Both were measured, both are locked here.
+        assert(rubric.contains("directRequest no time today is stated, and they ask you personally for work."))
+        assert(rubric.contains("deadlineToday they state a time today, or within the hour, when you must act."))
+        assert(rubric.range(of: "no time today is stated")!.upperBound
+               < rubric.range(of: "they ask you personally for work")!.lowerBound,
+               "the time test must precede the ask in the directRequest line")
         assert(!rubric.contains("production"))
         assert(!rubric.contains("deploy"))
+        assert(!rubric.lowercased().contains("coffee"))
+        assert(!rubric.lowercased().contains("build box"))
         let offsets = ["fyi", "social", "directRequest", "deadlineToday", "blocked"].map {
             label -> Int in
             guard let range = rubric.range(of: "\n\(label) ") else {
@@ -877,8 +922,10 @@ enum Triage {
         assert(!noRole.contains("About the person"), "no role means no role line")
         assert(withRole.contains(roleLine + "\n"))
         assert(withRole.count == noRole.count + roleLine.count, "the role line is the only addition")
-        // 1122 -> 1162: deliberate growth, the blocked line widened to also catch an
-        // outage/breakage that needs the reader to act, not just a stated blocker.
-        assert(noRole.count == 1162, "stage 1 prompt drifted to \(noRole.count) chars, it must not re-inflate")
+        // 1162 -> 1198: the widened blocked line put a joke about a broken thing at 1, so
+        // blocked now leads with the ask and fyi/social claim a fault that is only reported.
+        // 1198 -> 1210: directRequest's time test moved to the front of its line, which is
+        // what stopped it shadowing deadlineToday into never firing.
+        assert(noRole.count == 1210, "stage 1 prompt drifted to \(noRole.count) chars, it must not re-inflate")
     }
 }
