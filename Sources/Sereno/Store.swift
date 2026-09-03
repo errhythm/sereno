@@ -38,6 +38,12 @@ final class Store {
     private var slackScanState: SlackScanState?
     private var restoredSlackScanState = false
     private var resetGeneration = 0
+    /// Earliest time refreshIfStale() may try again after a failure. Deliberately NOT
+    /// lastScan: lastScan is the `since` cursor handed to the source, so advancing it to
+    /// buy quiet would silently skip every message that arrived in the gap. Without this a
+    /// failed refresh stayed stale and re-ran on the next touch of the panel, which turned
+    /// a 5 minute preference into a scan every 15 seconds against a rate limit.
+    private var retryAfterFailure: Date?
 
     /// The one thing the undo bar can currently take back. Two paths lead here, and each
     /// clears the other's bookkeeping when it fires, so the bar always undoes the action
@@ -56,6 +62,9 @@ final class Store {
     /// A scan younger than this counts as fresh. Opening the panel in a loop must not
     /// re-run the on-device model every time.
     static let stalePeriod: TimeInterval = 30
+    /// The least a failed refresh waits before refreshIfStale() tries again. A rate limit
+    /// that named a longer wait gets its own number honoured instead.
+    static let failureBackoff: TimeInterval = 60
     nonisolated private static let currentSchemaVersion = 1
 
     /// Interval the scheduled timer is actually running at, so a check can prove it
@@ -164,9 +173,24 @@ final class Store {
 
     /// For the panel-open path: skip the work when the last scan is recent. refresh()
     /// itself checks again because direct callers do not pass through this stale check.
+    ///
+    /// The backoff is checked only here, so the Refresh button still goes straight through:
+    /// a user pressing it is asking for the attempt now, whatever the last one did.
     func refreshIfStale() async {
         guard !isRefreshing, Date().timeIntervalSince(lastScan) >= Self.stalePeriod else { return }
+        if let retryAfterFailure, Date() < retryAfterFailure { return }
         await refresh()
+    }
+
+    /// How long to stay quiet after a failure. A rate limit names the wait it wants, and
+    /// honouring it is the only thing that stops the next attempt from renewing the same
+    /// rejection. Everything else gets the flat minimum, short enough that a blip is not
+    /// felt and long enough that a broken source is not asked again on every panel open.
+    private static func backoff(after error: Error) -> TimeInterval {
+        guard let slack = error as? SlackSourceError,
+              case .rateLimited(let retryAfter) = slack
+        else { return failureBackoff }
+        return max(failureBackoff, retryAfter ?? 0)
     }
 
     // Missing or corrupt state file just means "no history yet", not a crash. Missing is
@@ -327,6 +351,7 @@ final class Store {
             }
             log.error("refresh failed, list left unchanged error=\(error.localizedDescription, privacy: .public)")
             errorText = error.localizedDescription
+            retryAfterFailure = Date().addingTimeInterval(Self.backoff(after: error))
             return
         }
 
@@ -361,12 +386,14 @@ final class Store {
             }
             log.error("refresh failed, list left unchanged error=\(error.localizedDescription, privacy: .public)")
             errorText = error.localizedDescription
+            retryAfterFailure = Date().addingTimeInterval(Self.backoff(after: error))
             return
         }
 
         if let candidateSlackState { slackScanState = candidateSlackState }
         lastScan = Date()
         errorText = nil
+        retryAfterFailure = nil
 
         // Separate do/catch: a failure here must not lose the todos just merged
         // above or skip lastScan. Worst case is a stale done flag, not data loss.
@@ -411,6 +438,7 @@ final class Store {
         slackScanState = nil
         restoredSlackScanState = false
         errorText = nil
+        retryAfterFailure = nil
         lastRemoved = nil
         lastRemovedIndex = nil
         lastDoneID = nil
@@ -712,6 +740,18 @@ private struct SilentSource: MessageSource {
     func repliedIDs(among ids: [String]) async throws -> Set<String> { [] }
 }
 
+/// A source that can only fail, for the failure backoff.
+private final class RateLimitedSource: MessageSource, @unchecked Sendable {
+    var attempts = 0
+
+    func unrepliedMessages(since: Date) async throws -> [SlackMessage] {
+        attempts += 1
+        throw SlackSourceError.rateLimited(retryAfter: 60)
+    }
+
+    func repliedIDs(among ids: [String]) async throws -> Set<String> { [] }
+}
+
 /// A no-network stateful source for proving Store's Slack state round-trip.
 private actor StatefulSilentSource: SlackScanStateSource {
     let connectionTime: Date
@@ -799,5 +839,24 @@ func demoRefreshTimer() async {
     let restoredCheckpoint = await relaunchedSource.restoredCheckpoint()
     assert(restoredConnectionTime == connectionTime)
     assert(restoredCheckpoint?.newestTS == "123.000001")
+
+    // A failed refresh must not be retried on the next touch of the panel. The measured
+    // bug: refreshes 15 seconds apart against a 5 minute preference, because lastScan never
+    // moved and every panel touch therefore looked stale. lastScan must NOT move, it is the
+    // since cursor, so the quiet period gets its own timestamp.
+    let failureURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sereno-backoff-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: failureURL) }
+    let failing = RateLimitedSource()
+    let failingStore = Store(source: failing, fileURL: failureURL)
+    await failingStore.refresh()
+    assert(failing.attempts == 1 && failingStore.errorText != nil)
+    assert(failingStore.lastScan == .distantPast,
+           "a failed refresh must not advance the since cursor")
+    await failingStore.refreshIfStale()
+    assert(failing.attempts == 1, "a failed refresh must back off, attempts \(failing.attempts)")
+    await failingStore.refresh()
+    assert(failing.attempts == 2, "the Refresh button must bypass the backoff")
+    assert(Store.failureBackoff == 60)
     print("demoRefreshTimer: PASS")
 }

@@ -21,8 +21,10 @@ enum SlackSourceError: LocalizedError, Equatable {
     case reconnect
     /// Slack named a scope the token does not carry.
     case missingScope(String)
-    /// 429 after honouring Retry-After.
-    case rateLimited
+    /// 429 after honouring Retry-After. The seconds Slack asked for are carried along
+    /// because they are the only honest basis for deciding when to try the method again;
+    /// nil means the wait was never seen, as when a budget ran out locally.
+    case rateLimited(retryAfter: TimeInterval?)
     case offline
     case network(String)
     /// Any other `ok: false`, carrying Slack's slug so the log and the banner agree.
@@ -67,6 +69,24 @@ enum SlackSourceError: LocalizedError, Equatable {
         else { return nil }
         return slug
     }
+
+    /// A short, stable name for the case itself, for logs. Not `errorDescription`: that
+    /// string is user-facing UI copy free to reword itself, and for `.network` it is built
+    /// from a `URLError`'s own description, which is not safe to log. Every value folded in
+    /// here is either nothing at all or something Slack or the OS defines (a scope name, an
+    /// error slug, a retry delay), so the whole label is `.public`.
+    var caseLabel: String {
+        switch self {
+        case .notConnected: "notConnected"
+        case .reconnect: "reconnect"
+        case .offline: "offline"
+        case .badResponse: "badResponse"
+        case .missingScope(let scope): "missingScope(\(scope))"
+        case .rateLimited(let retryAfter): "rateLimited(\(retryAfter.map { String(Int($0)) } ?? "nil"))"
+        case .slack(let slug): "slack(\(slug))"
+        case .network: "network"
+        }
+    }
 }
 
 // MARK: - Raw Slack shapes
@@ -88,6 +108,19 @@ struct RawMessage: Sendable, Equatable {
     var date: Date { Date(timeIntervalSince1970: Double(ts) ?? 0) }
     /// A parent's own thread_ts equals its ts, so this is only true for a real reply.
     var isThreadReply: Bool { threadTS != nil && threadTS != ts }
+
+    /// A search match arrives in a different shape and carries no thread position, no
+    /// subtype and no reply counts, so this is how one becomes the same RawMessage the
+    /// history path produces. Everything search cannot know stays at its empty value.
+    init(ts: String, user: String, text: String, threadTS: String?) {
+        self.ts = ts
+        self.user = user
+        self.text = text
+        subtype = nil
+        self.threadTS = threadTS
+        replyCount = 0
+        replyUsers = []
+    }
 
     init?(_ json: [String: Any]) {
         guard let ts = json["ts"] as? String else { return nil }
@@ -168,6 +201,9 @@ actor SlackMessageSource: SlackScanStateSource {
     private static let historyWindow: TimeInterval = 7 * 24 * 60 * 60
     /// The conversation list changes rarely, so it is refetched every tenth refresh.
     private static let conversationCacheRefreshes = 10
+    /// Used when a 429 arrived without a readable Retry-After. A minute is what Slack asks
+    /// for on the capped methods, and guessing shorter would just buy another rejection.
+    private static let assumedCooldown: TimeInterval = 60
 
     private let call: Call
     private let observesStoredAccount: Bool
@@ -182,10 +218,24 @@ actor SlackMessageSource: SlackScanStateSource {
     private var permalinkHost = "app.slack.com"
     private var conversations: [SlackConversation] = []
     private var hasConversationCache = false
+    private var conversationsFetchedAt: Int?
     private var conversationsTask: Task<[SlackConversation], Error>?
     private var refreshCount = 0
     private var userNames: [String: String] = [:]
     private var scanState = SlackScanState()
+    /// Earliest date each Web API method may be called again, learned from Slack's own
+    /// Retry-After. Slack now allows this class of app about one conversations.history a
+    /// minute, and a call made inside that window reads nothing and is rejected on the
+    /// spot, so the request is pure waste and also renews the limit. Skipping the
+    /// conversation instead leaves it unscanned for a later refresh, which is the same
+    /// outcome the call budget already produces.
+    private var cooldowns: [String: Date] = [:]
+    /// Where the next sweep begins in the priority-ordered conversation list. A refresh
+    /// held to about one history call cannot honour "IMs first" AND reach the rest of the
+    /// workspace: starting at the top every time would re-read the same first conversation
+    /// forever and never look at the other eighty-one. So a refresh the rate limit cut
+    /// short hands the next one its stopping point.
+    private var sweepStart = 0
 
     /// Conversations whose newest real message this cycle was the user's own, which is
     /// exactly the question `repliedIDs(among:)` asks. Filled during the scan so reply
@@ -200,10 +250,20 @@ actor SlackMessageSource: SlackScanStateSource {
     }
 
     func restoreSlackScanState(_ state: SlackScanState) {
+        // Only a genuinely different account drops the identity. Store calls this on every
+        // failed refresh to roll conversation watermarks back, and clearing the identity
+        // there made each failure re-buy auth.test and usergroups.list, which is how a
+        // rate-limited refresh managed to spend three requests before reading anything.
+        // The correctness this used to provide is still provided: ensureIdentity compares
+        // the cached user against the stored one on every call, and
+        // synchronizeStoredAccount wipes the actor when the stored account changes, so a
+        // sign-in as a different person cannot inherit the previous human's identity.
+        if state.accountKey != scanState.accountKey {
+            identity = nil
+            permalinkHost = "app.slack.com"
+        }
         scanState = state
         userNames = state.userNames
-        identity = nil
-        permalinkHost = "app.slack.com"
     }
 
     func currentSlackScanState() -> SlackScanState {
@@ -212,6 +272,14 @@ actor SlackMessageSource: SlackScanStateSource {
     }
 
     // MARK: Budget
+
+    /// Seconds left before this method may be called again, nil when it is free. Checked
+    /// BEFORE `spend`, so a conversation nobody can read costs neither a request nor a
+    /// slice of the budget.
+    private func cooldown(_ method: String) -> TimeInterval? {
+        guard let until = cooldowns[method], until > Date() else { return nil }
+        return until.timeIntervalSinceNow
+    }
 
     /// Reserve one request. `reserve` keeps a tail of the budget for name lookups.
     private func spend(reserve: Int = 0) -> Bool {
@@ -223,12 +291,22 @@ actor SlackMessageSource: SlackScanStateSource {
     private func get(_ method: String, _ query: [(String, String)] = []) async throws -> [String: Any] {
         let conversationID = query.first(where: { $0.0 == "channel" })?.1 ?? "none"
         log.debug("request method=\(method, privacy: .public) conversation=\(conversationID, privacy: .public) callsLeft=\(self.budget, privacy: .public)")
-        let data = try await call(method, query)
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw SlackSourceError.badResponse
+        do {
+            let data = try await call(method, query)
+            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw SlackSourceError.badResponse
+            }
+            guard root["ok"] as? Bool == true else { throw Self.error(for: root) }
+            return root
+        } catch {
+            // Slack's cap is per method, so a 429 is a fact about the method and not about
+            // the conversation that happened to hit it. Recording it here, at the one place
+            // every request passes through, is what lets the rest of the refresh stop.
+            if let slack = error as? SlackSourceError, case .rateLimited(let retryAfter) = slack {
+                cooldowns[method] = Date().addingTimeInterval(retryAfter ?? Self.assumedCooldown)
+            }
+            throw error
         }
-        guard root["ok"] as? Bool == true else { throw Self.error(for: root) }
-        return root
     }
 
     // MARK: Identity
@@ -244,7 +322,7 @@ actor SlackMessageSource: SlackScanStateSource {
         if let identityTask { return try await identityTask.value }
         let task = Task {
             defer { identityTask = nil }
-            guard spend() else { throw SlackSourceError.rateLimited }
+            guard spend() else { throw SlackSourceError.rateLimited(retryAfter: nil) }
             let auth = try await get("auth.test")
             guard let userID = auth["user_id"] as? String, !userID.isEmpty else {
                 throw SlackSourceError.badResponse
@@ -304,12 +382,18 @@ actor SlackMessageSource: SlackScanStateSource {
         conversations = []
         hasConversationCache = false
         userNames = [:]
+        sweepStart = 0
     }
 
     // MARK: Conversation list
 
     private func ensureConversations() async throws -> [SlackConversation] {
-        if hasConversationCache, refreshCount % Self.conversationCacheRefreshes != 0 {
+        // `conversationsFetchedAt` is what makes this callable twice in one refresh: search
+        // discovery needs the list for channel kinds and the sweep needs it for the sweep
+        // order, and on the refresh where the cache is due to be refetched the second caller
+        // would otherwise buy the same three pages again.
+        if hasConversationCache,
+           conversationsFetchedAt == refreshCount || refreshCount % Self.conversationCacheRefreshes != 0 {
             return conversations
         }
         if let conversationsTask { return try await conversationsTask.value }
@@ -333,6 +417,7 @@ actor SlackMessageSource: SlackScanStateSource {
             guard !found.isEmpty else { return conversations }
             conversations = found.sorted { ($0.priority, $0.id) < ($1.priority, $1.id) }
             hasConversationCache = true
+            conversationsFetchedAt = refreshCount
             log.info("conversations cached count=\(self.conversations.count, privacy: .public)")
             return conversations
         }
@@ -344,32 +429,101 @@ actor SlackMessageSource: SlackScanStateSource {
 
     func unrepliedMessages(since: Date) async throws -> [SlackMessage] {
         budget = totalBudget
+        searchBudget = Self.searchCallBudget
         synchronizeStoredAccount()
-        log.info("refresh start budget=\(self.budget, privacy: .public) cachedConversations=\(self.conversations.count, privacy: .public)")
+        log.info("refresh start budget=\(self.budget, privacy: .public) searchBudget=\(self.searchBudget, privacy: .public) cachedConversations=\(self.conversations.count, privacy: .public)")
         if scanState.connectedAt == nil { scanState.connectedAt = Date() }
         settled = Set(scanState.conversations.compactMap { $0.value.settled ? $0.key : nil })
         defer { refreshCount += 1 }
 
         let identity = try await ensureIdentity()
+
+        // SEARCH FIRST, because it is the path that actually has quota. See the section
+        // below: history is capped to nothing for an app of this class.
+        let discovered = await discoverBySearch(since: since, identity: identity)
+
+        // History SECOND and best-effort. It stays because a workspace with quota gets
+        // strictly better rows from it, thread participants and parent authors included,
+        // and because its cooldown bookkeeping is what stops the sweep hammering a capped
+        // method. What it may no longer do is decide the refresh: a 429 here used to empty
+        // the list and raise a banner even though search had already answered.
+        let history: Result<[SlackMessage], Error>
+        do {
+            history = .success(try await sweepHistory(since: since, identity: identity))
+        } catch {
+            history = .failure(error)
+        }
+
+        switch history {
+        case .success(let rows):
+            return Self.merged(search: discovered.messages, history: rows)
+        case .failure(let error):
+            // Only a search that never got an answer leaves nothing to report. A search
+            // that answered, even with zero matches, is a real reading of the one thing
+            // this app looks for, so the refresh succeeded.
+            guard discovered.ok else { throw error }
+            let label = (error as? SlackSourceError)?.caseLabel ?? String(describing: type(of: error))
+            log.info("refresh done via=search messages=\(discovered.messages.count, privacy: .public) historyError=\(label, privacy: .public)")
+            return Self.merged(search: discovered.messages, history: [])
+        }
+    }
+
+    /// History wins a duplicate: it is the only path that knows a message's real thread
+    /// position, its parent author and its participants. A search match's thread position is
+    /// at best read off a permalink.
+    static func merged(search: [SlackMessage], history: [SlackMessage]) -> [SlackMessage] {
+        var byID: [String: SlackMessage] = [:]
+        for message in search + history { byID[message.id] = message }
+        // Ties broken by id so the order is the same on every run: Swift's sort is not
+        // stable, and two messages in the same second are ordinary in a busy channel.
+        return byID.values.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
+    }
+
+    private func sweepHistory(since: Date, identity: Identity) async throws -> [SlackMessage] {
         let all = try await ensureConversations()
 
         var results: [(conversationID: String, result: Result<ScanResult, Error>)] = []
         var index = 0
         var skipped = 0
+        var cooledSkipped = 0
+        // Priority order, rotated to where the last rate-limited refresh stopped.
+        let order = sweepStart > 0 && sweepStart < all.count
+            ? Array(all[sweepStart...] + all[..<sweepStart])
+            : all
+
+        // How many children may be in flight is decided ONCE, here, before any child
+        // exists. It used to be recomputed on every pass of the loop below by asking the
+        // cooldown table whether history had ever been capped, and that table keeps its
+        // entry after the window it describes has lapsed, so the limit could fall from
+        // three to one while three children were already running. Collection was gated on
+        // the in-flight count being exactly equal to the limit, so an in-flight count
+        // sitting above it made the branch unreachable for the rest of the sweep: nothing
+        // was ever collected again and the loop went on launching children with nobody
+        // counting them. A limit fixed for the whole sweep cannot oscillate, and the
+        // greater-or-equal test below cannot be stepped over even if one ever did.
+        let concurrency = cooldowns["conversations.history"] == nil ? Self.maxInFlight : 1
 
         // Three conversations in flight, refilled as each one lands, so the budget is
         // spent in priority order rather than all at once. A child never throws: one
         // unreadable channel must not cost the other thirty-nine.
         await withTaskGroup(of: (String, Result<ScanResult, Error>).self) { group in
             var inFlight = 0
-            while index < all.count {
+            while index < order.count {
+                // A 429 on history closes the method for the rest of this refresh. Every
+                // further conversation would be rejected at the same rate, so launching
+                // them spends requests on certain failures and renews the limit for the
+                // next refresh, which is how one bad minute became a permanent one.
+                if cooldown("conversations.history") != nil {
+                    cooledSkipped = order.count - index
+                    break
+                }
                 // Reserve the history call before launching the child. Reserving inside
                 // scan made the three children race for the last call, defeating priority.
                 guard spend(reserve: nameReserve) else {
-                    skipped = all.count - index
+                    skipped = order.count - index
                     break
                 }
-                let conversation = all[index]
+                let conversation = order[index]
                 index += 1
                 group.addTask {
                     do {
@@ -380,7 +534,17 @@ actor SlackMessageSource: SlackScanStateSource {
                     }
                 }
                 inFlight += 1
-                if inFlight == Self.maxInFlight, let result = await group.next() {
+                // The first conversation goes alone, and every conversation goes alone on
+                // a workspace that had already shown a 429 for history when this refresh
+                // began. Three children start before the parent suspends, so concurrent
+                // calls on a capped method are all rejected before the first rejection can
+                // be recorded, and each rejection pushes the cooldown further out, which is
+                // what would deny the NEXT refresh its one successful call. Serial is also
+                // no slower there: a cap of one call a minute admits one either way. The
+                // loop drains rather than collecting at most one result, so the in-flight
+                // count is brought back under the limit however far over it has gone.
+                let limit = results.isEmpty ? 1 : concurrency
+                while inFlight >= limit, let result = await group.next() {
                     inFlight -= 1
                     results.append(result)
                 }
@@ -390,12 +554,19 @@ actor SlackMessageSource: SlackScanStateSource {
             for await result in group { results.append(result) }
         }
 
+        // Rotated only when the rate limit was what stopped the sweep. The budget path
+        // keeps starting at the top, because starting at the top is exactly what puts the
+        // IMs and MPIMs inside the budget on a workspace too big to read in one refresh.
+        if cooledSkipped > 0, !order.isEmpty { sweepStart = (sweepStart + index) % order.count }
+
         var pending: [Pending] = []
         var firstError: Error?
         var reportableFailures = 0
+        var scanned = 0
         for (conversationID, result) in results {
             switch result {
             case .success(let batch):
+                scanned += 1
                 pending += batch.pending
                 for (key, checkpoint) in batch.checkpoints {
                     scanState.conversations[key] = checkpoint
@@ -414,21 +585,51 @@ actor SlackMessageSource: SlackScanStateSource {
                     log.info("conversation dropped id=\(conversationID, privacy: .public) error=\(slug, privacy: .public)")
                     continue
                 }
+                // Nothing logged this path before, so a reportable failure was invisible:
+                // only the eventual "refresh failed" banner showed, never which conversation
+                // or why. Slug when Slack named one, otherwise the error's own type, since a
+                // raw description could be carrying message text up from deeper in the stack.
+                if case .slack(let slug)? = error as? SlackSourceError {
+                    log.info("conversation failed id=\(conversationID, privacy: .public) error=\(slug, privacy: .public)")
+                } else {
+                    // caseLabel over the bare type name: the type is always "SlackSourceError"
+                    // regardless of which of its eight cases fired, which was the whole gap.
+                    let label = (error as? SlackSourceError)?.caseLabel ?? String(describing: type(of: error))
+                    log.info("conversation failed id=\(conversationID, privacy: .public) error=\(label, privacy: .public)")
+                }
                 firstError = firstError ?? error
                 reportableFailures += 1
             }
         }
 
-        // An empty list has to mean inbox zero. If nothing came back and something went
-        // wrong, the banner gets the error instead.
-        if pending.isEmpty, let firstError { throw firstError }
-        log.info("""
-            refresh done conversations=\(all.count, privacy: .public) \
-            messages=\(pending.count, privacy: .public) \
-            skippedForBudget=\(skipped, privacy: .public) \
-            failedConversations=\(reportableFailures, privacy: .public) \
-            callsLeft=\(self.budget, privacy: .public)
-            """)
+        // Every conversation held back by the cooldown means this refresh read nothing,
+        // and an empty list would be shown as inbox zero, which is the one lie the user
+        // would act on. So a fully blocked sweep is an error even though it made no request.
+        if scanned == 0, firstError == nil, cooledSkipped > 0 {
+            firstError = SlackSourceError.rateLimited(
+                retryAfter: cooldown("conversations.history")
+            )
+        }
+
+        // Built once so the throwing path and the success path report the same counters in
+        // the same shape, which is what makes them comparable when grepped side by side.
+        let counters = "conversations=\(all.count) messages=\(pending.count) " +
+            "skippedForBudget=\(skipped) scanned=\(scanned) skippedForRateLimit=\(cooledSkipped) " +
+            "failedConversations=\(reportableFailures) callsLeft=\(self.budget)"
+
+        // An empty list has to mean inbox zero, so a refresh that read nothing at all and
+        // failed reports the error. A refresh that read even one conversation succeeded in
+        // part: its rows and its checkpoints are kept, because throwing them away is how a
+        // single rate-limited conversation used to leave the user with nothing at all.
+        if scanned == 0, let firstError {
+            // This is the case that used to vanish: a refresh that attempted three
+            // conversations.history calls and threw before a single counter reached the log.
+            // The error is shown to the user already, so it is not new content, but it can
+            // still carry a network library's own wording, so it stays private here anyway.
+            log.error("refresh aborted \(counters, privacy: .public) error=\(firstError.localizedDescription, privacy: .private)")
+            throw firstError
+        }
+        log.info("refresh done \(counters, privacy: .public)")
 
         let names = await resolveNames(Set(pending.map(\.raw.user)))
         return pending
@@ -447,6 +648,257 @@ actor SlackMessageSource: SlackScanStateSource {
 
     static func conversationKey(ofItem id: String) -> String {
         id.split(separator: "#").first.map(String.init) ?? id
+    }
+
+    // MARK: Search discovery
+
+    /// SEARCH IS THE DISCOVERY PATH. Slack grants an app of this class effectively zero
+    /// `conversations.history` calls: on the workspace this was written for a freshly
+    /// launched process is answered `429 retryAfter=60` on its first history request and
+    /// every refresh ended `scanned=0`. `search.messages` is Tier 2, twenty or more calls a
+    /// minute, and is explicitly not covered by that restriction, so candidates now come
+    /// from four searches: the `<@USERID>` mention query, `to:<self>`, `is:thread with:<self>`
+    /// for the messages, and `from:<self>` for reply detection.
+    ///
+    /// Two things this API cannot answer at compile time are answered at RUNTIME and logged,
+    /// because guessing either one wrong is silent:
+    ///   - the self-reference spelling. Production clients disagree: one documents `from:me`
+    ///     and says `from:@me` returns nothing, others use `from:@me`. So `me` is tried, a
+    ///     query that comes back empty is retried once with `@me`, and whichever produced
+    ///     matches is kept for the rest of the process.
+    ///   - the thread position. A match carries no `thread_ts`, only maybe a permalink that
+    ///     embeds one. It is read from there when present, and a match without one is
+    ///     treated as a plain channel message. A real message is NEVER dropped for want of
+    ///     a thread position; the counts of both outcomes are logged so real traffic settles
+    ///     how often the permalink carries it.
+    ///
+    /// Logging obeys the privacy rule at the top of this file: query KIND labels (never the
+    /// query strings, one of which embeds the user id), integer counts, booleans, and Slack's
+    /// own error slugs and scope names. Nothing from a match is logged, not even its channel.
+    ///
+    /// A per-refresh allowance of its own, deliberately not `budget`: one shared pool is how
+    /// discovery would starve the sweep, or be starved by it.
+    static let searchCallBudget = 8
+    /// Full from birth, so a direct call to `discoverBySearch` in a demo has an allowance
+    /// too; `unrepliedMessages` refills it at the start of every refresh.
+    private var searchBudget = SlackMessageSource.searchCallBudget
+    /// Which self-reference spelling this workspace actually accepts, learned from traffic.
+    private var selfToken = SlackSearch.selfReference
+    private var selfTokenConfirmed = false
+
+    struct SearchDiscovery: Sendable {
+        var messages: [SlackMessage] = []
+        /// Conversation keys where the user's own message is the newest thing search saw.
+        var settled: Set<String> = []
+        /// Conversation keys with an inbound candidate newer than anything the user sent.
+        var unsettled: Set<String> = []
+        /// At least one CANDIDATE query got an answer. `from:<self>` alone does not count:
+        /// it discovers nothing, so it cannot be the basis for reporting inbox zero.
+        var ok = false
+        /// Exactly the lines logged, so a demo can assert what was parsed without a Logger.
+        var lines: [String] = []
+    }
+
+    /// One search: one budgeted request, one log line, no throw. `answered` distinguishes
+    /// "Slack said zero" from "Slack said no", which is the difference between a spelling
+    /// worth retrying and a scope that will refuse the retry too.
+    private struct SearchStep {
+        var matches: [SearchMatch]?
+        var lines: [String] = []
+        var answered = false
+    }
+
+    private func runSearch(_ search: SlackSearch, kind: String, query: String) async -> SearchStep {
+        guard searchBudget > 0 else {
+            return SearchStep(matches: nil, lines: ["kind=\(kind) skipped=allowance"])
+        }
+        searchBudget -= 1
+        do {
+            let result = try await search.search(query: query)
+            let total = result.pagination?.total ?? result.matches.count
+            return SearchStep(
+                matches: result.matches,
+                lines: ["kind=\(kind) ok=true total=\(total) matches=\(result.matches.count)"],
+                answered: true
+            )
+        } catch {
+            // caseLabel folds in only Slack's own vocabulary: an error slug, a scope name,
+            // a retry delay. A raw description could be carrying content up from below.
+            let label = (error as? SlackSourceError)?.caseLabel ?? String(describing: type(of: error))
+            return SearchStep(matches: nil, lines: ["kind=\(kind) ok=false error=\(label)"])
+        }
+    }
+
+    /// The runtime answer to the spelling question. Zero matches is not proof that a
+    /// spelling is wrong, but it is the only signal this API offers, and one extra request
+    /// on a Tier 2 method is far cheaper than being wrong for the whole process. A query
+    /// Slack REFUSED is not retried: a missing scope refuses both spellings equally.
+    private func selfSearch(
+        _ search: SlackSearch,
+        kind: String,
+        build: (String) -> String
+    ) async -> SearchStep {
+        var step = await runSearch(search, kind: kind, query: build(selfToken))
+        if selfTokenConfirmed { return step }
+        if let matches = step.matches, !matches.isEmpty {
+            selfTokenConfirmed = true
+            step.lines.append("selfReference=\(selfToken) confirmed=true")
+            return step
+        }
+        guard step.answered else { return step }
+        let alternate = selfToken == "me" ? "@me" : "me"
+        let retry = await runSearch(search, kind: "\(kind)-alt", query: build(alternate))
+        step.lines += retry.lines
+        step.answered = step.answered || retry.answered
+        guard let matches = retry.matches, !matches.isEmpty else { return step }
+        selfToken = alternate
+        selfTokenConfirmed = true
+        step.matches = matches
+        step.lines.append("selfReference=\(alternate) confirmed=true")
+        return step
+    }
+
+    /// Never throws. A search failure degrades discovery to whatever the history sweep can
+    /// still do, which is the same shape of partial result the budget already produces.
+    func discoverBySearch(since: Date, identity: Identity) async -> SearchDiscovery {
+        // The conversation list is Tier 3 and cached for ten refreshes, and it is what gives
+        // a match its channel kind, which .im and .mpim addressing depend on. Not fatal:
+        // `conversation(for:)` infers what it can when the list is unavailable.
+        _ = try? await ensureConversations()
+
+        let search = SlackSearch(call: call)
+        var out = SearchDiscovery()
+        var threadTSPresent = 0
+        var threadTSAbsent = 0
+
+        func emit(_ lines: [String]) {
+            out.lines += lines
+            for line in lines { log.info("search probe \(line, privacy: .public)") }
+        }
+
+        // The connection floor still holds: nothing predating connection may surface, and
+        // nothing already accounted for by an earlier refresh may be offered again.
+        let floor = scanState.connectedAt ?? Date()
+        let cutoff = max(since, floor)
+        // `after:` takes a calendar DAY and excludes it, so the coarse filter is the day
+        // before the cutoff and `SlackSearch.matches` applies the real cutoff in Swift.
+        let candidateDay = cutoff.addingTimeInterval(-86_400)
+        // Reply detection has to answer for every todo still open, not only for what this
+        // refresh discovered, so it looks back over the window history backfills.
+        let replyDay = Date().addingTimeInterval(-Self.historyWindow - 86_400)
+
+        var found: [SearchMatch] = []
+        let mention = await runSearch(search, kind: "mention",
+                                      query: SlackSearch.mentionQuery(userID: identity.userID, after: candidateDay))
+        emit(mention.lines)
+        found += mention.matches ?? []
+
+        let to = await selfSearch(search, kind: "to:self") {
+            SlackSearch.toQuery(after: candidateDay, selfAs: $0)
+        }
+        emit(to.lines)
+        found += to.matches ?? []
+
+        // `with:<self>` is what makes the user a participant of these threads, which is the
+        // one thread fact search can state rather than infer.
+        let threads = await selfSearch(search, kind: "thread") {
+            SlackSearch.threadQuery(after: candidateDay, selfAs: $0)
+        }
+        emit(threads.lines)
+        let inThread = Set((threads.matches ?? []).map(\.ts))
+        found += threads.matches ?? []
+
+        // Reply detection. It discovers nothing, so its success alone must never be the
+        // basis for reporting inbox zero, which is why `ok` ignores it.
+        let own = await selfSearch(search, kind: "from:self") {
+            SlackSearch.ownMessagesQuery(after: replyDay, selfAs: $0)
+        }
+        emit(own.lines)
+        out.ok = mention.answered || to.answered || threads.answered
+
+        /// A match's conversation key, the same one the history path checkpoints under: the
+        /// thread timestamp when there is one, otherwise the channel.
+        func key(_ match: SearchMatch) -> String? {
+            guard let channel = match.channel else { return nil }
+            return match.permalink.flatMap(SlackSearch.threadTS(fromPermalink:)) ?? channel.id
+        }
+
+        var ownNewest: [String: String] = [:]
+        for match in own.matches ?? [] {
+            guard let key = key(match) else { continue }
+            ownNewest[key] = max(ownNewest[key] ?? "", match.ts)
+        }
+
+        var seen: Set<String> = []
+        var inboundNewest: [String: String] = [:]
+        var pending: [Pending] = []
+        var answered = 0
+        for match in SlackSearch.matches(found, after: cutoff).sorted(by: { $0.ts < $1.ts }) {
+            guard let channel = match.channel,
+                  let user = match.user, !user.isEmpty, user != identity.userID
+            else { continue }
+            // The same message is returned by more than one query, by design: a DM that
+            // mentions you matches both. One obligation, one row.
+            guard seen.insert("\(channel.id)/\(match.ts)").inserted else { continue }
+            let threadTS = match.permalink.flatMap(SlackSearch.threadTS(fromPermalink:))
+            if threadTS == nil { threadTSAbsent += 1 } else { threadTSPresent += 1 }
+            let key = threadTS ?? channel.id
+            // The user has spoken in this conversation since: the obligation is discharged.
+            if let mine = ownNewest[key], mine > match.ts {
+                answered += 1
+                continue
+            }
+            let thread = threadTS.map {
+                ThreadContext(ts: $0,
+                              parentAuthorID: nil,
+                              participants: inThread.contains(match.ts) ? [identity.userID] : [])
+            }
+            pending.append(Pending(
+                raw: RawMessage(ts: match.ts, user: user, text: match.text, threadTS: threadTS),
+                conversation: conversation(for: channel),
+                thread: thread
+            ))
+            inboundNewest[key] = max(inboundNewest[key] ?? "", match.ts)
+        }
+
+        // Settlement still needs positive proof, exactly as the history path demands it:
+        // the user's own message must be the newest thing in the conversation, and an empty
+        // window proves nothing. Held in memory only, deliberately: writing it into
+        // scanState would mean inventing a watermark for a conversation search never read
+        // end to end, and the `from:<self>` window re-derives it on every refresh anyway.
+        for (key, mine) in ownNewest where (inboundNewest[key] ?? "") < mine {
+            out.settled.insert(key)
+            settled.insert(key)
+        }
+        for (key, inbound) in inboundNewest where (ownNewest[key] ?? "") < inbound {
+            out.unsettled.insert(key)
+            settled.remove(key)
+        }
+
+        // Names come out of the reserve, so a big search result cannot spend the sweep's
+        // requests on display names before the sweep has had its turn.
+        let names = await resolveNames(Set(pending.map(\.raw.user)),
+                                       reserve: max(0, budget - nameReserve))
+        out.messages = pending.map { $0.message(identity: identity, host: permalinkHost, names: names) }
+        emit(["candidates=\(out.messages.count) answered=\(answered) " +
+             "threadTSPresent=\(threadTSPresent) threadTSAbsent=\(threadTSAbsent) " +
+             "settled=\(out.settled.count) searchCallsLeft=\(searchBudget)"])
+        return out
+    }
+
+    /// A search match's channel block has no `is_im`, so a DM and a private channel cannot
+    /// be told apart from it. The cached conversation list is the authority; inference is the
+    /// fallback and errs toward a channel, which costs addressing SIGNAL rather than dropping
+    /// the message, and an unaddressed message still reaches the model to judge.
+    private func conversation(for channel: SearchMatchChannel) -> SlackConversation {
+        if let known = conversations.first(where: { $0.id == channel.id }) { return known }
+        let kind: ChannelKind = if channel.isMpim { .mpim }
+            else if channel.id.hasPrefix("D") { .im }
+            else if channel.isPrivate { .privateChannel }
+            else { .publicChannel }
+        return SlackConversation(id: channel.id,
+                                 kind: kind,
+                                 name: kind == .im || kind == .mpim ? nil : channel.name)
     }
 
     // MARK: Scanning one conversation
@@ -523,11 +975,18 @@ actor SlackMessageSource: SlackScanStateSource {
         // hand yet. Paging past that would just buy context nobody reads.
         if !raw.contains(where: { $0.user == identity.userID }),
            page["has_more"] as? Bool == true,
-           let cursor = Self.nextCursor(page),
-           spend(reserve: nameReserve) {
-            let second = try await get("conversations.history", base + [("cursor", cursor)])
-            raw += Self.parseMessages(second).filter(isNew)
-            historyComplete = second["has_more"] as? Bool != true
+           let cursor = Self.nextCursor(page) {
+            if cooldown("conversations.history") == nil, spend(reserve: nameReserve) {
+                let second = try await get("conversations.history", base + [("cursor", cursor)])
+                raw += Self.parseMessages(second).filter(isNew)
+                historyComplete = second["has_more"] as? Bool != true
+            } else {
+                // historyComplete already reads false here, from page["has_more"] above;
+                // this just makes that silent case visible. The history call itself still
+                // succeeded, only the second page was skipped, which is the distinction the
+                // next question after this one needs answered.
+                log.debug("conversation partial id=\(conversation.id, privacy: .public) reason=historyPageSkipped")
+            }
         }
 
         let ordered = Self.ordered(raw)
@@ -545,8 +1004,12 @@ actor SlackMessageSource: SlackScanStateSource {
         var checkpoints: [String: SlackConversationCheckpoint] = [:]
 
         for parent in ordered where Self.shouldFetchReplies(parent, userID: identity.userID) {
-            guard spend(reserve: nameReserve) else {
+            // A cooled method is treated exactly like an exhausted budget: the request is
+            // not made, the watermark does not advance, and the next refresh sees this
+            // thread again. Anything else would mark it read without having read it.
+            guard cooldown("conversations.replies") == nil, spend(reserve: nameReserve) else {
                 historyComplete = false
+                log.debug("conversation partial id=\(conversation.id, privacy: .public) reason=repliesSkipped")
                 break
             }
             let replies = Self.ordered(Self.parseMessages(
@@ -593,9 +1056,9 @@ actor SlackMessageSource: SlackScanStateSource {
 
     /// Display names are persisted with the scan state, so an app relaunch is not a cold
     /// users.info pass. Unknown authors stay sequential because they are normally few.
-    private func resolveNames(_ ids: Set<String>) async -> [String: String] {
+    private func resolveNames(_ ids: Set<String>, reserve: Int = 0) async -> [String: String] {
         for id in ids.sorted() where userNames[id] == nil {
-            guard spend() else { break }
+            guard spend(reserve: reserve) else { break }
             guard let info = try? await get("users.info", [("user", id)]),
                   let user = info["user"] as? [String: Any] else { continue }
             let display = ((user["profile"] as? [String: Any])?["display_name"] as? String) ?? ""
@@ -676,7 +1139,7 @@ actor SlackMessageSource: SlackScanStateSource {
         case "missing_scope":
             .missingScope(root["needed"] as? String ?? "an extra")
         case "ratelimited":
-            .rateLimited
+            .rateLimited(retryAfter: nil)
         case let other:
             .slack(other.isEmpty ? "unknown_error" : other)
         }
@@ -744,11 +1207,11 @@ actor SlackMessageSource: SlackScanStateSource {
                 lastRateLimitAttempt = attempt
                 if wait > maxRetryWait {
                     log.error("rate limit gave up method=\(method, privacy: .public) status=\(http.statusCode, privacy: .public) retryAfter=\(waitSeconds, privacy: .public)s attempt=\(attempt, privacy: .public) reason=waitExceedsMaxRetryWait")
-                    throw SlackSourceError.rateLimited
+                    throw SlackSourceError.rateLimited(retryAfter: TimeInterval(waitSeconds))
                 }
                 if attempt >= 2 {
                     log.error("rate limit gave up method=\(method, privacy: .public) status=\(http.statusCode, privacy: .public) retryAfter=\(waitSeconds, privacy: .public)s attempt=\(attempt, privacy: .public) reason=attemptsRanOut")
-                    throw SlackSourceError.rateLimited
+                    throw SlackSourceError.rateLimited(retryAfter: TimeInterval(waitSeconds))
                 }
                 log.info("rate limited method=\(method, privacy: .public) waiting=\(wait.components.seconds, privacy: .public)s")
                 try await Task.sleep(for: wait)
@@ -772,7 +1235,7 @@ actor SlackMessageSource: SlackScanStateSource {
         }
         let retryAfter = lastRetryAfterSeconds.map(String.init) ?? "none"
         log.error("rate limit gave up method=\(method, privacy: .public) status=\(lastRateLimitStatus, privacy: .public) retryAfter=\(retryAfter, privacy: .public) attempt=\(lastRateLimitAttempt, privacy: .public) reason=attemptsRanOut")
-        throw SlackSourceError.rateLimited
+        throw SlackSourceError.rateLimited(retryAfter: lastRetryAfterSeconds.map(TimeInterval.init))
     }
 
     private static func transportError(_ error: URLError) -> SlackSourceError {
@@ -897,19 +1360,19 @@ func demoSlackSource() async {
     assert(slackError(#"{"ok":false,"error":"token_revoked"}"#) == .reconnect)
     assert(slackError(#"{"ok":false,"error":"missing_scope","needed":"channels:history"}"#)
            == .missingScope("channels:history"))
-    assert(slackError(#"{"ok":false,"error":"ratelimited"}"#) == .rateLimited)
+    assert(slackError(#"{"ok":false,"error":"ratelimited"}"#) == .rateLimited(retryAfter: nil))
     assert(slackError(#"{"ok":false,"error":"channel_not_found"}"#) == .slack("channel_not_found"))
     assert(SlackSourceError.slack("channel_not_found").nonReportableConversationSlug != nil)
     assert(SlackSourceError.slack("is_archived").nonReportableConversationSlug != nil)
     assert(SlackSourceError.slack("not_in_channel").nonReportableConversationSlug != nil)
     assert(SlackSourceError.slack("internal_error").nonReportableConversationSlug == nil)
     assert(SlackSourceError.reconnect.isFatal && SlackSourceError.missingScope("x").isFatal)
-    assert(!SlackSourceError.rateLimited.isFatal)
+    assert(!SlackSourceError.rateLimited(retryAfter: 60).isFatal)
     assert(SlackSourceError.reconnect.localizedDescription.contains("Reconnect"))
 
     // MARK: the whole pipeline, over canned JSON
     let now = Date()
-    func ts(_ minutesAgo: Double) -> String { S.slackTS(now.addingTimeInterval(-minutesAgo * 60)) }
+    @Sendable func ts(_ minutesAgo: Double) -> String { S.slackTS(now.addingTimeInterval(-minutesAgo * 60)) }
     let dmHistory = """
     {"ok":true,"messages":[
       {"ts":"\(ts(2))","user":"U_PAUL","text":"review it within the hour"},
@@ -956,8 +1419,18 @@ func demoSlackSource() async {
             methods.append(method)
             calls.append((method, query))
         }
-        var count: Int { methods.count }
+        /// Budget spend, which is why search.messages is excluded: the diagnostic probe
+        /// spends its own separate allowance, so counting its calls here would make the
+        /// budget asserts below fail on requests the budget never paid for.
+        var count: Int { methods.filter { $0 != "search.messages" }.count }
         func count(of method: String) -> Int { methods.filter { $0 == method }.count }
+        /// The query string each call carried, so the self-reference spelling actually sent
+        /// can be asserted rather than inferred from behaviour.
+        func queries(of method: String) -> [String] {
+            calls.compactMap { name, query in
+                name == method ? query.first(where: { $0.0 == "query" })?.1 : nil
+            }
+        }
         func oldest(channel: String) -> [String] {
             calls.compactMap { method, query in
                 guard method == "conversations.history",
@@ -1165,6 +1638,211 @@ func demoSlackSource() async {
     assert(tightState.conversations["C_ENG"] == nil,
            "a conversation skipped for budget must keep its old watermark")
 
+    // MARK: a capped method costs one rejected call per refresh, not one per conversation
+    // Slack answers conversations.history about once a minute for an app of this class.
+    // The bug this pins: the sweep launched a request per conversation, roughly thirty of
+    // them rejected on the spot, which kept the limit renewed so the first call of the
+    // next refresh was rejected too, forever.
+    func rateLimitedSource(
+        readable: String?, history: String, retryAfter: TimeInterval = 60, log: CallLog
+    ) -> SlackMessageSource {
+        SlackMessageSource(call: { method, query in
+            await log.record(method, query)
+            let channel = query.first { $0.0 == "channel" }?.1 ?? ""
+            // The seam's contract is that Retry-After has already been honoured, which is
+            // what httpCall does before giving up on a wait it cannot afford.
+            if method == "conversations.history", channel != readable {
+                throw SlackSourceError.rateLimited(retryAfter: retryAfter)
+            }
+            let body: String
+            switch method {
+            case "auth.test":
+                body = #"{"ok":true,"user_id":"U_ME","url":"https://acme.slack.com/"}"#
+            case "users.info":
+                let id = query.first { $0.0 == "user" }?.1 ?? "U"
+                body = #"{"ok":true,"user":{"real_name":"Name \#(id)","profile":{"display_name":"n\#(id)"}}}"#
+            case "usergroups.list":
+                body = #"{"ok":true,"usergroups":[]}"#
+            case "users.conversations":
+                body = conversationList
+            case "conversations.history":
+                body = history
+            default:
+                body = #"{"ok":false,"error":"unknown_method"}"#
+            }
+            return Data(body.utf8)
+        })
+    }
+
+    let cappedLog = CallLog()
+    let capped = rateLimitedSource(readable: nil, history: dmHistory, log: cappedLog)
+    await capped.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    do {
+        let rows = try await capped.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+        assert(false, "a refresh that read nothing returned \(rows.count) rows instead of an error")
+    } catch let error as SlackSourceError {
+        assert(error == .rateLimited(retryAfter: 60), "got \(error)")
+    } catch {
+        assert(false, "wrong error type")
+    }
+    let cappedHistory = await cappedLog.count(of: "conversations.history")
+    assert(cappedHistory == 1, "nine conversations must cost one rejected call, got \(cappedHistory)")
+
+    // The cooldown outlives the refresh, so the next one makes no request at all, and it
+    // still must not report inbox zero. Identity survives the round trip through Store's
+    // rollback: clearing it there is what made every failed refresh re-buy auth.test.
+    await capped.restoreSlackScanState(await capped.currentSlackScanState())
+    do {
+        _ = try await capped.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+        assert(false, "a fully blocked refresh must not be reported as inbox zero")
+    } catch let error as SlackSourceError {
+        guard case .rateLimited = error else {
+            assert(false, "got \(error)")
+            fatalError()
+        }
+    } catch {
+        assert(false, "wrong error type")
+    }
+    let cappedHistoryAgain = await cappedLog.count(of: "conversations.history")
+    let cappedAuthCalls = await cappedLog.count(of: "auth.test")
+    assert(cappedHistoryAgain == 1, "a cooled method must not be called at all, got \(cappedHistoryAgain)")
+    assert(cappedAuthCalls == 1, "a failed refresh must keep the cached identity, spent \(cappedAuthCalls)")
+
+    // MARK: one readable conversation makes the refresh a partial success, not a failure
+    let survivorLog = CallLog()
+    let survivor = rateLimitedSource(readable: "D_PAUL", history: dmHistory, log: survivorLog)
+    await survivor.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    let survived = try! await survivor.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    assert(Set(survived.map(\.text)) == ["Hi", "review it within the hour"],
+           "the one readable conversation must come back, got \(survived.count) rows")
+    // Four history calls, not thirty: the probe plus one batch of concurrent children,
+    // after which the recorded cooldown stops the sweep. A workspace already known to be
+    // capped serialises from the start and pays just one rejection.
+    let survivorHistory = await survivorLog.count(of: "conversations.history")
+    assert(survivorHistory <= 4, "the sweep must stop on the first 429, spent \(survivorHistory)")
+    let survivorState = await survivor.currentSlackScanState()
+    assert(survivorState.conversations["D_PAUL"]?.newestTS == ts(2),
+           "a partial refresh must keep the checkpoint it earned")
+    assert(survivorState.conversations["C_ENG"] == nil,
+           "a conversation the rate limit blocked must keep its old watermark")
+
+    // Owing nothing is not the same as reading nothing. A conversation the user has
+    // already answered was still read, so the refresh succeeded: reporting an error here
+    // would say nothing arrived when the truth is that nothing is owed, and it would throw
+    // away the settlement proof that read just earned.
+    let quietLog = CallLog()
+    let quiet = rateLimitedSource(readable: "D_PAUL", history: settledChannel, log: quietLog)
+    await quiet.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    do {
+        let rows = try await quiet.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+        assert(rows.isEmpty, "the user answered last there, got \(rows.count) rows")
+    } catch {
+        assert(false, "a refresh that read one conversation must not fail: \(error)")
+    }
+    let quietState = await quiet.currentSlackScanState()
+    assert(quietState.conversations["D_PAUL"]?.settled == true,
+           "a partial refresh must keep the proof it earned")
+
+    // MARK: the next refresh resumes past the conversation the limit blocked
+    // One history call a minute means a refresh reads about one conversation, so starting
+    // at the top every time would re-read the first one forever and never reach the rest.
+    // The canned Retry-After is a fraction of a second so the cooldown can lapse between
+    // these two refreshes without the check waiting out a real minute.
+    let rotationLog = CallLog()
+    let rotating = rateLimitedSource(
+        readable: "C_ENG", history: dmHistory, retryAfter: 0.4, log: rotationLog
+    )
+    await rotating.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    do {
+        let rows = try await rotating.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+        assert(false, "the DM was rate limited, so this refresh read nothing: \(rows.count) rows")
+    } catch let error as SlackSourceError {
+        guard case .rateLimited = error else {
+            assert(false, "got \(error)")
+            fatalError()
+        }
+    } catch {
+        assert(false, "wrong error type")
+    }
+    try! await Task.sleep(for: .milliseconds(500))
+    let resumed = try! await rotating.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    assert(Set(resumed.map(\.conversationID)) == ["C_ENG"],
+           "the sweep must resume past the blocked conversation, got \(Set(resumed.map(\.conversationID)))")
+
+    // MARK: every child the sweep launches is collected, and the limit is never exceeded
+    // This pins the crash. The collection condition used to be an equality test against a
+    // limit recomputed on every pass, and the cooldown table keeps its entry after the
+    // window it describes has lapsed, so the limit fell to one while three children were
+    // already running and the in-flight count could never equal it again. Collection
+    // stopped dead while the loop went on launching, which is how a refresh ended up with
+    // an unbounded number of children offering results into a group nobody was reading.
+    // The peak is the assert that catches it: a sweep that honours its limit never holds
+    // more than three history calls open at once, and the broken code held eighteen.
+    actor SweepTracker {
+        private var live = 0
+        var peak = 0
+        var historyCalls = 0
+        var rejections = 0
+        /// The fourth call is the one Slack caps, chosen so a success is already banked
+        /// before the 429 lands and so fifteen conversations are still unswept after it.
+        func enterHistory() -> Bool {
+            historyCalls += 1
+            live += 1
+            peak = max(peak, live)
+            let reject = historyCalls == 4
+            if reject { rejections += 1 }
+            return reject
+        }
+        func leaveHistory() { live -= 1 }
+    }
+    let tracker = SweepTracker()
+    let wideTS = ts(2)
+    let wideList = #"{"ok":true,"channels":[{"id":"D_ONE","is_im":true,"user":"U_OTHER"},"#
+        + (1...20).map { #"{"id":"C_W\#($0)","name":"w\#($0)"}"# }.joined(separator: ",")
+        + "]}"
+    let wide = SlackMessageSource(call: { method, query in
+        let body: String
+        switch method {
+        case "auth.test":
+            body = #"{"ok":true,"user_id":"U_ME","url":"https://acme.slack.com/"}"#
+        case "usergroups.list":
+            body = #"{"ok":true,"usergroups":[]}"#
+        case "users.conversations":
+            body = wideList
+        case "users.info":
+            body = #"{"ok":true,"user":{"real_name":"Other","profile":{"display_name":"other"}}}"#
+        case "conversations.history":
+            let channel = query.first { $0.0 == "channel" }?.1 ?? ""
+            let reject = await tracker.enterHistory()
+            // A real request stays open for a while, which is what lets the parent come
+            // back round the loop while children are still in flight. Without the wait
+            // the sweep would be serial by accident and prove nothing.
+            try? await Task.sleep(for: .milliseconds(15))
+            await tracker.leaveHistory()
+            // Retry-After zero is already in the past by the time the loop next reads the
+            // table, so the cooldown is recorded but lapsed. That is the exact state that
+            // used to tighten the limit under children that had already been launched,
+            // and it is why the sweep continues here instead of breaking.
+            if reject { throw SlackSourceError.rateLimited(retryAfter: 0) }
+            body = #"{"ok":true,"messages":[{"ts":"\#(wideTS)","user":"U_OTHER","text":"\#(channel)"}]}"#
+        default:
+            body = #"{"ok":false,"error":"unknown_method"}"#
+        }
+        return Data(body.utf8)
+    }, budget: 60)
+    await wide.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    let wideRows = try! await wide.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    let widePeak = await tracker.peak
+    let wideHistory = await tracker.historyCalls
+    let wideRejections = await tracker.rejections
+    // Three is maxInFlight, spelled out because it is private to the actor.
+    assert(widePeak <= 3, "the sweep held \(widePeak) history calls open at once, limit is 3")
+    assert(wideHistory == 21, "the sweep must reach every conversation once, got \(wideHistory)")
+    assert(wideRows.count == wideHistory - wideRejections,
+           "\(wideHistory - wideRejections) children succeeded but \(wideRows.count) results came back")
+    assert(wideRows.contains { $0.conversationID == "D_ONE" },
+           "the success banked before the 429 was lost")
+
     // MARK: an unreadable conversation is skipped and evicted, not reported as refresh failure
     let goneLog = CallLog()
     let gone = SlackMessageSource(call: { method, query in
@@ -1204,6 +1882,143 @@ func demoSlackSource() async {
     let goneListCalls = await goneLog.count(of: "users.conversations")
     assert(goneHistoryCalls == 1, "the evicted conversation was scanned \(goneHistoryCalls) times")
     assert(goneListCalls == 1, "an empty loaded cache must not be mistaken for no cache")
+
+    // MARK: search discovery carries a refresh on its own, with history unavailable
+    @Sendable func searchMatch(channel: String, ts: String, user: String, text: String, threadTS: String? = nil) -> String {
+        let permalink = "https://acme.slack.com/archives/\(channel)/p\(ts.replacingOccurrences(of: ".", with: ""))"
+            + (threadTS.map { "?thread_ts=\($0)&cid=\(channel)" } ?? "")
+        return #"{"ts":"\#(ts)","user":"\#(user)","text":"\#(text)","channel":{"id":"\#(channel)"},"permalink":"\#(permalink)"}"#
+    }
+    @Sendable func searchBody(_ matches: String...) -> Data {
+        Data("""
+        {"ok":true,"messages":{"pagination":{"total":\(matches.count),"page":1,"page_count":1,"per_page":100},
+         "matches":[\(matches.joined(separator: ","))]}}
+        """.utf8)
+    }
+    /// Everything except search.messages, which each source below answers for itself. This
+    /// is the workspace Sereno actually runs on: conversations.history is answered 429 on
+    /// the first request of a freshly launched process, so nothing comes from history.
+    @Sendable func searchOnlyCall(
+        _ method: String,
+        _ log: CallLog
+    ) async throws -> Data? {
+        await log.record(method)
+        switch method {
+        case "auth.test": return Data(#"{"ok":true,"user_id":"U_ME","url":"https://acme.slack.com/"}"#.utf8)
+        case "users.info": return Data(#"{"ok":true,"user":{"real_name":"Ana","profile":{"display_name":"ana"}}}"#.utf8)
+        case "usergroups.list": return Data(#"{"ok":true,"usergroups":[]}"#.utf8)
+        case "users.conversations":
+            return Data(#"{"ok":true,"channels":[{"id":"D_PAUL","is_im":true},{"id":"C_ENG","name":"eng"},{"id":"C_SETTLED","name":"design"}]}"#.utf8)
+        case "conversations.history": throw SlackSourceError.rateLimited(retryAfter: 60)
+        default: return nil
+        }
+    }
+
+    let engThreadTS = ts(30)
+    @Sendable func searchOnlySource(_ searchLog: CallLog) -> SlackMessageSource {
+            SlackMessageSource(call: { method, query in
+            if let canned = try await searchOnlyCall(method, searchLog) { return canned }
+            await searchLog.record(method, query)
+            let q = query.first { $0.0 == "query" }?.1 ?? ""
+            // A DM that also mentions the user matches two of the queries, which is what the
+            // deduplication below has to survive.
+            if q.hasPrefix("<@U_ME>") {
+                return searchBody(
+                    searchMatch(channel: "D_PAUL", ts: ts(5), user: "U_PAUL", text: "<@U_ME> can you review this"),
+                    searchMatch(channel: "C_SETTLED", ts: ts(15), user: "U_ANA", text: "<@U_ME> ping")
+                )
+            }
+            if q.hasPrefix("to:me") {
+                return searchBody(searchMatch(channel: "D_PAUL", ts: ts(5), user: "U_PAUL", text: "<@U_ME> can you review this"))
+            }
+            if q.hasPrefix("is:thread with:me") {
+                return searchBody(searchMatch(channel: "C_ENG", ts: ts(8), user: "U_DEV",
+                                              text: "any thoughts", threadTS: engThreadTS))
+            }
+            if q.hasPrefix("from:me") {
+                // Answered after the C_SETTLED mention above, which settles that conversation.
+                return searchBody(searchMatch(channel: "C_SETTLED", ts: ts(2), user: "U_ME", text: "done"))
+            }
+            return Data(#"{"ok":false,"error":"unexpected_query"}"#.utf8)
+        })
+    }
+
+    let searchLog = CallLog()
+    let searchOnly = searchOnlySource(searchLog)
+    await searchOnly.restoreSlackScanState(SlackScanState(connectedAt: now.addingTimeInterval(-60 * 60)))
+    let searchRows = try! await searchOnly.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    let searchHistoryCalls = await searchLog.count(of: "conversations.history")
+    assert(searchHistoryCalls >= 1, "history must still be attempted where quota might exist")
+    assert(searchRows.count == 2, "search alone must carry the refresh, got \(searchRows.count)")
+    assert(searchRows.map(\.conversationID) == ["D_PAUL", engThreadTS],
+           "newest first, and a threaded match is keyed by its thread: \(searchRows.map(\.conversationID))")
+    // A match whose permalink carried no thread_ts is a plain channel message, never dropped.
+    assert(searchRows[0].addressing.contains(.directMessage) && searchRows[0].addressing.contains(.mention),
+           "the DM kind came from the cached conversation list: \(searchRows[0].addressing)")
+    assert(searchRows[0].sender == "ana" || searchRows[0].sender == "U_PAUL",
+           "a name lookup may be skipped for budget but must not invent one")
+    // `with:<self>` is proof of participation, so the one thread fact search can state.
+    assert(searchRows[1].addressing.contains(.threadParticipant), "got \(searchRows[1].addressing)")
+    let searchSettled = try! await searchOnly.repliedIDs(among: ["C_SETTLED", "D_PAUL", engThreadTS])
+    assert(searchSettled == ["C_SETTLED"], "from:<self> is the reply detector now, got \(searchSettled)")
+    assert(!searchRows.contains { $0.conversationID == "C_SETTLED" },
+           "a conversation the user has since answered is not an obligation")
+
+    // MARK: what the search probe logged, which is the whole of what it is allowed to log
+    let probeSource = searchOnlySource(CallLog())
+    await probeSource.restoreSlackScanState(SlackScanState(connectedAt: now.addingTimeInterval(-60 * 60)))
+    let searchLines = await probeSource.discoverBySearch(
+        since: now.addingTimeInterval(-20 * 60),
+        identity: Identity(userID: "U_ME", displayName: "", realName: "", userGroupIDs: [])
+    ).lines
+    assert(searchLines == ["kind=mention ok=true total=2 matches=2",
+                           "kind=to:self ok=true total=1 matches=1",
+                           "selfReference=me confirmed=true",
+                           "kind=thread ok=true total=1 matches=1",
+                           "kind=from:self ok=true total=1 matches=1",
+                           "candidates=2 answered=1 threadTSPresent=1 threadTSAbsent=2 " +
+                           "settled=1 searchCallsLeft=4"],
+           "got \(searchLines)")
+    assert(!searchLines.contains { $0.contains("D_PAUL") || $0.contains("C_ENG") || $0.contains("review")
+                                   || $0.contains("acme.slack.com") || $0.contains("U_PAUL") },
+           "a probe line carried content: \(searchLines)")
+
+    // MARK: the self-reference spelling is settled at runtime, not guessed
+    let altLog = CallLog()
+    let alternate = SlackMessageSource(call: { method, query in
+        if let canned = try await searchOnlyCall(method, altLog) { return canned }
+        await altLog.record(method, query)
+        let q = query.first { $0.0 == "query" }?.1 ?? ""
+        // This workspace answers nothing for `me`, which is exactly the failure mode the
+        // two conflicting production clients disagree about.
+        if q.hasPrefix("to:@me") {
+            return searchBody(searchMatch(channel: "C_OPEN", ts: ts(4), user: "U_PAUL", text: "please review"))
+        }
+        return searchBody()
+    })
+    await alternate.restoreSlackScanState(SlackScanState(connectedAt: now.addingTimeInterval(-60 * 60)))
+    let altRows = try! await alternate.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    assert(altRows.count == 1, "the alternate spelling found the message, got \(altRows.count)")
+    assert(altRows[0].conversationID == "C_OPEN", "got \(altRows[0].conversationID)")
+    let altQueries = await altLog.queries(of: "search.messages")
+    assert(altQueries.count == 5, "one retry, not one per query: \(altQueries)")
+    assert(altQueries.contains { $0.hasPrefix("to:@me") } && altQueries.contains { $0.hasPrefix("to:me") },
+           "both spellings must have been tried: \(altQueries)")
+    assert(altQueries.contains { $0.hasPrefix("is:thread with:@me") },
+           "the winning spelling must be kept for the rest of the process: \(altQueries)")
+
+    // MARK: a missing scope is Slack's own vocabulary, so it is logged, and history decides
+    let scopeSource = SlackMessageSource(call: { method, _ in
+        method == "search.messages"
+            ? Data(#"{"ok":false,"error":"missing_scope","needed":"search:read"}"#.utf8)
+            : Data(#"{"ok":false,"error":"invalid_auth"}"#.utf8)
+    })
+    let scopeLines = await scopeSource.discoverBySearch(
+        since: now, identity: Identity(userID: "U_ME", displayName: "", realName: "", userGroupIDs: [])
+    ).lines
+    assert(scopeLines.filter { $0.hasSuffix("error=missingScope(search:read)") }.count == 4,
+           "each of the four queries reports the named scope, and a REFUSED query is not " +
+           "retried with the other spelling: \(scopeLines)")
 
     // MARK: the live source never substitutes sample rows for a missing token
     let disconnected = LiveMessageSource(tokenAvailable: { false })
