@@ -9,11 +9,13 @@ import Security
 //
 // Two rules this file is built around, and neither is a style preference:
 //
-// 1. No secret is ever printed, logged or written outside the Keychain. There is no
+// 1. No secret is ever printed, logged or interpolated. There is no
 //    `print`, no `Logger`, not even a `.private` one, on any path that can see a token,
 //    a code, or a code_verifier. `redacted(_:)` exists for the one case where a human
 //    needs to know a token is *there*, and it emits a prefix plus a length, never the
 //    middle. An OAuth code in a log file is a usable credential until it is redeemed.
+//    Where the token comes to rest is Credentials.swift's business, not this file's: a
+//    0600 file beside state.json, no longer the Keychain. That file says why.
 // 2. There is no client_secret. Under PKCE Slack explicitly does not want one, and a
 //    Mac binary cannot keep one anyway: `strings Sereno.app/Contents/MacOS/Sereno`
 //    would hand it to anybody. The client_id below is deliberately in the clear for
@@ -193,7 +195,6 @@ enum SlackAuthError: Error, Equatable {
     case timedOut
     case cancelled
     case noCode
-    case keychain(OSStatus)
 
     /// Plain language, shown inline in Settings. No jargon the user cannot act on.
     var message: String {
@@ -214,8 +215,6 @@ enum SlackAuthError: Error, Equatable {
             "Sign-in cancelled."
         case .noCode:
             "Slack's reply arrived without an authorization code."
-        case .keychain(let status):
-            "Could not use your Keychain (error \(status))."
         }
     }
 }
@@ -452,61 +451,6 @@ final class SlackLoopbackListener: @unchecked Sendable {
     }
 }
 
-// MARK: - Keychain
-
-/// `SecItem` generic password, service "com.rhystart.sereno". Not UserDefaults, not a file:
-/// those are world-readable to anything running as this user, and a `xoxp-` token reads
-/// every message the signed-in human can read.
-enum SlackKeychain {
-    static let service = "com.rhystart.sereno"
-    static let defaultAccount = "slack-user-token"
-
-    private static func query(_ account: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service,
-         kSecAttrAccount as String: account]
-    }
-
-    /// Add, or update when the item is already there. `SecItemAdd` returns
-    /// errSecDuplicateItem rather than replacing, so re-connecting would fail forever
-    /// without this fallback.
-    static func save(_ token: String, account: String = defaultAccount) throws {
-        let secret = Data(token.utf8)
-        var attributes = query(account)
-        attributes[kSecValueData as String] = secret
-        // Needed on a machine that has booted but not been unlocked since; the default
-        // (WhenUnlocked) would fail a background refresh on a locked screen.
-        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            let update = SecItemUpdate(query(account) as CFDictionary,
-                                       [kSecValueData as String: secret] as CFDictionary)
-            guard update == errSecSuccess else { throw SlackAuthError.keychain(update) }
-            return
-        }
-        guard status == errSecSuccess else { throw SlackAuthError.keychain(status) }
-    }
-
-    static func load(account: String = defaultAccount) -> String? {
-        var request = query(account)
-        request[kSecReturnData as String] = true
-        request[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(request as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    /// errSecItemNotFound is success: the point is that nothing is stored afterwards.
-    static func delete(account: String = defaultAccount) throws {
-        let status = SecItemDelete(query(account) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw SlackAuthError.keychain(status)
-        }
-    }
-}
-
 // MARK: - Controller
 
 enum SlackAuthState {
@@ -532,12 +476,14 @@ final class SlackAuth {
 
     private var attempt: Task<Void, Never>?
 
-    /// Whether a token is on this machine, not whether this session signed in.
-    var hasToken: Bool { SlackKeychain.load() != nil }
+    /// Whether a token is on this machine, not whether this session signed in. A file
+    /// read, not a Keychain read: this runs from `init`, and a Keychain read from an unsigned
+    /// binary can block on a permission dialog nobody can see. See Credentials.swift.
+    var hasToken: Bool { Credentials.load(.slackToken) != nil }
 
     init() {
-        // The id and workspace name are not secrets and are needed to render Settings
-        // before anything touches the Keychain; the token itself stays in the Keychain.
+        // The id and workspace name are not secrets and live in UserDefaults; the token
+        // itself stays in the credentials file, which is what `hasToken` reads.
         if hasToken, let userID = UserDefaults.standard.string(forKey: Self.userIDKey) {
             state = .connected(workspace: UserDefaults.standard.string(forKey: Self.workspaceKey),
                                userID: userID)
@@ -564,15 +510,16 @@ final class SlackAuth {
     }
 
     /// Deletes the stored token. Forgetting it in memory would leave a working credential
-    /// in the Keychain for the next launch to pick straight back up.
+    /// on disk for the next launch to pick straight back up.
     func disconnect() {
         do {
-            try SlackKeychain.delete()
+            try Credentials.delete(.slackToken)
             UserDefaults.standard.removeObject(forKey: Self.userIDKey)
             UserDefaults.standard.removeObject(forKey: Self.workspaceKey)
             state = .disconnected
         } catch {
-            state = .failed((error as? SlackAuthError ?? .keychain(errSecInternalError)).message)
+            state = .failed((error as? CredentialsError)?.message
+                            ?? "Could not update Sereno's credentials file.")
         }
     }
 
@@ -600,7 +547,7 @@ final class SlackAuth {
                 return try await group.next()!
             }
             let credential = try await SlackOAuth.exchange(code: code, verifier: verifier)
-            try SlackKeychain.save(credential.accessToken)
+            try Credentials.save(credential.accessToken, as: .slackToken)
             UserDefaults.standard.set(credential.userID, forKey: Self.userIDKey)
             UserDefaults.standard.set(credential.workspace, forKey: Self.workspaceKey)
             state = .connected(workspace: credential.workspace, userID: credential.userID)
@@ -608,6 +555,10 @@ final class SlackAuth {
             state = .disconnected
         } catch let error as SlackAuthError {
             state = error == .cancelled ? .disconnected : .failed(error.message)
+        } catch let error as CredentialsError {
+            // Slack said yes and the token could not be stored. Reporting "could not reach
+            // Slack" here would send the user off to debug entirely the wrong thing.
+            state = .failed(error.message)
         } catch {
             state = .failed(SlackAuthError.network(error.localizedDescription).message)
         }
@@ -616,8 +567,9 @@ final class SlackAuth {
 
 // MARK: - Runnable checks
 
-/// Plain asserts over the pure parts: no network, no browser, no real token, and the
-/// Keychain round-trip uses a throwaway account it deletes on the way out.
+/// Plain asserts over the pure parts: no network, no browser, no real token, and nothing
+/// that touches the Keychain. The credential round trip lives in `demoCredentials` now,
+/// against a throwaway file; this file no longer holds a credential store to exercise.
 ///
 /// Run from a scratch package that compiles this file with its own @main. Nothing in the
 /// app calls it, so the app ships one entry point.
@@ -678,19 +630,8 @@ func demoSlackAuth() {
     assert(SlackCallback.code(fromQuery: "code=attacker&state=guess", expectedState: "st")
            == .failure(.stateMismatch), "CSRF check bypassed")
 
-    // Keychain round-trip on a throwaway account, cleaned up below whatever happens.
-    let scratch = "demo-only-\(UUID().uuidString)"
-    assert(SlackKeychain.load(account: scratch) == nil, "throwaway account already had a value")
+    // A fake token, only ever a string to redact below.
     let fake = "xoxp-not-a-real-token-0123456789"
-    try! SlackKeychain.save(fake, account: scratch)
-    assert(SlackKeychain.load(account: scratch) == fake, "keychain load did not match save")
-    // The "already exists" path: save again must update, not fail.
-    try! SlackKeychain.save(fake + "-updated", account: scratch)
-    assert(SlackKeychain.load(account: scratch) == fake + "-updated", "second save did not update")
-    try! SlackKeychain.delete(account: scratch)
-    assert(SlackKeychain.load(account: scratch) == nil, "keychain delete left the item behind")
-    // Deleting nothing is not an error, so a Disconnect with no token cannot fail.
-    try! SlackKeychain.delete(account: scratch)
 
     // Redaction, the only string form a credential may take.
     let redacted = SlackOAuth.redacted(fake)

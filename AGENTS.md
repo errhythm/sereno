@@ -27,13 +27,26 @@ Sources/Sereno/
   Preferences.swift   UserDefaults-backed settings
   Weather.swift       Open-Meteo fetch + WMO mapping
   MockMessageSource.swift  fixtures, stands in for the Slack client
-  App.swift           all UI: menu bar popover, window, Settings, sky, notifications
-  SlackAuth.swift     PKCE OAuth + Keychain (in progress)
+  App.swift           all UI: the panel, window, Settings, sky, notifications
+  Tray.swift          the status item and the NSPanel it drops, both owned outright
+  SlackAuth.swift     PKCE OAuth
+  Credentials.swift   the two secrets, in one 0600 file; one-time migration off the Keychain
+  SlackMessageSource.swift  the live Slack client: search discovery, history sweep, budget
+  SlackSearch.swift   search.messages queries and parsing
+  RemoteModel.swift   opt-in OpenAI-compatible provider (OpenRouter or custom), off by default
+  DebugCapture.swift  opt-in local capture of triaged conversations, for replay
 icon/sereno.svg       the S is a falling star's trail; Sereno.icns is generated from it
 ```
 
 Identifier `com.rhystart.sereno`. State in `~/Library/Application Support/Sereno/state.json`.
-Settings in UserDefaults. Slack token in Keychain, service `com.rhystart.sereno`.
+Settings in UserDefaults. Slack token and remote model API key in
+`~/Library/Application Support/Sereno/credentials.json`, directory `0700`, file `0600`,
+unencrypted. **Not the Keychain**: `build.sh` signs ad-hoc, a Keychain ACL binds to code
+identity, so every rebuild was a fresh permission prompt. A Keychain read from an unsigned
+binary can also block forever on a dialog nobody can see, which is what hung a demo that
+merely constructed `MenuContent`. The owner was told a file is the weaker place and chose it
+anyway; do not re-propose the Keychain. The only `SecItem` calls left are
+`Credentials.Legacy.keychain`, reached once from `Credentials.migrate()` at launch.
 
 ## Verify
 
@@ -47,7 +60,8 @@ bash build.sh        # produces Sereno.app, ad-hoc signed, LSUIElement
 
 Demos are plain `assert` functions, no test framework: `demo`, `demoModels`, `demoMockSource`,
 `demoAutoComplete`, `demoAddressing`, `demoStoreMerge`, `demoPreferences`, `demoRefreshTimer`,
-`demoSky`, `demoWeather`, `demoNotifyBatch`, `demoAddressingFilter`, `demoSlackSource`. None of
+`demoSky`, `demoWeather`, `demoNotifyBatch`, `demoAddressingFilter`, `demoSlackSource`,
+`demoCredentials`. None of
 these are called by the app; each only runs when a throwaway package calls it explicitly. The
 repo has exactly one `@main` (App.swift), so run them from a throwaway SwiftPM package under
 `/private/tmp` that copies the sources and supplies its own entry point, then delete it.
@@ -91,6 +105,27 @@ bug first:
 - **`UNUserNotificationCenter.current()` traps** in a process with no bundle identifier, which
   is any bare binary. Guard it.
 
+- **This model reads the FRONT of a rubric line and discards the tail.** Measured twice in
+  one evening. A joke about a broken coffee machine went to priority 1 because the qualifier
+  "and they need you to act" trailed after a comma; and `deadlineToday` fired 0 times in 40
+  runs because `directRequest` read "they ask you personally for work, with no deadline
+  stated" and the model never weighed the trailing clause, so it shadowed the rung entirely.
+  Moving the discriminator to the front of the line fixed both. Front-load, always.
+- **Telling this model what to LEAVE OUT does nothing; telling it what to PUT IN works.**
+  A shape-only rule ("never one bare noun") was ignored outright. Naming what the topic must
+  contain — the thing and what is wrong or wanted with it — turned "Reply production" into
+  "Help production broke down", 5 runs out of 5.
+- **"before 5pm today" trips Apple's guardrail**, 3 refusals in 3 runs, silently forcing a
+  fallback. Same class as "by end of day". A fallback measures nothing, so a fixture carrying
+  either phrase is a fixture that proves nothing.
+- **Rules belong in the prompt, NOT in `instructions`, whatever Apple's docs say.** Their
+  guidance is that the model prioritises instructions over prompts. Measured at 5 runs across
+  11 fixtures: moving the rubric into `instructions` cost 20 fallback rows of 55 and killed
+  the `Help` verb outright (10/10 → 0/10); adding the repetition Apple also suggests traded
+  those for 8 DROPPED conversations, which is worse, since a fallback still shows the message
+  and a drop hides it. The baseline shipped. This model applies a rule that sits next to the
+  data it judges and discounts one hoisted away from it.
+
 ### SwiftUI on macOS 26
 - **`@Observable` + a `didSet` that assigns to its own property recurses forever** through the
   generated setter and segfaults. Clamp in an explicit setter over a private stored property.
@@ -115,6 +150,27 @@ bug first:
 - **`Logger` redacts interpolations by default, but `error.localizedDescription` came through
   in the clear.** A FoundationModels error can quote the prompt, which contains message text.
   Mark it `privacy: .private` explicitly.
+
+- **`MenuBarExtra` re-derives its window's size from the content continuously, not once at
+  presentation, and it wins every time.** Measured across one continuous drag: every
+  `setFrame` took effect (`got=` matched the request) and every following line still read
+  `from=321`, the live content height. Five fixes were built on that misunderstanding — a top
+  anchor, a pin that only moved the origin, a flag to stop the pin fighting itself, a room
+  measurement that had become a feedback loop, whole-point rounding, and a `setFrame` that
+  agreed with SwiftUI one step early. None could win, because the size was never ours. The
+  app now owns an `NSStatusItem` and an `NSPanel` (`Tray.swift`); never set a MenuBarExtra
+  popover's frame.
+- **An AppKit window's origin is its BOTTOM-left, so growing its height extends it UPWARD.**
+  That is why the panel's header climbed off the top of the screen: the framework grew the
+  window and nothing moved the origin down to compensate.
+- **A SwiftUI app terminates when its last scene window closes.** Sereno survived with
+  nothing on screen only because `MenuBarExtra` was itself a scene. Owning the status item
+  means the app needs `applicationShouldTerminateAfterLastWindowClosed → false`, or it
+  vanishes from the menu bar with no error and nothing for an assert to catch.
+- **Clamp a panel's frame in BOTH axes.** Clamping x alone looked correct for months: with
+  the menu bar visible `button.minY - gap` is always safely on screen. With another app
+  fullscreen the menu bar hides, the button's y and the screen's visible frame stop agreeing,
+  and the panel's top lands above the usable area.
 
 ### Rendering and verification
 - A render harness under `scratchpad/render` rasterises views with `ImageRenderer` so a design

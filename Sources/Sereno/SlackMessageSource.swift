@@ -4,7 +4,7 @@ import os
 /// PRIVACY RULE FOR THIS WHOLE FILE. Ids, counts, HTTP status codes and Slack's own error
 /// slugs are `.public`: none of them is content. Message text, sender names, channel names
 /// and permalinks are Slack content and are never logged at all, at any privacy level.
-/// The token is never logged, never written outside the Keychain, and never interpolated.
+/// The token is never logged, never interpolated, and is read from `Credentials` per call.
 /// A colleague's message in the unified log is a leak, so the safe default here is silence.
 private let log = Logger(subsystem: "com.rhystart.sereno", category: "slack")
 
@@ -1388,13 +1388,13 @@ actor SlackMessageSource: SlackScanStateSource {
     private static let maxRetryWait = Duration.seconds(30)
 
     private static func httpCall(_ method: String, _ query: [(String, String)]) async throws -> Data {
-        guard let token = SlackKeychain.load() else { throw SlackSourceError.notConnected }
+        guard let token = Credentials.load(.slackToken) else { throw SlackSourceError.notConnected }
         var components = URLComponents(string: "https://slack.com/api/\(method)")!
         components.queryItems = query.map { URLQueryItem(name: $0.0, value: $0.1) }
         guard let url = components.url else { throw SlackSourceError.badResponse }
         var request = URLRequest(url: url)
         // The token lives in this frame and nowhere else. Not logged, not redacted, not
-        // stored: the Keychain is the only copy.
+        // copied: the credentials file is the only copy.
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         var lastRateLimitStatus = 429
@@ -1463,8 +1463,8 @@ actor SlackMessageSource: SlackScanStateSource {
 
 // MARK: - What App.swift installs
 
-/// The source Store is given at launch. It checks the Keychain per call so connecting or
-/// disconnecting Slack takes effect on the next refresh instead of the next launch. When
+/// The source Store is given at launch. It reads the credentials file per call so connecting
+/// or disconnecting Slack takes effect on the next refresh instead of the next launch. When
 /// there is no token it reports notConnected; canned messages belong only to demos.
 struct LiveMessageSource: SlackScanStateSource {
     private let slack: SlackMessageSource
@@ -1472,7 +1472,7 @@ struct LiveMessageSource: SlackScanStateSource {
 
     init(
         slack: SlackMessageSource = SlackMessageSource(),
-        tokenAvailable: @escaping @Sendable () -> Bool = { SlackKeychain.load() != nil }
+        tokenAvailable: @escaping @Sendable () -> Bool = { Credentials.load(.slackToken) != nil }
     ) {
         self.slack = slack
         self.tokenAvailable = tokenAvailable

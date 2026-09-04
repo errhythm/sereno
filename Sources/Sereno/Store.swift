@@ -17,6 +17,15 @@ private let log = Logger(subsystem: "com.rhystart.sereno", category: "store")
 final class Store {
     let source: any MessageSource
     private(set) var todos: [TodoItem] = []
+
+    /// What the user is meant to see: open, not snoozed, in list order.
+    ///
+    /// The tray badge, the panel's header count and the rows all read this ONE property, so
+    /// a count can no longer disagree with the list under it. Two copies of this predicate
+    /// is exactly how the badge once came to show a number over an empty list. It lived in
+    /// App.swift as a fileprivate extension until the tray moved into a file of its own,
+    /// which is what its own `ponytail:` note asked for.
+    var visible: [TodoItem] { TodoItem.ranked(todos.filter { !$0.done && !$0.isSnoozed }) }
     private(set) var lastScan: Date = .distantPast
     /// True while refresh() is in flight. Drives the spinner on the Refresh button.
     private(set) var isRefreshing = false

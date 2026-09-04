@@ -1,7 +1,8 @@
 import SwiftUI
 import AppKit
 import Charts
-import Carbon.HIToolbox
+import KeyboardShortcuts
+import ServiceManagement
 import Observation
 import UserNotifications
 import CoreText
@@ -68,33 +69,48 @@ private func registerBundledFonts() {
     }
 }
 
+/// The app's only AppKit delegate, and it exists for one reason.
+///
+/// A SwiftUI app terminates when its last scene window closes. Sereno used to survive with
+/// nothing on screen because `MenuBarExtra` was itself a scene. Now that the tray owns the
+/// panel, every remaining scene — the window, Settings, onboarding, History — is closed most of the time,
+/// and the app would quit out from under the user. Measured with a probe before the
+/// migration: hiding the last scene window killed the process mid-run, silently, with no
+/// error and nothing for an assert to catch. It would have presented as Sereno vanishing
+/// from the menu bar some time after launch, most likely just after closing History.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
+}
+
 @main
 struct SerenoApp: App {
     @State private var store: Store
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     init() {
         registerBundledFonts()
         GlobalHotkey.install()
-        // LiveMessageSource asks the Keychain on every call, so connecting or
+        // One last Keychain permission prompt for anyone upgrading, then never again:
+        // the Slack token and the remote model key move into a 0600 file beside state.json.
+        // This is the ONLY place the app reaches the Keychain now, and it has to run before
+        // Store, because LiveMessageSource reads that file on the first refresh. The reason
+        // any of this happens at all is in Credentials.swift.
+        Credentials.migrate()
+        // LiveMessageSource reads the credentials file on every call, so connecting or
         // disconnecting Slack takes effect on the next refresh instead of the next launch.
         let store = Store(source: LiveMessageSource())
         _store = State(initialValue: store)
         Notify.start(store)
         Chime.start(store)
+        // The tray owns the status item and the panel outright; there is no menu bar scene
+        // any more. The async hop is required: NSStatusBar.system must not be touched
+        // before NSApp exists.
+        DispatchQueue.main.async {
+            Tray.shared.install(store: store) { AnyView(PanelRoot(store: store)) }
+        }
     }
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuContent(store: store)
-        } label: {
-            MenuBarRoot(store: store)
-        }
-        .menuBarExtraStyle(.window)
-        // No .defaultSize here. Apple documents it for WindowGroup, Window, DocumentGroup
-        // and Settings, and MenuBarExtra is not on that list: it compiles, because
-        // defaultSize is a Scene modifier, and does nothing. The popover's size comes from
-        // MenuContent's own .frame(width: 360) and .frame(maxHeight: 400).
-
         // The same panel, as its own floating window. Chromeless and transparent, so the
         // content draws the card, and never fullscreen: this is a 380pt utility panel,
         // and a fullscreen one would be absurd.
@@ -454,239 +470,9 @@ enum Foreground {
         window.isMovableByWindowBackground = true
         window.styleMask.insert(.resizable)
     }
-
-    /// The height the popover's CONTENT asks for: `nil` while the user has not dragged
-    /// one, which means the content sizes itself and the panel is exactly as tall as the
-    /// list, the banners and the chrome make it.
-    ///
-    /// This is the ONLY thing that decides the panel's height, and it is deliberately a
-    /// content height and not a window frame. Measured on the owner's machine, one
-    /// continuous drag of the grip: every `setFrame` took effect (`got=` matched what was
-    /// asked for) and every following line still read `from=321.000`, 321 being the live
-    /// content height. So MenuBarExtra re-derives its window's size from the content
-    /// continuously, not once at presentation, and it wins every time. Setting the
-    /// NSWindow's frame is therefore the wrong lever — it was overwritten before the next
-    /// mouse event, and the leftover origin (we moved y to hold the top edge, then the
-    /// height snapped back) is exactly the "section goes to the top, half of it off the
-    /// screen" the owner saw. That same overwrite is why auto-fit never worked either:
-    /// both bugs were one bug. Sizing the content instead makes the framework's own
-    /// re-derivation do the work.
-    ///
-    /// Pure, so demoPopoverHeight can check it without a window. `room` is how far down
-    /// the screen the panel may reach, and beyond it the list scrolls, which is what the
-    /// ScrollView is for. The floor is chrome plus one row, so a drag cannot leave a panel
-    /// with nothing in it. When the two disagree the SCREEN wins, because the bottom half
-    /// of a panel taller than the screen cannot be reached to drag back. A room of 0 or
-    /// less means "no screen to measure", which must not collapse the panel, so only the
-    /// floor applies.
-    nonisolated static func panelHeight(manual: Double?, room: CGFloat,
-                                        minimum: CGFloat) -> CGFloat? {
-        guard let manual else { return nil }
-        let floored = max(CGFloat(manual), minimum)
-        guard room > 0 else { return floored }
-        return min(floored, room)
-    }
-
-    /// The same, reading the live preference and the live screen. Called from the panel's
-    /// body, so the `popoverHeight` read is what registers the @Observable dependency that
-    /// makes a drag redraw the content at the new height.
-    static func panelHeight() -> CGFloat? {
-        panelHeight(manual: Preferences.shared.popoverHeight, room: popoverRoom(),
-                    minimum: popoverMinimumHeight)
-    }
-
-    /// How far the panel may reach down the screen from its pinned top edge. Measured off
-    /// the live window when there is one — read-only, this no longer sets anything — and
-    /// off the whole visible frame before the first presentation resolves it, which is the
-    /// most room there could be. Off by the window's chrome, since it bounds a content
-    /// height with a window measurement; that is a point or two of slack in a clamp, not a
-    /// size anything is set to.
-    /// Where the panel's TOP edge belongs: under the status item, where the popover was
-    /// first put. Captured once per presentation, because it is the one thing about the
-    /// window's geometry that must not move.
-    ///
-    /// An AppKit window's origin is its BOTTOM-left, so making it taller extends it UPWARD.
-    /// That is the whole of the reported bug: the framework grows the window from the
-    /// content, nothing moves the origin down to compensate, and the header climbs off the
-    /// top of the screen out of reach. Measured from the field: window= tracked request=
-    /// exactly (480, 482, 483…) while the panel's header disappeared above the menu bar.
-    private static var popoverTopAnchor: CGFloat?
-
-    /// Room BELOW the anchor, not below the window's current top. Using `frame.maxY` here
-    /// was a feedback loop: every upward drift raised maxY, which raised the room, which
-    /// permitted more height, which drifted further. The field log shows room=1037 on a
-    /// screen whose usable height is exactly that, so the clamp had stopped clamping.
-    static func popoverRoom() -> CGFloat {
-        guard let window = popover,
-              let visible = (window.screen ?? NSScreen.main)?.visibleFrame
-        else { return NSScreen.main?.visibleFrame.height ?? 0 }
-        return (popoverTopAnchor ?? window.frame.maxY) - visible.minY
-    }
-
-    /// Hold the top edge still while the framework changes the height underneath us.
-    ///
-    /// `setFrameOrigin`, never `setFrame`: the size belongs to MenuBarExtra, which was
-    /// measured re-asserting it within one event when we tried to own it. The POSITION is
-    /// not contested, so moving the window is the one lever that sticks. Called from the
-    /// same window reader that reports the height, which already runs on every content
-    /// change.
-    static func pinPopoverTop(_ window: NSWindow?) {
-        guard let window, window.isVisible else { return }
-        guard let anchor = popoverTopAnchor else {
-            popoverTopAnchor = window.frame.maxY
-            return
-        }
-        // A point of slack: setFrameOrigin triggers another layout pass, and an exact
-        // comparison here would ping-pong on sub-pixel differences.
-        guard abs(window.frame.maxY - anchor) > 1 else { return }
-        window.setFrameOrigin(NSPoint(x: window.frame.origin.x, y: anchor - window.frame.height))
-        popoverLog.info("""
-            popover pinned top=\(anchor, privacy: .public) \
-            height=\(window.frame.height, privacy: .public) \
-            newY=\(anchor - window.frame.height, privacy: .public)
-            """)
-    }
-
-    /// A fresh presentation gets a fresh anchor: MenuBarExtra builds a new window each time
-    /// it opens, and the status item can have moved since.
-    static func forgetPopoverAnchor() { popoverTopAnchor = nil }
-
-    /// The smallest the panel may be dragged to: the popover's chrome plus one whole row.
-    /// 161 is measured, not chosen — the content's own ideal height at one row under
-    /// NSHostingView, of which the list's 72pt floor is one section header plus one row,
-    /// leaving 89 for the header, both dividers and the footer. It is a FLOOR and not a
-    /// typical height: the live panel reports 321 at one to-do because the owner's machine
-    /// has an error banner up on nearly every refresh, plus the role hint and the snoozed
-    /// section. Do not read the harness's numbers as the live ones.
-    nonisolated static let popoverMinimumHeight: CGFloat = 161
-
-    /// Called from the grab strip on every mouse move, which is what makes it feel like a
-    /// resize rather than a commit on release. All it does is store the clamped height:
-    /// the preference is @Observable, so the panel redraws at that height, and
-    /// MenuBarExtra resizes its window to the content. Nothing here touches a frame.
-    static func setPopoverHeight(_ wanted: CGFloat) {
-        let room = popoverRoom()
-        guard let height = panelHeight(manual: Double(wanted), room: room,
-                                       minimum: popoverMinimumHeight) else { return }
-        guard Preferences.shared.popoverHeight != Double(height) else { return }
-        Preferences.shared.popoverHeight = Double(height)
-
-        // Move the window to its final frame NOW, in one call, rather than letting SwiftUI
-        // resize it and correcting afterwards.
-        //
-        // Correcting afterwards is what produced the reported flicker: the framework grew
-        // the window upward from its bottom-left origin, that frame was presented, and only
-        // then did the pin drag the top back down — two visible positions per mouse move,
-        // which reads as the panel jumping to the top and snapping back over and over.
-        //
-        // Setting both origin and size together lands on exactly the frame SwiftUI is about
-        // to compute from the same stored height, so its own resize is a no-op and there is
-        // nothing left to correct. This is not a fight over the size: it is agreeing with
-        // the framework one step early. `pinPopoverTop` stays as the safety net for growth
-        // this path does not cause, such as a to-do arriving while the panel is open.
-        if let window = popover, window.isVisible, let anchor = popoverTopAnchor {
-            let frame = NSRect(x: window.frame.origin.x, y: anchor - height,
-                               width: window.frame.width, height: height)
-            if abs(frame.origin.y - window.frame.origin.y) > 0.5
-                || abs(frame.height - window.frame.height) > 0.5 {
-                window.setFrame(frame, display: true)
-            }
-        }
-        // .info, not .debug: debug is not persisted on the machine this has to be
-        // diagnosed on — eight hours of unified log held zero debug lines. All .public,
-        // because every value here is geometry and never message content.
-        //
-        // window= is the frame as it stands BEFORE SwiftUI has laid the content out
-        // again, so across a drag it is the PREVIOUS request, one line behind. That is
-        // the tell: window= climbing behind request= means the content is driving the
-        // window, which is the fix working. window= stuck at one value while request=
-        // climbs means the content height is not reaching the window at all.
-        popoverLog.info("""
-            popover drag wanted=\(wanted, privacy: .public) \
-            request=\(height, privacy: .public) \
-            room=\(room, privacy: .public) \
-            window=\(popover?.frame.height ?? -1, privacy: .public)
-            """)
-    }
-
-    /// Double-clicking the grip: forget the dragged height and let the content size
-    /// itself again. The escape hatch from a drag that left it a useless size.
-    static func clearPopoverHeight() {
-        Preferences.shared.popoverHeight = nil
-        popoverLog.info("popover drag cleared, the content sizes itself again")
-    }
-
-    /// What the window did with the height the content asked for. Runs from the panel's
-    /// WindowReader, so on every content change, which is exactly when the answer can
-    /// have moved.
-    ///
-    /// This is the line that replaces `fitPopover`'s. The old one reported a frame we had
-    /// just set, which told us nothing once it turned out the framework overwrote it a
-    /// moment later. This one reports a frame nothing here sets: window= following
-    /// request= (and, with no request, following content=) is the mechanism working, and
-    /// window= sitting at one value while the other two climb is it not reaching the
-    /// window at all.
-    static func logPanelHeight(_ window: NSWindow?, request: CGFloat?) {
-        guard let window else {
-            popoverLog.info("popover content: no window yet")
-            return
-        }
-        let asked = request.map { String(format: "%.0f", $0) } ?? "auto"
-        popoverLog.info("""
-            popover content request=\(asked, privacy: .public) \
-            window=\(window.frame.height, privacy: .public) \
-            content=\(window.contentView?.fittingSize.height ?? -1, privacy: .public)
-            """)
-    }
-
     /// One logger for the popover's geometry, shared by the grab strip and the panel's
     /// own window reader so both land in the same category for one `log show` predicate.
     private static let popoverLog = Logger(subsystem: "com.rhystart.sereno", category: "popover")
-
-    /// The live menu bar popover, handed over by the WindowReader the popover's own content
-    /// carries. Weak, so a popover window that has gone does not linger here, and re-read on
-    /// every presentation because MenuBarExtra builds a fresh window each time it opens.
-    private(set) static weak var popover: NSWindow?
-
-    /// Ignores anything that carries a scene identifier. Nothing should reach here but the
-    /// popover, and mistaking the floating window for the popover would order out the window
-    /// the button just opened.
-    static func capture(_ window: NSWindow?) {
-        guard let window, window.identifier == nil else { return }
-        // A different window object means MenuBarExtra rebuilt the popover, so the top
-        // anchor belongs to a presentation that is gone. Keeping it would pin the new
-        // popover to where the old one hung, which is wrong the moment the status item
-        // moves or the panel opens on another screen.
-        if popover !== window { forgetPopoverAnchor() }
-        popover = window
-    }
-
-    /// Closes the menu bar popover, so opening the window does not leave two copies of the
-    /// same list on screen.
-    ///
-    /// The popover's real identity, probed with it actually open: class
-    /// _TtGC7SwiftUI18MenuBarExtraWindowVS_7AnyView_, identifier nil, level 101, which is
-    /// `.popUpMenu`, 360x323 under the status item. So the old level-and-nil-identifier
-    /// guess did match in that probe, but the class had come back as SPRoundedWindow in an
-    /// earlier one, and an attribute guess that misses matches nothing and fails silently,
-    /// which is the symptom the user reported twice. The reference the content hands over
-    /// is the same window by identity and cannot miss, so it leads and the guess is only
-    /// the fallback for a nil reference.
-    ///
-    /// Ordered out rather than dismissed because MenuBarExtra's popover has no API to close
-    /// itself. The caller still sends `dismiss()` first so SwiftUI updates its own state.
-    static func closePopover() {
-        DispatchQueue.main.async {
-            if let popover {
-                if popover.isVisible { popover.orderOut(nil) }
-                return
-            }
-            for window in NSApp.windows
-            where window.isVisible && window.level == .popUpMenu && window.identifier == nil {
-                window.orderOut(nil)
-            }
-        }
-    }
 
     private static var watching = false
 
@@ -707,25 +493,6 @@ enum Foreground {
                 NSApp.setActivationPolicy(.accessory)
             }
         }
-    }
-}
-
-/// Hands back the NSWindow hosting this view. The one way to know the popover's window for
-/// certain instead of guessing it out of NSApp.windows by class or level.
-///
-/// Both calls hop to the next main queue turn: `view.window` is nil until the view is in a
-/// window's hierarchy, which it is not yet inside makeNSView.
-private struct WindowReader: NSViewRepresentable {
-    let onResolve: (NSWindow?) -> Void
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async { onResolve(view.window) }
-        return view
-    }
-
-    func updateNSView(_ view: NSView, context: Context) {
-        DispatchQueue.main.async { onResolve(view.window) }
     }
 }
 
@@ -757,7 +524,7 @@ private struct PopoverResizeGrip: View {
             // the panel a useless size is undone by double-clicking the same strip.
             .gesture(
                 TapGesture(count: 2)
-                    .onEnded { Foreground.clearPopoverHeight() }
+                    .onEnded { Tray.shared.clearHeight() }
                     .exclusively(before: DragGesture(minimumDistance: 1)
                         .onChanged { _ in
                             let y = NSEvent.mouseLocation.y
@@ -766,13 +533,11 @@ private struct PopoverResizeGrip: View {
                             // instead of drifting by the window's chrome each time. Only
                             // the very first drag has no stored height, and the live
                             // window is the closest thing to it.
-                            let start = anchor ?? (y, Foreground.panelHeight()
-                                                      ?? Foreground.popover?.frame.height
-                                                      ?? Foreground.popoverMinimumHeight)
+                            let start = anchor ?? (y, Tray.shared.currentHeight)
                             anchor = start
                             // Screen y counts upwards and the panel grows downwards from
                             // a pinned top edge, so a falling y is what makes it taller.
-                            Foreground.setPopoverHeight(start.height + (start.y - y))
+                            Tray.shared.setHeight(start.height + (start.y - y))
                         }
                         .onEnded { _ in anchor = nil })
             )
@@ -800,7 +565,7 @@ private func openSettings() {
     // forget it now. Same order as the window button, open first so the app is never
     // left with nothing on screen mid activation-policy change, and closePopover hops
     // to the next main queue turn regardless.
-    Foreground.closePopover()
+    Tray.shared.hide()
 }
 
 /// "1 hour", "3 hours".
@@ -874,15 +639,71 @@ private struct Pane<Content: View>: View {
     }
 }
 
+/// What the General pane's toggle shows. Only `.enabled` means the app actually launches
+/// at login right now -- `.requiresApproval` needs a further flip in System Settings, and
+/// `.notFound`/`.notRegistered` mean it won't launch -- so showing "on" for anything but
+/// `.enabled` would misstate what happens on the next login. A free function, not inlined,
+/// so it is checkable without ever calling register().
+func loginItemToggleIsOn(_ status: SMAppService.Status) -> Bool { status == .enabled }
+
+/// Pins the pure mapping only. Whether `register()`/`unregister()` actually succeed for
+/// this ad-hoc signed bundle -- and whether the toggle reflects a change made in System
+/// Settings instead of by Sereno -- both need a human: either one means really adding or
+/// removing a login item, a real system-state change this demo deliberately does not make.
+func demoLoginItemStatus() {
+    assert(loginItemToggleIsOn(.enabled), "enabled must read as on")
+    assert(!loginItemToggleIsOn(.notRegistered), "never registered must read as off")
+    assert(!loginItemToggleIsOn(.requiresApproval), "not yet approved must read as off, not a lie that it's running")
+    assert(!loginItemToggleIsOn(.notFound), "not found must read as off")
+    print("demoLoginItemStatus: PASS")
+}
+
 /// What the app does for this particular user, and how often it does it.
 @MainActor
 private struct GeneralPane: View {
     @Bindable private var prefs = Preferences.shared
 
+    /// The truth is SMAppService.mainApp.status, not a stored bool: if the user removes
+    /// the login item from System Settings > General > Login Items, this must show that
+    /// on the next read rather than keep insisting it's on. Read fresh in `.task`, since
+    /// nothing posts a notification when the system-side state changes.
+    @State private var loginItemStatus = SMAppService.mainApp.status
+    @State private var loginItemError: String?
+
+    private static let log = Logger(subsystem: "com.rhystart.sereno", category: "loginItem")
+
     /// The stored value is always in the list, so a value set outside these choices
     /// (or clamped to 240) shows itself instead of leaving the picker blank.
     private var refreshChoices: [Int] {
         Array(Set([1, 5, 15, 30, 60, prefs.refreshMinutes])).sorted()
+    }
+
+    private var launchAtLogin: Binding<Bool> {
+        Binding(
+            get: { loginItemToggleIsOn(loginItemStatus) },
+            set: { wantsOn in
+                loginItemError = nil
+                do {
+                    // ponytail: login items are keyed to code identity, and this app is ad-hoc
+                    // signed with a signature that changes on every rebuild -- the same root
+                    // cause as the Keychain problem Credentials.swift moved off. macOS may
+                    // therefore refuse register() here, or accept it but drop the item on the
+                    // next rebuild. NOT verified either way: doing so means actually adding a
+                    // real login item, a system-state change this change deliberately avoids
+                    // as a side effect of writing it. A human needs to toggle this once and
+                    // read the result. Upgrade path if it fails: a stable Developer ID signature.
+                    if wantsOn { try SMAppService.mainApp.register() }
+                    else { try SMAppService.mainApp.unregister() }
+                } catch {
+                    let nsError = error as NSError
+                    Self.log.error("login item \(wantsOn ? "register" : "unregister", privacy: .public) failed: \(nsError.domain, privacy: .public) \(nsError.code, privacy: .public)")
+                    loginItemError = wantsOn
+                        ? "Couldn't add Sereno to Login Items. Try System Settings > General > Login Items instead."
+                        : "Couldn't remove Sereno from Login Items. Try System Settings > General > Login Items instead."
+                }
+                loginItemStatus = SMAppService.mainApp.status
+            }
+        )
     }
 
     var body: some View {
@@ -909,6 +730,19 @@ private struct GeneralPane: View {
             }
 
             Section {
+                Toggle("Launch at login", isOn: launchAtLogin)
+                if let loginItemError {
+                    Text(loginItemError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            } header: {
+                Text("Startup")
+            } footer: {
+                Text("Reflects System Settings > General > Login Items, not a choice Sereno remembers itself -- turning it off there shows up here too.")
+            }
+
+            Section {
                 Toggle("Keep window above other apps", isOn: $prefs.windowAlwaysOnTop)
             } header: {
                 Text("Window")
@@ -916,6 +750,10 @@ private struct GeneralPane: View {
                 Text("Off lets other windows cover it, the way an ordinary window behaves. Takes effect straight away, on an open window too.")
             }
         }
+        // Nothing posts a notification when System Settings changes the login item, so
+        // re-read it whenever this pane comes on screen rather than trust the value from
+        // whenever the toggle last touched it.
+        .task { loginItemStatus = SMAppService.mainApp.status }
     }
 }
 
@@ -934,7 +772,7 @@ private struct SlackPane: View {
             } header: {
                 Text("Slack")
             } footer: {
-                Text("Connecting grants Sereno read-only access to the messages you can already see. The token is kept in your Keychain, never in a file or a preference, and nothing is sent anywhere except Slack itself.")
+                Text("Connecting grants Sereno read-only access to the messages you can already see, and nothing is sent anywhere except Slack itself. The token is kept unencrypted, in plain text, in ~/Library/Application Support/Sereno/credentials.json, in a file only your account can read. It is deliberately not in your Keychain: Sereno is signed ad-hoc, so every rebuild looks like a different app to the Keychain and asks permission all over again. A file is the weaker place — anything running as you can read it, and it rides along in a Time Machine backup — and that trade was made on purpose.")
             }
 
             Section {
@@ -993,7 +831,7 @@ private struct SlackPane: View {
 /// helper and CLAUDE.md's disclosure requirement for this pane specifically.
 ///
 /// The API key never touches `Preferences`/UserDefaults: it round-trips through
-/// `RemoteModelKeychain` directly, loaded once into local `@State` on appear and written back
+/// `Credentials` directly, loaded once into local `@State` on appear and written back
 /// only on an explicit Save, the same shape SlackPane already uses for its own credential
 /// (there the token never surfaces in Settings at all; here it has to, so the user can type
 /// it, but it is never bound directly to a persisted preference).
@@ -1040,7 +878,7 @@ private struct ModelPane: View {
                 }
 
                 Section {
-                    SecureField("API key", text: $apiKey, prompt: Text("stored in your Keychain, not in Settings"))
+                    SecureField("API key", text: $apiKey, prompt: Text("stored in credentials.json, not in Settings"))
                         .onSubmit(saveKey)
                     HStack {
                         Button("Save key", action: saveKey)
@@ -1058,30 +896,30 @@ private struct ModelPane: View {
                 } header: {
                     Text("API key")
                 } footer: {
-                    Text("Kept in your Keychain, never in a file or in Settings' own storage.")
+                    Text("Kept beside the Slack token, unencrypted, in plain text, in ~/Library/Application Support/Sereno/credentials.json, in a file only your account can read. Never in Settings' own storage. Clear key removes it from that file straight away.")
                 }
             }
         }
-        .onAppear { apiKey = RemoteModelKeychain.load() ?? "" }
+        .onAppear { apiKey = Credentials.load(.remoteModelAPIKey) ?? "" }
     }
 
     private func saveKey() {
         guard !apiKey.isEmpty else { return }
         do {
-            try RemoteModelKeychain.save(apiKey)
+            try Credentials.save(apiKey, as: .remoteModelAPIKey)
             keyStatus = "Saved."
         } catch {
-            keyStatus = "Could not save the key to your Keychain."
+            keyStatus = (error as? CredentialsError)?.message ?? "Could not save the key."
         }
     }
 
     private func clearKey() {
         do {
-            try RemoteModelKeychain.delete()
+            try Credentials.delete(.remoteModelAPIKey)
             apiKey = ""
             keyStatus = "Removed."
         } catch {
-            keyStatus = "Could not remove the key."
+            keyStatus = (error as? CredentialsError)?.message ?? "Could not remove the key."
         }
     }
 }
@@ -1212,7 +1050,7 @@ private struct AboutPane: View {
     var body: some View {
         Pane {
             Section("Keyboard shortcuts") {
-                LabeledContent("Open the panel from anywhere", value: "⌘⇧T")
+                KeyboardShortcuts.Recorder("Open the panel from anywhere:", name: .togglePanel)
                 LabeledContent("Open Sereno in its own window", value: "⌘⇧O")
             }
 
@@ -1243,14 +1081,14 @@ private struct AboutPane: View {
             } header: {
                 Text("Reset")
             } footer: {
-                Text("Showing onboarding again costs nothing, it only reopens the first-run window. Resetting is the other thing entirely, so it asks first, and it also deletes any captured debug data.")
+                Text("Showing onboarding again costs nothing, it only reopens the first-run window. Resetting is the other thing entirely, so it asks first, and it also deletes any captured debug data and the credentials file.")
             }
         }
         .confirmationDialog("Reset Sereno?", isPresented: $confirmingReset) {
             Button("Reset Sereno", role: .destructive, action: reset)
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Every to-do Sereno has collected is deleted, every setting goes back to its default, and the Slack token and any remote model API key are removed from your Keychain. Nothing in Slack itself changes. This cannot be undone.")
+            Text("Every to-do Sereno has collected is deleted, every setting goes back to its default, and ~/Library/Application Support/Sereno/credentials.json is deleted outright, taking the Slack token and any remote model API key with it. Nothing in Slack itself changes. This cannot be undone.")
         }
     }
 
@@ -1281,8 +1119,10 @@ private struct AboutPane: View {
         SlackAuth.shared.cancelConnect()
         SlackAuth.shared.disconnect()
         // Preferences.resetAll() already put modelProvider back to .onDevice; this is the
-        // Keychain half of that same reset, same as the Slack disconnect two lines up.
-        try? RemoteModelKeychain.delete()
+        // credentials half of that same reset, same as the Slack disconnect two lines up.
+        // The whole file goes, not each name in turn, so nothing is left on disk under a
+        // name a later version might read.
+        Credentials.deleteFile()
         showOnboarding()
     }
 }
@@ -1364,7 +1204,7 @@ private struct Onboarding: View {
     private var connectStep: some View {
         VStack(alignment: .leading, spacing: 11) {
             Text("Connect Slack").font(.headline)
-            Text("Sereno has nothing to show until an account is attached. It asks for read-only permission to the messages you can already see, it cannot post anything, and the token is kept in your Keychain rather than in a file.")
+            Text("Sereno has nothing to show until an account is attached. It asks for read-only permission to the messages you can already see, and it cannot post anything. The token is kept unencrypted, in a file on this Mac only your account can read; Settings names the exact path.")
             slackControls
         }
     }
@@ -1484,74 +1324,53 @@ private struct Onboarding: View {
     }
 }
 
-/// Cmd+Shift+T from any app opens the panel.
+extension KeyboardShortcuts.Name {
+    /// Default Cmd+Shift+T, so existing muscle memory from the old Carbon hotkey keeps
+    /// working. User-editable from here on via the Recorder in Settings' About pane.
+    static let togglePanel = Self("togglePanel", initial: .init(.t, modifiers: [.command, .shift]))
+}
+
+/// Cmd+Shift+T (default, user-editable) from any app opens the panel.
 ///
-/// Carbon's RegisterEventHotKey, not NSEvent.addGlobalMonitorForEvents: the NSEvent
-/// monitor only ever fires once the process holds Accessibility permission, so on a
-/// fresh install it would ship silently dead. The Carbon hotkey table needs no such
-/// permission. Verified on macOS 26.6: registration returns noErr and the handler
-/// fires on a real Cmd+Shift+T while another app is frontmost.
+/// KeyboardShortcuts (github.com/sindresorhus/KeyboardShortcuts), not Carbon's
+/// RegisterEventHotKey: same permission-free global-shortcut mechanism as the code this
+/// replaced, but also user-editable, unlike a hardcoded Carbon registration a user could
+/// never change or resolve a clash from. Confirmed only that it builds, links, and
+/// survives ad-hoc codesigning in this app; whether the shortcut actually fires globally
+/// needs a human -- see demoGlobalHotkey's doc comment.
 ///
-/// MenuBarExtra still has no API to open its own window, so this finds the
-/// NSStatusBarButton SwiftUI installed and clicks it, which does open the panel.
-/// A second press now closes it, by ordering out the window Foreground captured from
-/// inside the popover's content rather than by clicking the status item again, which
-/// did not reliably toggle it shut.
+/// MenuBarExtra still has no API to open its own window, so `openPanel`/`Tray.shared`
+/// finds the NSStatusBarButton SwiftUI installed and clicks it, which does open the panel.
 @MainActor
 enum GlobalHotkey {
-    private static var ref: EventHotKeyRef?
-
     static func install() {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                 eventKind: UInt32(kEventHotKeyPressed))
-        _ = InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { GlobalHotkey.openPanel(toggle: true) }
-            }
-            return noErr
-        }, 1, &spec, nil, nil)
-
-        _ = RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(cmdKey | shiftKey),
-                                EventHotKeyID(signature: OSType(0x53545247), id: 1),
-                                GetApplicationEventTarget(), 0, &ref)
+        KeyboardShortcuts.onKeyUp(for: .togglePanel) { Tray.shared.toggle() }
     }
 
     /// Also the notification-click path, see Notify.ClickHandler, which passes no toggle:
     /// clicking a notification should show the panel, never shut one already up.
     ///
-    /// The click goes out either way, open or shut, because it is what keeps MenuBarExtra's
-    /// own idea of being presented in step. Ordering the window out on its own leaves that
-    /// flag set, and one probe run then spent the following press getting back in step
-    /// instead of opening anything, so the press after a close looked dead. Clicking is
-    /// also what dismisses when it works at all. The order-out is the cleanup for a click
-    /// that did not take.
-    /// ponytail: three presses alternated open, shut, open in the probe. If a press ever
-    /// still looks dead, the flag is out of step and the next thing to try is dropping the
-    /// order-out for this path.
+    /// Historical note, kept because it explains why this is now two lines: MenuBarExtra had
+    /// no API to open its own window, so this used to click the status item and then order
+    /// the window out, which left MenuBarExtra's own presented flag out of step and made the
+    /// press after a close look dead. The tray has real show/hide, so none of that survives.
+    /// The tray owns the panel now, so this is a real call instead of the old trick of
+    /// walking NSStatusBarWindow's subviews for a control to `performClick` — MenuBarExtra
+    /// had no API to open its own window, and this one does.
     static func openPanel(toggle: Bool = false) {
-        let up = Foreground.popover?.isVisible == true
-        guard toggle || !up else { return }
-        clickStatusItem()
-        if up { Foreground.closePopover() }
+        if toggle { Tray.shared.toggle() } else if !Tray.shared.isOpen { Tray.shared.show() }
     }
 
-    private static func clickStatusItem() {
-        // The button sits a couple of views down inside NSStatusBarWindow, so search
-        // for it instead of relying on a fixed path that a macOS update can shift.
-        func control(_ view: NSView) -> NSControl? {
-            if let control = view as? NSControl { return control }
-            for sub in view.subviews {
-                if let found = control(sub) { return found }
-            }
-            return nil
-        }
-        for window in NSApp.windows where window.className.contains("NSStatusBarWindow") {
-            if let root = window.contentView, let button = control(root) {
-                button.performClick(nil)
-                return
-            }
-        }
-    }
+}
+
+/// Pins the one part of the shortcut that is checkable without a running event loop: the
+/// default binding a fresh install registers. Whether it actually fires globally, and
+/// whether a user's own rebinding round-trips through the Recorder, both need a human.
+func demoGlobalHotkey() {
+    let shortcut = KeyboardShortcuts.Name.togglePanel.initialShortcut
+    assert(shortcut?.key == .t, "default shortcut must keep Cmd+Shift+T muscle memory")
+    assert(shortcut?.modifiers == [.command, .shift])
+    print("demoGlobalHotkey: PASS")
 }
 
 /// Every notification the app posts goes through `post`, so muting the whole
@@ -1843,105 +1662,7 @@ private final class ClickHandler: NSObject, UNUserNotificationCenterDelegate {
         -> UNNotificationPresentationOptions { [.banner, .sound] }
 }
 
-/// What the user is meant to see: open, not snoozed, in list order. The badge, the
-/// header count and the rows all go through this one property, so a count can no longer
-/// disagree with the rows under it. Two copies of this predicate is exactly how the badge
-/// came to show a number over an empty list.
-///
-/// ponytail: this belongs on Store, next to `todos`, in Store.swift. It is declared here
-/// only because Store.swift is owned by another change in flight; move it across when
-/// that lands and delete this extension.
-private extension Store {
-    var visible: [TodoItem] { TodoItem.ranked(todos.filter { !$0.done && !$0.isSnoozed }) }
-}
 
-/// The tray icon, plus the one thing that has to happen without anyone clicking first.
-///
-/// An accessory app builds nothing of its own at launch: the popover's content is made
-/// when the popover opens, and a Window scene stays closed until something opens it. The
-/// menu bar label is the only view SwiftUI instantiates on its own, so first run is
-/// presented from here. It goes through Foreground.present for the reason that helper
-/// exists, an accessory app's window otherwise opens behind whatever was frontmost.
-///
-/// The flag alone would be enough to decide, but onAppear can run again for a label that
-/// is re-installed, so `presented` keeps a user who is midway through setup from having
-/// the window yanked to the front under them.
-private struct MenuBarRoot: View {
-    let store: Store
-    @Environment(\.openWindow) private var openWindow
-    @State private var presented = false
-
-    init(store: Store) { self.store = store }
-
-    /// The badge's number, as its own property so a check can call the reader itself
-    /// rather than re-deriving the predicate and proving nothing. See demoVisibleSelector.
-    var badgeCount: Int { store.visible.count }
-
-    var body: some View {
-        // Counted HERE, in a View body, not handed in as an Int from SerenoApp.body.
-        // That was the stale-badge bug: a plain Int across the Scene/View boundary meant
-        // this view read no property of the store, so it established no observation
-        // dependency on `todos` and kept drawing the pre-refresh number after the panel's
-        // list had emptied. Reading an @Observable during body is the whole subscription;
-        // no @State and no @Bindable are needed for it.
-        MenuBarLabel(count: badgeCount)
-            .onAppear {
-                guard !presented, !Preferences.shared.hasCompletedOnboarding else { return }
-                presented = true
-                Foreground.present(onboardingWindowID) { openWindow(id: onboardingWindowID) }
-            }
-    }
-}
-
-/// The tray icon plus a red count badge.
-///
-/// macOS treats a MenuBarExtra label as a template image, which flattens every color
-/// to the menu bar ink, so a plain red Circle comes out grey. The whole label is
-/// rasterized here and flagged isTemplate = false to keep the red. The cost is that
-/// the glyph no longer inverts by itself, so the ink color is picked from the current
-/// appearance and re-picked when the theme changes.
-private struct MenuBarLabel: View {
-    let count: Int
-    @State private var dark = MenuBarLabel.darkMenuBar
-
-    var body: some View {
-        Image(nsImage: rendered)
-            .onReceive(DistributedNotificationCenter.default.publisher(
-                for: Notification.Name("AppleInterfaceThemeChangedNotification"))) { _ in
-                dark = Self.darkMenuBar
-            }
-    }
-
-    private static var darkMenuBar: Bool {
-        NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-    }
-
-    private var rendered: NSImage {
-        let renderer = ImageRenderer(content: content)
-        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
-        guard let image = renderer.nsImage else { return NSImage() }
-        image.isTemplate = false
-        return image
-    }
-
-    private var content: some View {
-        HStack(spacing: 3) {
-            Image(systemName: count > 0 ? "tray.full.fill" : "tray")
-                .font(.system(size: 14))
-                .foregroundStyle(dark ? .white : .black)
-            if count > 0 {
-                Text("\(count)")
-                    .font(.system(size: 10, weight: .bold))
-                    .monospacedDigit()
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 4)
-                    .frame(minWidth: 16, minHeight: 16)
-                    .background(Brand.red, in: Capsule())
-            }
-        }
-        .padding(.horizontal, 1)
-    }
-}
 
 /// Slack's own brand palette. Hardcoded because these are identity colors, not
 /// system colors: they must look the same in light and dark. Only ever used as
@@ -2304,6 +2025,32 @@ private enum Band: CaseIterable {
 /// The panel, rendered by both scenes. The popover and the floating window share this
 /// one view so the two cannot drift apart; `windowed` covers the three places they
 /// legitimately differ. See the header button, `body` and `list`.
+/// What the tray actually hosts: the panel, plus the one thing that has to happen at launch
+/// without anyone clicking.
+///
+/// First-run onboarding used to hang off `MenuBarRoot.onAppear`, because the menu bar label
+/// was the only view SwiftUI instantiated on its own. With the tray owning the status item
+/// there is no such view, and `Tray.install` is not a View so it has no `openWindow`. This
+/// wrapper is that missing launch-time view: `Tray.install` forces one layout pass so the
+/// body runs even though the panel has not been shown yet.
+///
+/// Probed before the migration: `@Environment(\.openWindow)` DOES resolve inside an
+/// NSHostingView with no scene of its own, which is what makes this work at all.
+private struct PanelRoot: View {
+    let store: Store
+    @Environment(\.openWindow) private var openWindow
+    @State private var presented = false
+
+    var body: some View {
+        MenuContent(store: store)
+            .onAppear {
+                guard !presented, !Preferences.shared.hasCompletedOnboarding else { return }
+                presented = true
+                Foreground.present(onboardingWindowID) { openWindow(id: onboardingWindowID) }
+            }
+    }
+}
+
 private struct MenuContent: View {
     let store: Store
     /// True in the Window scene. Chromeless there, so the content draws the card.
@@ -2342,13 +2089,19 @@ private struct MenuContent: View {
     /// in `panel`, which is what registers the @Observable dependency on the preference,
     /// so dragging the grip redraws this panel at the new height. Always nil in the
     /// window scene, which is resizable by its own frame and has no grip.
-    private var panelHeight: CGFloat? { windowed ? nil : Foreground.panelHeight() }
+    /// Only `listCap` reads this now, and only to answer "has the user dragged a height".
+    /// When they have, the panel's own frame bounds the list and the 400pt cap would fight
+    /// it; when they have not, the cap is what stops a long list opening full-screen tall.
+    /// Reading the preference registers the observation that redraws the list on a drag.
+    private var panelHeight: CGFloat? {
+        windowed ? nil : Preferences.shared.popoverHeight.map { CGFloat($0) }
+    }
 
     /// The list's height cap. 400 is the popover's own limit on how far the list may
     /// grow the panel by itself; once a height is dragged the panel's height is decided
     /// and the list is the one thing that can absorb the difference, so the cap has to
     /// come off — leaving it on is what would put dead space above and below the content
-    /// of a 600pt panel. Pure and static so demoPopoverHeight can check it without
+    /// of a 600pt panel. Pure and static so demoTrayGeometry can check it without
     /// building a body. The window scene has always been uncapped.
     nonisolated static func listCap(windowed: Bool, panelHeight: CGFloat?) -> CGFloat {
         windowed || panelHeight != nil ? .infinity : 400
@@ -2359,9 +2112,9 @@ private struct MenuContent: View {
     /// one; nothing here keeps a copy of it.
     var items: [TodoItem] { store.visible }
 
-    /// Gated on `state` alone and not on `hasToken`: hasToken reads the Keychain, and
+    /// Gated on `state` alone and not on `hasToken`: hasToken reads a file off disk, and
     /// body runs on every store change and every animation frame. `state` already
-    /// carries the token check, since SlackAuth's init seeds it from the Keychain.
+    /// carries the token check, since SlackAuth's init seeds it from that same file.
     private var connected: Bool {
         if case .connected = slack.state { return true }
         return false
@@ -2395,7 +2148,13 @@ private struct MenuContent: View {
     /// hanging off the menu bar should look like.
     @ViewBuilder private var panel: some View {
         let core = VStack(spacing: 0) {
+            // fixedSize, so a panel shorter than its content takes the shortfall out of the
+            // LIST (which scrolls, and has its own 72pt floor) instead of out of the sky
+            // band. Without it SwiftUI squeezed the header to a purple sliver and the panel
+            // looked headless — reported from the field with a stored height of 161 while
+            // the live content needed ~321 because an error banner was up.
             header
+                .fixedSize(horizontal: false, vertical: true)
             Divider()
             if composing {
                 ComposeArea(store: store) { composing = false }
@@ -2408,6 +2167,7 @@ private struct MenuContent: View {
             }
             Divider()
             footer
+                .fixedSize(horizontal: false, vertical: true)
         }
 
         if windowed {
@@ -2431,27 +2191,14 @@ private struct MenuContent: View {
                 // Foreground.panelHeight), so a taller content is a taller window. A
                 // dragged height becomes an explicit one here instead, and .top so any
                 // slack falls at the bottom rather than being split above the header.
-                .frame(width: 360, height: panelHeight, alignment: .top)
+                // Width only. The panel's FRAME is its height now — the tray sets it from
+                // Tray.panelHeight and nothing here competes for it. This is the line that
+                // used to fight MenuBarExtra for the height and lose.
+                .frame(width: 360, alignment: .top)
                 .background(Color(nsColor: .textBackgroundColor))
                 // The bottom edge, made draggable. Overlaid rather than stacked so it
                 // costs no layout height and cannot change the height asked for above.
                 .overlay(alignment: .bottom) { PopoverResizeGrip() }
-                // Popover branch only. In the window branch this would hand the window
-                // scene's own window to closePopover, which would then order out the window
-                // the button had just opened.
-                //
-                // Nothing here sets a frame any more: the reference is for closePopover,
-                // and for the read-only screen-room measurement the drag clamp needs.
-                // updateNSView runs on every content change, so this is also the one place
-                // that can report what the window actually did with the height the content
-                // asked for — the line that proves the mechanism, since the frame= that
-                // used to fall back to 321 is now expected to follow request=.
-                .background(WindowReader { window in
-                    Foreground.capture(window)
-                    // Pin BEFORE logging, so the logged frame is the one the user sees.
-                    Foreground.pinPopoverTop(window)
-                    Foreground.logPanelHeight(window, request: panelHeight)
-                })
         }
     }
 
@@ -2541,8 +2288,12 @@ private struct MenuContent: View {
                     // openWindow reuses the window for a given id, so a second press
                     // brings the existing one forward instead of making another.
                     Foreground.present(serenoWindowID) { openWindow(id: serenoWindowID) }
+                    // `\.dismiss` is a no-op inside the tray's NSHostingView, which has no
+                    // scene of its own, so the tray must be told directly. Kept alongside
+                    // dismiss() because the same view is also the window's content, where
+                    // dismiss() is the thing that closes it.
                     dismiss()
-                    Foreground.closePopover()
+                    Tray.shared.hide()
                 }
             } label: {
                 Image(systemName: windowed ? "xmark" : "macwindow")
@@ -3025,10 +2776,19 @@ func demoVisibleSelector() {
     assert(store.visible.map(\.id) == [urgent.id, open.id],
            "visible must drop done and snoozed items and rank what is left")
 
-    assert(MenuBarRoot(store: store).badgeCount == MenuContent(store: store).items.count,
-           "the badge and the panel must count the same list")
+    // Constructing MenuContent is back, and it is the proof that one specific hang is gone.
+    //
+    // MenuContent holds `private let slack = SlackAuth.shared`, and SlackAuth's init used to
+    // seed itself from the Keychain. In an unsigned harness binary that raises a permission
+    // dialog nobody can see, and the demo hung on it forever — measured: SecurityAgent live,
+    // the run stalled with no output, and it only started once real credentials had been
+    // saved. That init now reads the credentials file instead (Credentials.swift), so the
+    // rows are pinned by reading the view again rather than by trusting that
+    // `MenuContent.items` stayed a one-line alias for the selector.
     assert(MenuContent(store: store).items.map(\.id) == store.visible.map(\.id),
-           "the panel's rows must be the selector's items, in the selector's order")
+           "the rows must read Store.visible, not a second copy of the predicate")
+    assert(Tray.badgeCount(store) == store.visible.count,
+           "the badge must count the selector, not a second copy of the predicate")
 
     // The badge's read also has to BE an observation dependency, which is precisely what
     // the plain Int handed across the Scene boundary was not. onChange fires only if
@@ -3037,83 +2797,11 @@ func demoVisibleSelector() {
     // mutate a captured local. Single-threaded here, hence @unchecked.
     final class Flag: @unchecked Sendable { var hit = false }
     let observed = Flag()
-    _ = withObservationTracking { MenuBarRoot(store: store).badgeCount } onChange: { observed.hit = true }
+    _ = withObservationTracking { Tray.badgeCount(store) } onChange: { observed.hit = true }
     store.addManual("Something new", priority: 5, detail: "")
     assert(observed.hit, "reading the badge count must register an observation on the store")
 
-    print("demoVisibleSelector: PASS badge \(MenuBarRoot(store: store).badgeCount)"
-          + " == rows \(MenuContent(store: store).items.count)")
-}
-
-/// The popover's height, which is now one number: the height the CONTENT asks for.
-///
-/// This replaces demoPopoverFit and demoPopoverGrip, which asserted NSWindow frame
-/// arithmetic — top-edge anchoring, origins, growOnly. Every one of those asserts passed
-/// while the live panel was broken, because the framework discarded the frames they were
-/// describing (see Foreground.panelHeight for the measurement). A check that cannot fail
-/// when the thing it covers fails is worse than none, so the arithmetic is gone and what
-/// is left is the value that actually decides the outcome.
-///
-/// Still not covered, honestly: whether MenuBarExtra grows its window when the content
-/// gets taller. That is the framework's side of the contract, it needs the app running,
-/// and the `popover content request=/window=/content=` log line is what answers it.
-func demoPopoverHeight() {
-    let floor = Foreground.popoverMinimumHeight
-    let room: CGFloat = 875
-
-    // No dragged height: no explicit height at all, so the content sizes itself. This is
-    // the normal case and the one that lets a to-do arriving while the panel is open grow
-    // it — an explicit height here would be exactly the bug.
-    assert(Foreground.panelHeight(manual: nil, room: room, minimum: floor) == nil,
-           "with no dragged height the content must size itself")
-
-    // A dragged height is taken as asked when the screen has the room for it.
-    assert(Foreground.panelHeight(manual: 600, room: room, minimum: floor) == 600,
-           "a dragged height must be the height the content asks for")
-
-    // Never shorter than the chrome plus one whole row, or the drag reaches a panel with
-    // nothing in it.
-    assert(Foreground.panelHeight(manual: 10, room: room, minimum: floor) == floor,
-           "must floor at chrome plus one row")
-
-    // Never taller than the screen can show. Beyond the cap the list scrolls.
-    assert(Foreground.panelHeight(manual: 4000, room: room, minimum: floor) == room,
-           "must not ask for more than the screen has room for")
-
-    // When the two limits disagree the screen wins: the bottom half of a panel taller
-    // than the screen cannot be reached to drag back.
-    let cramped = Foreground.panelHeight(manual: 10, room: 120, minimum: floor)!
-    assert(cramped == 120, "the screen must win over the floor, got \(cramped)")
-    assert(cramped < floor, "and this case is only meaningful below the floor")
-
-    // No screen to measure must not collapse the panel: only the floor applies.
-    assert(Foreground.panelHeight(manual: 600, room: 0, minimum: floor) == 600)
-    assert(Foreground.panelHeight(manual: 10, room: -5, minimum: floor) == floor,
-           "an unmeasurable screen must still respect the floor")
-
-    // Stable, which is what makes the stored preference safe: the drag stores the clamped
-    // height, so reading it back after a relaunch must not clamp it a second time into
-    // something different.
-    for wanted in [0.0, 10.0, 161.0, 321.0, 600.0, 4000.0] {
-        let once = Foreground.panelHeight(manual: wanted, room: room, minimum: floor)!
-        let twice = Foreground.panelHeight(manual: Double(once), room: room, minimum: floor)!
-        assert(once == twice, "clamping \(wanted) must be stable, \(once) became \(twice)")
-    }
-
-    // And the other half of the height reaching the screen: with a height dragged, the
-    // list's own cap has to come off, because the list is the only thing in the panel
-    // that can absorb the difference. Leaving it on is what would leave dead space in a
-    // 600pt panel — the same displaced-content symptom, from the opposite direction.
-    assert(MenuContent.listCap(windowed: false, panelHeight: nil) == 400,
-           "with no dragged height the list keeps the popover's own 400pt cap")
-    assert(MenuContent.listCap(windowed: false, panelHeight: 600) == .infinity,
-           "a dragged height must uncap the list so it can absorb the height")
-    assert(MenuContent.listCap(windowed: true, panelHeight: nil) == .infinity,
-           "the window scene has always been uncapped")
-
-    print("demoPopoverHeight: PASS auto=nil, 600->600, 10->\(floor),"
-          + " 4000->\(room), screen wins ->\(cramped), clamp is stable,"
-          + " dragged height uncaps the list")
+    print("demoVisibleSelector: PASS badge \(Tray.badgeCount(store)) == visible \(store.visible.count)")
 }
 
 /// The bands must partition the priority range: exactly one band per priority, never two
@@ -3271,8 +2959,8 @@ private struct Sky: View {
     /// in Weather.swift and what the user gets while the toggle is off.
     var weather: WeatherCondition?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// MenuBarExtra should tear this down when the panel closes, but the timeline is
-    /// gated on it anyway so a retained panel cannot keep drawing out of sight.
+    /// The tray's panel is retained across opens rather than rebuilt, so this gate is what
+    /// stops the starfield animating while the panel is hidden.
     @State private var onScreen = false
 
     private struct Star { let x, y, r, alpha: Double; let twinkles: Bool }

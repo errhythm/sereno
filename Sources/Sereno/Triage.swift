@@ -189,7 +189,7 @@ enum Triage {
                 ignoredSignals: preferences.ignoredSignals,
                 modelProvider: provider,
                 remoteConfig: config,
-                remoteAPIKey: provider == .onDevice ? "" : RemoteModelKeychain.load() ?? ""
+                remoteAPIKey: provider == .onDevice ? "" : Credentials.load(.remoteModelAPIKey) ?? ""
             )
         }
     }
@@ -1148,7 +1148,7 @@ enum Triage {
 
         // Remote and on-device stage one share validatedTask. Feed every remote fixture
         // through RemoteModelClient.Call first so this exercises the real defensive parser
-        // without a network request or Keychain access.
+        // without a network request or a credential read.
         func cannedRemoteFields(
             verb: String = "Review",
             topic: String,

@@ -127,9 +127,9 @@ final class Preferences {
     /// height: the panel asks its content to be this tall and MenuBarExtra sizes the
     /// window from that. nil means the user never dragged one, and then the content sizes
     /// itself. There is no second mechanism — setting the window's frame was measured
-    /// being overwritten a moment later, so it was removed (see Foreground.panelHeight).
+    /// being overwritten a moment later, so it was removed (see Tray.panelHeight).
     ///
-    /// Stored already clamped, by the only writer, `Foreground.setPopoverHeight`: the
+    /// Stored already clamped, by the only writer, `Tray.setHeight`: the
     /// limits — never taller than the screen has room for, never shorter than the chrome
     /// plus one row — need the live window and its screen. Reading it back applies the
     /// same clamp again, which is stable, so a value stored on a big screen cannot come
@@ -212,7 +212,7 @@ final class Preferences {
         debugCaptureEnabled = false
         // The assignments above run didSet and write defaults back, so this second sweep
         // is what leaves the UserDefaults domain clean after a reset. The API key is not
-        // touched here: it lives in the Keychain, not UserDefaults, and RemoteModelKeychain
+        // touched here: it lives in the credentials file, not UserDefaults, and Credentials
         // owns clearing it (App.swift's reset flow calls it alongside SlackAuth.disconnect()).
         Key.all.forEach(store.removeObject)
     }
@@ -291,7 +291,7 @@ func demoPreferences() {
     assert(reloaded.ignoredSignals == [.broadcast, .nameMentioned])
 
     // Remote model choice round-trips like any other preference. The API key never does:
-    // it is not stored here at all, see RemoteModelKeychain.
+    // it is not stored here at all, see Credentials.
     prefs.modelProvider = .openRouter
     prefs.remoteModelID = "meta-llama/llama-3.3-70b-instruct:free"
     let reloadedProvider = Preferences(store: suite)

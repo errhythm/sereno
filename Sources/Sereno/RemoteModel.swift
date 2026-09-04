@@ -1,5 +1,4 @@
 import Foundation
-import Security
 import os
 
 /// PRIVACY RULE FOR THIS WHOLE FILE, same discipline SlackMessageSource.swift and
@@ -342,7 +341,6 @@ enum RemoteModelError: Error, Equatable {
     case noAPIKey
     case network(String)
     case badResponse
-    case keychain(OSStatus)
 }
 
 /// The one network call this file makes: one OpenAI-compatible `POST /chat/completions` per
@@ -386,7 +384,7 @@ actor RemoteModelClient {
         apiKey: String
     ) async -> RemoteModel.Fields? {
         guard !apiKey.isEmpty else {
-            log.error("remote model call skipped, no API key in the Keychain")
+            log.error("remote model call skipped, no API key stored")
             return nil
         }
         let request = RemoteModel.makeRequest(
@@ -410,66 +408,12 @@ actor RemoteModelClient {
     }
 }
 
-// MARK: - Keychain
-
-/// `SecItem` generic password, the SAME service SlackAuth.swift's `SlackKeychain` uses, but a
-/// distinct account, so a remote-model key and the Slack token cannot collide or be read back
-/// under each other's name. Same shape as `SlackKeychain` deliberately (add-or-update on
-/// `errSecDuplicateItem`, `errSecItemNotFound` on delete is success), not shared code with it:
-/// the two keychains protect different secrets with different lifetimes, and this project's
-/// own trap log already warns against exactly the kind of copy-that-drifts a shared helper
-/// would invite if one call site's account handling needed to change and the other didn't.
-enum RemoteModelKeychain {
-    static let service = "com.rhystart.sereno"
-    static let account = "remote-model-api-key"
-
-    private static func query() -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service,
-         kSecAttrAccount as String: account]
-    }
-
-    static func save(_ key: String) throws {
-        let secret = Data(key.utf8)
-        var attributes = query()
-        attributes[kSecValueData as String] = secret
-        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            let update = SecItemUpdate(query() as CFDictionary, [kSecValueData as String: secret] as CFDictionary)
-            guard update == errSecSuccess else { throw RemoteModelError.keychain(update) }
-            return
-        }
-        guard status == errSecSuccess else { throw RemoteModelError.keychain(status) }
-    }
-
-    static func load() -> String? {
-        var request = query()
-        request[kSecReturnData as String] = true
-        request[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(request as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    static func delete() throws {
-        let status = SecItemDelete(query() as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw RemoteModelError.keychain(status)
-        }
-    }
-}
-
 // MARK: - Runnable checks
 
 /// Plain asserts, this project's style: no test framework, no network, no key, no Keychain.
-/// The Keychain round trip is deliberately NOT exercised here (see CLAUDE.md's Slack traps
-/// and this task's own instruction): an unsigned scratch-package binary hitting the
-/// `com.rhystart.sereno` Keychain item can pop an access-permission dialog at a human sitting
-/// in front of the Mac, exactly as a previous agent already found and refused to do for
-/// SlackKeychain. `RemoteModelKeychain.save`/`load`/`delete` need a human running the signed
-/// app's own Settings pane to confirm.
+/// The API key no longer lives in the Keychain at all: it is one of the two names in
+/// `Credentials`, a 0600 file beside state.json, and its round trip is checked there in
+/// `demoCredentials` against a throwaway path. Nothing about storage is exercised here.
 ///
 /// Run from a scratch SwiftPM package under /private/tmp that copies this file with its own
 /// @main, per this project's CLAUDE.md; nothing in the app calls this.
