@@ -171,13 +171,18 @@ struct SlackScanState: Codable, Sendable, Equatable {
     /// Sender avatar URLs, cached next to userNames for the same reason: the request
     /// budget is scarce, so a relaunch must not need a fresh users.info pass.
     var userAvatars: [String: URL] = [:]
+    /// Thread parents successfully recovered through the search fallback. This is a set of
+    /// Slack timestamps rather than message text: it lets the one-call allowance cover a
+    /// different needy thread on the next refresh without retaining conversation content.
+    var fetchedThreadParentTimestamps: Set<String> = []
 }
 
 extension SlackScanState {
     // Swift's synthesized init(from:) does NOT fall back to a property's default for a
-    // missing key, it throws. A state.json written before userAvatars existed has no such
-    // key, so this decodes it explicitly rather than losing the whole scan state (and with
-    // it every conversation watermark and cached display name) on load.
+    // missing key, it throws. A state.json written before userAvatars or
+    // fetchedThreadParentTimestamps existed has no such keys, so this decodes them
+    // explicitly rather than losing the whole scan state (and with it every conversation
+    // watermark and cached display name) on load.
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         accountKey = try c.decodeIfPresent(String.self, forKey: .accountKey)
@@ -185,6 +190,8 @@ extension SlackScanState {
         conversations = try c.decodeIfPresent([String: SlackConversationCheckpoint].self, forKey: .conversations) ?? [:]
         userNames = try c.decodeIfPresent([String: String].self, forKey: .userNames) ?? [:]
         userAvatars = try c.decodeIfPresent([String: URL].self, forKey: .userAvatars) ?? [:]
+        fetchedThreadParentTimestamps = try c.decodeIfPresent(Set<String>.self,
+                                                               forKey: .fetchedThreadParentTimestamps) ?? []
     }
 }
 
@@ -267,9 +274,9 @@ actor SlackMessageSource: SlackScanStateSource {
     /// short hands the next one its stopping point.
     private var sweepStart = 0
 
-    /// Conversations whose newest real message this cycle was the user's own, which is
-    /// exactly the question `repliedIDs(among:)` asks. Filled during the scan so reply
-    /// detection costs no extra requests.
+    /// Conversations whose newest real message this cycle was an ordinary user reply.
+    /// A commitment is deliberately excluded: promising future work is not the same as
+    /// delivering it. Filled during the scan so reply detection costs no extra requests.
     private var settled: Set<String> = []
 
     init(call: Call? = nil, budget: Int = SlackMessageSource.callBudget) {
@@ -723,7 +730,7 @@ actor SlackMessageSource: SlackScanStateSource {
 
     struct SearchDiscovery: Sendable {
         var messages: [SlackMessage] = []
-        /// Conversation keys where the user's own message is the newest thing search saw.
+        /// Conversation keys where an ordinary user reply is newer than the inbound work.
         var settled: Set<String> = []
         /// Conversation keys with an inbound candidate newer than anything the user sent.
         var unsettled: Set<String> = []
@@ -860,11 +867,20 @@ actor SlackMessageSource: SlackScanStateSource {
             return match.permalink.flatMap(SlackSearch.threadTS(fromPermalink:)) ?? channel.id
         }
 
-        var ownNewest: [String: String] = [:]
+        var ownReplyNewest: [String: String] = [:]
         for match in own.matches ?? [] {
             guard let key = key(match) else { continue }
-            ownNewest[key] = max(ownNewest[key] ?? "", match.ts)
+            guard !isCommitment(match.text) else { continue }
+            ownReplyNewest[key] = max(ownReplyNewest[key] ?? "", match.ts)
         }
+
+        // The from:<self> settlement probe already fetched these messages. Reuse its full
+        // history window for commitments; there is no additional Slack call. The connection
+        // floor still applies so enabling the feature cannot surface promises from before
+        // Sereno was connected.
+        let commitmentCutoff = max(Date().addingTimeInterval(-Self.historyWindow), floor)
+        let ownCommitments = SlackSearch.matches(own.matches ?? [], after: commitmentCutoff)
+            .filter { isCommitment($0.text) }
 
         var seen: Set<String> = []
         var inboundNewest: [String: String] = [:]
@@ -881,7 +897,7 @@ actor SlackMessageSource: SlackScanStateSource {
             if threadTS == nil { threadTSAbsent += 1 } else { threadTSPresent += 1 }
             let key = threadTS ?? channel.id
             // The user has spoken in this conversation since: the obligation is discharged.
-            if let mine = ownNewest[key], mine > match.ts {
+            if let mine = ownReplyNewest[key], mine > match.ts {
                 answered += 1
                 continue
             }
@@ -898,25 +914,55 @@ actor SlackMessageSource: SlackScanStateSource {
             inboundNewest[key] = max(inboundNewest[key] ?? "", match.ts)
         }
 
+        // One conversation, one obligation. When an inbound ask is still open, the user's
+        // promise joins it as context so triage transforms the existing task instead of
+        // making a duplicate. Without an open inbound ask, the promise itself is actionable.
+        let keysWithOpenInbound = Set(pending.compactMap { item in
+            item.thread?.ts ?? item.conversation.id
+        })
+        var seenCommitments: Set<String> = []
+        for match in ownCommitments {
+            guard let channel = match.channel,
+                  let user = match.user, user == identity.userID,
+                  seenCommitments.insert("\(channel.id)/\(match.ts)").inserted
+            else { continue }
+            let threadTS = match.permalink.flatMap(SlackSearch.threadTS(fromPermalink:))
+            let conversationKey = threadTS ?? channel.id
+            let thread = threadTS.map {
+                ThreadContext(ts: $0, parentAuthorID: nil, participants: [identity.userID])
+            }
+            pending.append(Pending(
+                raw: RawMessage(ts: match.ts, user: user, text: match.text, threadTS: threadTS),
+                conversation: conversation(for: channel),
+                thread: thread,
+                isContext: keysWithOpenInbound.contains(conversationKey)
+            ))
+        }
+
         // Settlement still needs positive proof, exactly as the history path demands it:
-        // the user's own message must be the newest thing in the conversation, and an empty
-        // window proves nothing. Held in memory only, deliberately: writing it into
+        // an ordinary user reply must be newer than the inbound work, and an empty window
+        // proves nothing. Held in memory only, deliberately: writing it into
         // scanState would mean inventing a watermark for a conversation search never read
         // end to end, and the `from:<self>` window re-derives it on every refresh anyway.
-        for (key, mine) in ownNewest where (inboundNewest[key] ?? "") < mine {
+        for (key, mine) in ownReplyNewest where (inboundNewest[key] ?? "") < mine {
             out.settled.insert(key)
             settled.insert(key)
         }
-        for (key, inbound) in inboundNewest where (ownNewest[key] ?? "") < inbound {
+        for (key, inbound) in inboundNewest where (ownReplyNewest[key] ?? "") < inbound {
             out.unsettled.insert(key)
             settled.remove(key)
         }
 
-        // A bare mention does not give triage enough context to infer the owed work. Search
-        // has no thread parent, so buy at most one capped replies request to recover it.
+        // A reply that does not name what to act on does not give triage enough context to
+        // infer the owed work. Search has no thread parent, so buy at most one capped replies
+        // request to recover it. Successfully recovered threads stay covered across refreshes
+        // and launches, letting the next allowance reach another needy thread instead.
         if let candidate = pending
-            .filter({ $0.raw.threadTS != nil && strippingMarkupAndCode($0.raw.text)
-                .split(whereSeparator: { $0.isWhitespace }).count < 4 })
+            .filter({ item in
+                guard let threadTS = item.raw.threadTS else { return false }
+                return Self.needsThreadParentContext(item.raw.text)
+                    && !scanState.fetchedThreadParentTimestamps.contains(threadTS)
+            })
             .max(by: { $0.raw.ts < $1.raw.ts }),
            let threadTS = candidate.raw.threadTS {
             if cooldown("conversations.replies") != nil {
@@ -929,6 +975,7 @@ actor SlackMessageSource: SlackScanStateSource {
             ) {
                 let replies = Self.ordered(Self.parseMessages(page))
                 if let root = replies.first {
+                    scanState.fetchedThreadParentTimestamps.insert(threadTS)
                     let context = ThreadContext(
                         ts: threadTS,
                         parentAuthorID: root.user,
@@ -1009,6 +1056,7 @@ actor SlackMessageSource: SlackScanStateSource {
                 text: slackPlainText(raw.text, names: names),
                 isContext: isContext,
                 isFromUser: raw.user == identity.userID,
+                isCommitment: raw.user == identity.userID && isCommitment(raw.text),
                 date: raw.date,
                 directlyAddressed: signals.isPersonal,
                 addressing: signals,
@@ -1076,11 +1124,12 @@ actor SlackMessageSource: SlackScanStateSource {
         }
 
         let ordered = Self.ordered(raw)
-        // "Settled" needs positive proof that the user's own message is the newest thing
-        // here. An empty window proves nothing, and treating it as settled would silently
-        // mark an old open task done.
+        // "Settled" needs positive proof that an ordinary user reply is newest. A promise
+        // is a new obligation, not an answer; an empty window proves nothing either.
         var channelSettled = previous?.settled ?? false
-        if let newest = ordered.last { channelSettled = newest.user == identity.userID }
+        if let newest = ordered.last {
+            channelSettled = newest.user == identity.userID && !isCommitment(newest.text)
+        }
 
         var pending: [Pending] = []
         // Threads first, so a parent whose thread was read is not ALSO reported as a
@@ -1107,7 +1156,7 @@ actor SlackMessageSource: SlackScanStateSource {
             if let newest = replies.last {
                 checkpoints[key] = SlackConversationCheckpoint(
                     newestTS: newest.ts,
-                    settled: newest.user == identity.userID
+                    settled: newest.user == identity.userID && !isCommitment(newest.text)
                 )
             }
 
@@ -1116,11 +1165,21 @@ actor SlackMessageSource: SlackScanStateSource {
                 let context = ThreadContext(ts: key,
                                             parentAuthorID: root.user,
                                             participants: Set(replies.map(\.user)))
-                let tailTimestamps = Set(threadTail.map(\.ts))
+                let hasOpenInbound = threadTail.contains { $0.user != identity.userID }
+                let newestInboundTS = threadTail.last { $0.user != identity.userID }?.ts
+                let tailTimestamps = Set(threadTail.filter {
+                    if hasOpenInbound && $0.user == identity.userID && isCommitment($0.text) {
+                        return false
+                    }
+                    // A thread root before a later open reply is context. If the root is
+                    // itself the newest inbound ask, keep it actionable.
+                    if $0.ts == root.ts && newestInboundTS != root.ts { return false }
+                    return true
+                }.map(\.ts))
                 pending += replies.filter { !tailTimestamps.contains($0.ts) }.map {
                     Pending(raw: $0, conversation: conversation, thread: context, isContext: true)
                 }
-                pending += threadTail.map {
+                pending += threadTail.filter { tailTimestamps.contains($0.ts) }.map {
                     Pending(raw: $0, conversation: conversation, thread: context)
                 }
             }
@@ -1129,7 +1188,15 @@ actor SlackMessageSource: SlackScanStateSource {
         let tail = Self.unrepliedTail(ordered, userID: identity.userID)
             .filter { !$0.isThreadReply && !handled.contains($0.ts) }
         if let newest = tail.last, newest.date > since {
-            pending += tail.map { Pending(raw: $0, conversation: conversation, thread: nil) }
+            let hasOpenInbound = tail.contains { $0.user != identity.userID }
+            pending += tail.map {
+                Pending(
+                    raw: $0,
+                    conversation: conversation,
+                    thread: nil,
+                    isContext: hasOpenInbound && $0.user == identity.userID && isCommitment($0.text)
+                )
+            }
         }
         if historyComplete {
             let newestAccounted = max(
@@ -1196,8 +1263,9 @@ actor SlackMessageSource: SlackScanStateSource {
         raw.filter(isRealMessage).sorted { $0.ts < $1.ts }
     }
 
-    /// Everything that arrived after the user's own most recent message. If they have
-    /// posted since, everything before that is settled, whatever it said.
+    /// Every detected commitment, plus everything that arrived after the user's most recent
+    /// ordinary reply. A commitment never cuts the tail: "I'll send it tomorrow" promises
+    /// more work and therefore cannot discharge the inbound ask it followed.
     ///
     /// This returns the conversation's FULL tail, not just what is newer than the last
     /// scan. `since` decides which conversations are worth returning; the tail is what
@@ -1205,8 +1273,43 @@ actor SlackMessageSource: SlackScanStateSource {
     /// one obligation, and handing Triage only the second half strips its antecedent.
     static func unrepliedTail(_ raw: [RawMessage], userID: String) -> [RawMessage] {
         let ordered = ordered(raw)
-        guard let mine = ordered.lastIndex(where: { $0.user == userID }) else { return ordered }
-        return Array(ordered[ordered.index(after: mine)...])
+        guard let reply = ordered.lastIndex(where: {
+            $0.user == userID && !isCommitment($0.text)
+        }) else { return ordered }
+        return ordered.enumerated().compactMap { index, message in
+            if message.user == userID && isCommitment(message.text) { return message }
+            return index > reply ? message : nil
+        }
+    }
+
+    /// Whether a search reply needs its thread parent to name the work. Markup and code are
+    /// removed first, then words that only express a request, acknowledgement, or pronoun
+    /// reference are discounted. Any remaining word is a concrete enough subject to let
+    /// triage proceed without spending the one replies call.
+    /// ponytail: This is intentionally a small, deterministic vocabulary rather than a
+    /// grammar parser. It can fetch a parent for a vague-but-complete message, but must never
+    /// skip one merely because it has four words that contain no subject.
+    static func needsThreadParentContext(_ text: String) -> Bool {
+        let nonSubjectWords: Set<String> = [
+            "a", "an", "and", "any", "are", "be", "can", "could", "did", "do", "does",
+            "for", "help", "hello", "hey", "hi", "i", "it", "just", "know", "let", "may",
+            "me", "might", "need", "needs", "of", "on", "please", "reply", "respond", "review",
+            "should", "tell", "thank", "thanks", "the", "this", "that", "thought", "thoughts",
+            "to", "update", "updates", "we", "will", "would", "you", "your",
+            // Function words whose absence caused an UNDER-fetch, which is the harmful
+            // direction: "can you help me with this?" is as subject-less as "can you help
+            // me?", and over-fetching is bounded by the one-call-per-refresh cap while a
+            // missed parent is the reported bug this whole test exists to catch.
+            "about", "again", "am", "anyone", "as", "at", "back", "have", "here", "how",
+            "in", "is", "look", "looking", "my", "one", "or", "our", "out", "quick",
+            "question", "someone", "sure", "take", "there", "us", "was", "were", "what",
+            "when", "with", "yet"
+        ]
+        let words = strippingMarkupAndCode(text)
+            .lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+        return words.allSatisfy { nonSubjectWords.contains($0) }
     }
 
     /// Whether a thread's replies are worth a request. `conversations.history` already hands
@@ -1444,6 +1547,24 @@ func demoSlackSource() async {
     assert(!tail.contains { $0.user.isEmpty })
     assert(S.unrepliedTail(interleaved, userID: "U_NOBODY").count == 4,
            "a user who never posted owes the whole visible history")
+
+    let promisedAfterAsk = raw("""
+    {"messages":[
+      {"ts":"1728394805.000100","user":"U_OTHER","text":"please send the report"},
+      {"ts":"1728394815.000100","user":"U_ME","text":"I'll send it tomorrow"}
+    ]}
+    """)
+    assert(S.unrepliedTail(promisedAfterAsk, userID: "U_ME").map(\.text) ==
+           ["please send the report", "I'll send it tomorrow"],
+           "a commitment must not discharge the inbound obligation")
+    let answeredAfterAsk = raw("""
+    {"messages":[
+      {"ts":"1728394805.000100","user":"U_OTHER","text":"please send the report"},
+      {"ts":"1728394815.000100","user":"U_ME","text":"sent in the project channel"}
+    ]}
+    """)
+    assert(S.unrepliedTail(answeredAfterAsk, userID: "U_ME").isEmpty,
+           "an ordinary reply must still discharge the inbound obligation")
 
     // MARK: reply_users decides whether a thread costs a request
     func parent(_ replyUsers: [String], count: Int = 2, author: String = "U_OTHER") -> RawMessage {
@@ -2116,6 +2237,174 @@ func demoSlackSource() async {
     assert(searchSettled == ["C_SETTLED"], "from:<self> is the reply detector now, got \(searchSettled)")
     assert(!searchRows.contains { $0.conversationID == "C_SETTLED" },
            "a conversation the user has since answered is not an obligation")
+
+    // MARK: needsThreadParentContext asks whether the reply itself names anything to act on,
+    // not how many words it has. THE BUG THIS PINS: "can you help me?" is four words and used
+    // to pass a `< 4` word-count test untouched, so its parent (which named the deployment
+    // document) was never fetched.
+    // The last three were UNDER-fetching: a single function word outside the vocabulary made
+    // a subject-less ask look complete, and an under-fetch is the harmful direction. An
+    // over-fetch costs at most one already-capped request; a missed parent is this bug.
+    for needy in ["can you help me?", "<@U_ME>", "any update?", "?", "thoughts?",
+                  "can you help me with this?", "anyone here know about this?"] {
+        assert(S.needsThreadParentContext(needy), "must be flagged needy: \(needy)")
+    }
+    // The ceiling, measured rather than assumed: "what happened with it?" names nothing a
+    // human would act on, but "happened" is a content word to a vocabulary and adding it
+    // starts an unbounded chase through every verb ("what broke with it", "what's up with
+    // it"). Left under-fetching there deliberately. A grammar parser is the upgrade path if
+    // this ever costs a real to-do; a longer word list is not.
+    assert(!S.needsThreadParentContext("what happened with it?"),
+           "documenting the vocabulary's limit, not endorsing it")
+    for complete in ["can someone help me with the deployment document?",
+                     "the staging database is down",
+                     "please review MR !41 today"] {
+        assert(!S.needsThreadParentContext(complete),
+               "a message that already names its subject must not spend a request: \(complete)")
+    }
+
+    // MARK: coverage accumulates across refreshes instead of re-buying the same thread
+    let coverageThreadA = ts(50)
+    let coverageThreadB = ts(45)
+    @Sendable func coverageSource(_ log: CallLog) -> SlackMessageSource {
+        SlackMessageSource(call: { method, query in
+            await log.record(method, query)
+            switch method {
+            case "auth.test":
+                return Data(#"{"ok":true,"user_id":"U_ME","url":"https://acme.slack.com/"}"#.utf8)
+            case "users.info":
+                return Data(#"{"ok":true,"user":{"real_name":"","profile":{"display_name":""}}}"#.utf8)
+            case "usergroups.list":
+                return Data(#"{"ok":true,"usergroups":[]}"#.utf8)
+            case "users.conversations":
+                return Data(#"{"ok":true,"channels":[{"id":"C_COVA","name":"a"},{"id":"C_COVB","name":"b"}]}"#.utf8)
+            case "conversations.history":
+                throw SlackSourceError.rateLimited(retryAfter: 60)
+            case "search.messages":
+                let q = query.first { $0.0 == "query" }?.1 ?? ""
+                guard q.hasPrefix("<@U_ME>") else { return searchBody() }
+                return searchBody(
+                    searchMatch(channel: "C_COVA", ts: ts(5), user: "U_A",
+                                text: "can you help me?", threadTS: coverageThreadA),
+                    searchMatch(channel: "C_COVB", ts: ts(3), user: "U_B",
+                                text: "any update?", threadTS: coverageThreadB)
+                )
+            case "conversations.replies":
+                let channel = query.first { $0.0 == "channel" }?.1 ?? ""
+                let queriedTS = query.first { $0.0 == "ts" }?.1 ?? ""
+                let rootText = channel == "C_COVA"
+                    ? "the deployment document needs review" : "the budget spreadsheet needs numbers"
+                return Data("""
+                {"ok":true,"messages":[
+                  {"ts":"\(queriedTS)","user":"U_ROOT","text":"\(rootText)","thread_ts":"\(queriedTS)"}
+                ]}
+                """.utf8)
+            default:
+                return Data(#"{"ok":false,"error":"unknown_method"}"#.utf8)
+            }
+        })
+    }
+
+    let coverageLog = CallLog()
+    let coverageSrc = coverageSource(coverageLog)
+    await coverageSrc.restoreSlackScanState(SlackScanState(connectedAt: now.addingTimeInterval(-60 * 60)))
+    let firstCoveragePass = try! await coverageSrc.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    let firstCoverageReplies = await coverageLog.count(of: "conversations.replies")
+    assert(firstCoverageReplies == 1,
+           "two needy uncovered threads in one refresh must cost exactly one replies call, got \(firstCoverageReplies)")
+    let stateAfterFirst = await coverageSrc.currentSlackScanState()
+    assert(stateAfterFirst.fetchedThreadParentTimestamps == [coverageThreadB],
+           "the more recent uncovered candidate is fetched first: \(stateAfterFirst.fetchedThreadParentTimestamps)")
+    assert(firstCoveragePass.contains { $0.text.contains("budget spreadsheet") },
+           "the newly covered thread's root must reach the rows")
+    assert(!firstCoveragePass.contains { $0.text.contains("deployment document") },
+           "an uncovered thread not chosen this pass must not have been fetched")
+
+    let secondCoveragePass = try! await coverageSrc.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    let secondCoverageReplies = await coverageLog.count(of: "conversations.replies") - firstCoverageReplies
+    assert(secondCoverageReplies == 1,
+           "the next refresh buys exactly one more replies call, got \(secondCoverageReplies)")
+    let stateAfterSecond = await coverageSrc.currentSlackScanState()
+    assert(stateAfterSecond.fetchedThreadParentTimestamps == [coverageThreadA, coverageThreadB],
+           "coverage must accumulate rather than re-picking the already-covered thread: " +
+           "\(stateAfterSecond.fetchedThreadParentTimestamps)")
+    assert(secondCoveragePass.contains { $0.text.contains("deployment document") },
+           "a covered thread must not be re-fetched, so the next refresh reaches the uncovered one")
+
+    // MARK: the state-file trap: a blob written before the covered-set field must still
+    // decode, and the covered-set itself must survive a save/restore round trip.
+    let legacyStateJSON = Data(#"{"conversations":{},"userNames":{},"userAvatars":{}}"#.utf8)
+    let legacyState = try! JSONDecoder().decode(SlackScanState.self, from: legacyStateJSON)
+    assert(legacyState.fetchedThreadParentTimestamps.isEmpty,
+           "a state blob written before fetchedThreadParentTimestamps existed must still decode")
+
+    var seededState = SlackScanState()
+    seededState.fetchedThreadParentTimestamps = ["1728394805.000100", "1728394999.000200"]
+    let roundTripSource = SlackMessageSource(call: { _, _ in Data(#"{"ok":false,"error":"unused"}"#.utf8) })
+    await roundTripSource.restoreSlackScanState(seededState)
+    let restored = await roundTripSource.currentSlackScanState()
+    assert(restored.fetchedThreadParentTimestamps == seededState.fetchedThreadParentTimestamps,
+           "the covered-set must survive an in-memory save/restore round trip unchanged")
+    let reencoded = try! JSONDecoder().decode(SlackScanState.self, from: JSONEncoder().encode(restored))
+    assert(reencoded.fetchedThreadParentTimestamps == seededState.fetchedThreadParentTimestamps,
+           "the covered-set must survive an encode/decode round trip unchanged")
+
+    // The existing from:<self> call does double duty: a promise keeps an inbound ask open,
+    // an ordinary reply still settles it, and a promise with no inbound ask stands alone.
+    @Sendable func promiseSource(ownText: String, includeInbound: Bool) -> SlackMessageSource {
+        SlackMessageSource(call: { method, query in
+            switch method {
+            case "auth.test":
+                return Data(#"{"ok":true,"user_id":"U_ME","url":"https://acme.slack.com/"}"#.utf8)
+            case "users.info":
+                return Data(#"{"ok":true,"user":{"real_name":"Ana","profile":{"display_name":"ana","image_72":"https://avatars.slack-edge.com/ana.png"}}}"#.utf8)
+            case "usergroups.list":
+                return Data(#"{"ok":true,"usergroups":[]}"#.utf8)
+            case "users.conversations":
+                return Data(#"{"ok":true,"channels":[{"id":"C_PROMISE","name":"work"}]}"#.utf8)
+            case "conversations.history":
+                throw SlackSourceError.rateLimited(retryAfter: 60)
+            case "search.messages":
+                let q = query.first { $0.0 == "query" }?.1 ?? ""
+                if q.hasPrefix("<@U_ME>") && includeInbound {
+                    return searchBody(searchMatch(
+                        channel: "C_PROMISE", ts: ts(10), user: "U_OTHER",
+                        text: "<@U_ME> can you send the report?"
+                    ))
+                }
+                if q.hasPrefix("from:me") || q.hasPrefix("from:@me") {
+                    return searchBody(searchMatch(
+                        channel: "C_PROMISE", ts: ts(5), user: "U_ME", text: ownText
+                    ))
+                }
+                return searchBody()
+            default:
+                return Data(#"{"ok":false,"error":"unknown_method"}"#.utf8)
+            }
+        })
+    }
+
+    let promisedSource = promiseSource(ownText: "I'll send the report tomorrow", includeInbound: true)
+    await promisedSource.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    let promisedRows = try! await promisedSource.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    assert(promisedRows.count == 2 && promisedRows.contains(where: { $0.isCommitment && $0.isContext }),
+           "an inbound ask plus the reader's promise must remain one conversation with promise context")
+    let promisedSettled = try! await promisedSource.repliedIDs(among: ["C_PROMISE"])
+    assert(promisedSettled.isEmpty, "a promise must not count as an answer")
+
+    let answeredSource = promiseSource(ownText: "sent in the project channel", includeInbound: true)
+    await answeredSource.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    let answeredRows = try! await answeredSource.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    assert(answeredRows.isEmpty, "an ordinary reply must still remove the inbound ask")
+    let ordinarilySettled = try! await answeredSource.repliedIDs(among: ["C_PROMISE"])
+    assert(ordinarilySettled == ["C_PROMISE"], "an ordinary reply must still settle the conversation")
+
+    let standaloneSource = promiseSource(ownText: "I'll send the report within the hour", includeInbound: false)
+    await standaloneSource.restoreSlackScanState(SlackScanState(connectedAt: originalFloor))
+    let standaloneRows = try! await standaloneSource.unrepliedMessages(since: now.addingTimeInterval(-20 * 60))
+    assert(standaloneRows.count == 1 && standaloneRows[0].isCommitment && !standaloneRows[0].isContext &&
+           standaloneRows[0].isFromUser && standaloneRows[0].conversationID == "C_PROMISE",
+           "a standalone promise must become an actionable source row")
 
     // MARK: what the search probe logged, which is the whole of what it is allowed to log
     let probeSource = searchOnlySource(CallLog())

@@ -247,6 +247,37 @@ func containsWord(_ needle: String, in haystack: String) -> Bool {
 
 private func isWordCharacter(_ c: Character) -> Bool { c.isLetter || c.isNumber || c == "_" }
 
+// MARK: - First-person commitments
+
+/// A deliberately narrow deterministic gate for promises of future action. The model may
+/// phrase and rank text only after this says yes; it never gets to expand the candidate set.
+///
+/// ponytail: the ceiling is these 18 action heads after "I'll", "I will", "I can",
+/// "I'm going to", or "let me": send, share, get, check, review, fix, finish, update,
+/// reply, respond, follow up, handle, write, prepare, deliver, submit, investigate, and
+/// look at/into/over. Plus the whole-message acknowledgements "on it" and "will do".
+/// Do not widen this from anecdotes: every new head needs false-positive fixtures first.
+func isCommitment(_ text: String) -> Bool {
+    let prose = strippingMarkupAndCode(text)
+        .replacingOccurrences(of: "’", with: "'")
+        .lowercased()
+    guard !prose.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+
+    let action = #"(?:send|share|get\s+(?:back|the|this|that|it|these|those|you|them|him|her|us)|check|review|fix|finish|update|reply|respond|follow\s+up|handle|write|prepare|deliver|submit|investigate|look\s+(?:at|into|over))"#
+    let firstPerson = #"(?:^|[^a-z0-9_])(?:i'll|i will|i can|i'm going to|i am going to|let me)\s+"#
+    if prose.range(
+        of: firstPerson + action + #"(?=$|[^a-z0-9_])"#,
+        options: .regularExpression
+    ) != nil {
+        return true
+    }
+
+    // These are commitments only as complete acknowledgements. Matching them inside a
+    // sentence ("I think Sam is on it") would turn third-person status into the user's task.
+    let acknowledgement = #"^\s*(?:(?:sure|okay|ok|yes|yep)[,!:\- ]+\s*)?(?:(?:i'm|i am)\s+)?(?:on it|will do)[.!]?\s*$"#
+    return prose.range(of: acknowledgement, options: .regularExpression) != nil
+}
+
 // MARK: - Runnable check
 
 /// Plain asserts, no framework. This decides whether tasks exist at all, so it is worth
@@ -279,6 +310,36 @@ func demoAddressing() {
 
     // Rule 1: the user's own message, whatever else is true, is never for the user.
     assert(addressing(facts("hey <@U_ME> in my own DM", .im, author: "U_ME"), identity: me).isEmpty)
+
+    // Commitments are detected beside addressing, but are not Addressing cases: they are
+    // authored by the user and cannot be disabled as though they were notification signals.
+    let commitments = [
+        "I'll send the report",
+        "I will review the plan",
+        "I can update the ticket",
+        "Let me check the numbers",
+        "On it",
+        "Will do",
+        "I'm going to fix the build",
+        "I'll get the approval",
+    ]
+    for fixture in commitments {
+        assert(isCommitment(fixture), "missed commitment: \(fixture)")
+    }
+    let nonCommitments = [
+        "I'll be honest",
+        "I'll admit I missed it",
+        "I'd say the build is fine",
+        "I'll bet it passes",
+        "I think I'll never understand this API",
+        "I'll get tired after lunch",
+        "",
+        "The report is due within the hour",
+        "Sam is on it",
+    ]
+    for fixture in nonCommitments {
+        assert(!isCommitment(fixture), "false commitment: \(fixture)")
+    }
 
     // Rule 2: DMs and group DMs.
     assert(addressing(facts("can you check this", .im), identity: me) == [.directMessage])

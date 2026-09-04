@@ -74,6 +74,7 @@ struct SerenoApp: App {
         let store = Store(source: LiveMessageSource())
         _store = State(initialValue: store)
         Notify.start(store)
+        Chime.start(store)
     }
 
     var body: some Scene {
@@ -795,6 +796,22 @@ private struct NotificationsPane: View {
             }
 
             Section {
+                Picker("Sound", selection: $prefs.chimeSoundName) {
+                    Text("Off").tag("")
+                    ForEach(Chime.availableSounds, id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+                .onChange(of: prefs.chimeSoundName) { _, newValue in
+                    Chime.play(newValue)
+                }
+            } header: {
+                Text("Chime")
+            } footer: {
+                Text("Plays once when a to-do first appears, same batching as above. Never for something you added or undid yourself.")
+            }
+
+            Section {
                 Stepper(value: $prefs.snoozeHours, in: 1...23) {
                     Text("Snooze for \(plural(prefs.snoozeHours, "hour"))")
                 }
@@ -877,14 +894,35 @@ private struct AppearancePane: View {
 @MainActor
 private struct AboutPane: View {
     let store: Store
+    @Bindable private var prefs = Preferences.shared
     @Environment(\.openWindow) private var openWindow
     @State private var confirmingReset = false
+    @State private var captureDeleted = false
 
     var body: some View {
         Pane {
             Section("Keyboard shortcuts") {
                 LabeledContent("Open the panel from anywhere", value: "⌘⇧T")
                 LabeledContent("Open Sereno in its own window", value: "⌘⇧O")
+            }
+
+            Section {
+                Toggle("Capture triage cases for debugging", isOn: $prefs.debugCaptureEnabled)
+                    .onChange(of: prefs.debugCaptureEnabled) { captureDeleted = false }
+                HStack {
+                    Button("Delete captured data", role: .destructive, action: deleteCapture)
+                        .pointerCursor()
+                    Spacer()
+                    Text(captureStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Debug capture")
+            } footer: {
+                // Not softened and not a tooltip, per this app's rule that a network- or
+                // disk-write disclosure has to be said plainly, the same as ModelPane's.
+                Text("When on, every conversation Sereno triages — its Slack messages and the to-do it produced — is written unencrypted, in plain text, to ~/Library/Application Support/Sereno/debug-captures.jsonl on this Mac, so a real failure can be replayed later instead of guessed at. Nothing here is ever uploaded, this only ever writes to that one file. Off by default. Delete removes the file immediately.")
             }
 
             Section {
@@ -895,7 +933,7 @@ private struct AboutPane: View {
             } header: {
                 Text("Reset")
             } footer: {
-                Text("Showing onboarding again costs nothing, it only reopens the first-run window. Resetting is the other thing entirely, so it asks first.")
+                Text("Showing onboarding again costs nothing, it only reopens the first-run window. Resetting is the other thing entirely, so it asks first, and it also deletes any captured debug data.")
             }
         }
         .confirmationDialog("Reset Sereno?", isPresented: $confirmingReset) {
@@ -904,6 +942,17 @@ private struct AboutPane: View {
         } message: {
             Text("Every to-do Sereno has collected is deleted, every setting goes back to its default, and the Slack token and any remote model API key are removed from your Keychain. Nothing in Slack itself changes. This cannot be undone.")
         }
+    }
+
+    private var captureStatus: String {
+        if captureDeleted { return "Deleted." }
+        guard let bytes = store.debugCaptureFileSizeBytes else { return "Nothing captured yet." }
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    private func deleteCapture() {
+        store.deleteDebugCapture()
+        captureDeleted = true
     }
 
     /// Clearing the flag is not enough on its own. Nothing watches it after launch, and a
@@ -1324,6 +1373,124 @@ enum Notify {
         granted = allowed
         return allowed
     }
+}
+
+/// Plays a short system sound when a to-do is genuinely new. Configurable in the
+/// Notifications pane; empty `Preferences.chimeSoundName` means off.
+///
+/// Deliberately its own tracker, not folded into Notify's `known`: `known` there is
+/// recomputed from the CURRENT list on every change, so it forgets an id the moment the
+/// item leaves `store.todos` -- harmless for a banner (a re-arriving id looks like a fresh
+/// item, which is a mild annoyance, not a bug the banner cares about), but wrong for a
+/// chime tied to "genuinely new": an Undo restoring a just-removed item would look
+/// identical to a brand-new one and chime again. `everSeen` below only ever grows, so an
+/// id stays "not new" forever once observed, even across a Remove/Undo round trip.
+@MainActor
+enum Chime {
+    /// True when `new` holds a non-manual, non-done to-do whose id appears nowhere in
+    /// `old`. Manual is excluded because the user is looking right at what they just
+    /// typed; done is excluded because a reply-detected item finishing in the background
+    /// is not something newly owed. Pure -- no NSSound, no static state -- so it is
+    /// testable without audio. `old` is meant to be every to-do ever observed for this
+    /// store (see `everSeen`/`sync` below), not merely the last snapshot: that distinction
+    /// is what keeps an Undo restore silent even though the item briefly left the live list.
+    static func newTodoAppeared(old: [TodoItem], new: [TodoItem]) -> Bool {
+        let seenIDs = Set(old.map(\.id))
+        return new.contains { !$0.isManual && !$0.done && !seenIDs.contains($0.id) }
+    }
+
+    /// Every to-do ever observed for this store. Only ever grows, see header comment.
+    private static var everSeen: [TodoItem] = []
+
+    static func start(_ store: Store) {
+        everSeen = store.todos
+        observe(store)
+    }
+
+    private static func observe(_ store: Store) {
+        withObservationTracking {
+            _ = store.todos
+        } onChange: {
+            Task { @MainActor in
+                sync(store.todos)
+                observe(store)
+            }
+        }
+    }
+
+    private static func sync(_ items: [TodoItem]) {
+        if newTodoAppeared(old: everSeen, new: items) {
+            play(Preferences.shared.chimeSoundName)
+        }
+        // Union, never replace, so a Remove can never make an id look new again on Undo.
+        let knownIDs = Set(everSeen.map(\.id))
+        everSeen.append(contentsOf: items.filter { !knownIDs.contains($0.id) })
+    }
+
+    /// System sounds macOS ships, enumerated so the picker matches what this machine
+    /// actually has; the fixed list is only a fallback if the directory cannot be read.
+    static var availableSounds: [String] {
+        let fallback = ["Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero", "Morse",
+                         "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink"]
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: "/System/Library/Sounds") else {
+            return fallback
+        }
+        let found = names.filter { $0.hasSuffix(".aiff") }
+            .map { ($0 as NSString).deletingPathExtension }
+            .sorted()
+        return found.isEmpty ? fallback : found
+    }
+
+    /// Plays `name` once, or nothing for "" (off) or a name NSSound cannot find. Used both
+    /// for the real chime and the Settings picker's preview, so the preview is honest about
+    /// what the user is actually choosing.
+    static func play(_ name: String) {
+        guard !name.isEmpty else { return }
+        NSSound(named: name)?.play()
+    }
+}
+
+/// The pure decision behind Chime: whether a to-do refresh should make a sound, and that
+/// it never double-counts a batch. No NSSound here, everSeen bookkeeping in App is what
+/// wires this into the live store; this only exercises the rule itself.
+@MainActor
+func demoChime() {
+    func todo(_ id: String, manual: Bool = false, done: Bool = false) -> TodoItem {
+        TodoItem(id: id, action: "Reply", priority: 3, reason: "", sender: "Sender", channel: nil,
+                 date: Date(), permalink: nil, done: done, isManual: manual)
+    }
+
+    let loaded = [todo("a"), todo("b")]
+
+    // App launch loading state.json: old and new are the same list, nothing to chime about.
+    assert(!Chime.newTodoAppeared(old: loaded, new: loaded), "loading existing todos must not chime")
+
+    // Refresh re-triaging a conversation: same id, fields rewritten, still not new.
+    var updated = loaded[0]
+    updated.action = "Reply urgently"
+    assert(!Chime.newTodoAppeared(old: loaded, new: [updated, loaded[1]]),
+           "a merged update to an existing row must not chime")
+
+    // Remove then Undo: the live list briefly drops "a", but the caller's `old` (the
+    // running union in Chime.sync) never does, so neither step chimes.
+    let duringRemoval = [loaded[1]]
+    assert(!Chime.newTodoAppeared(old: loaded, new: duringRemoval), "a Remove itself must not chime")
+    assert(!Chime.newTodoAppeared(old: loaded, new: loaded), "Undo restoring it must not chime either")
+
+    // Manual add: the user typed it and is looking right at it.
+    assert(!Chime.newTodoAppeared(old: loaded, new: loaded + [todo("m", manual: true)]),
+           "a manual task must not chime")
+
+    // An item that arrives already done (reply detected in the background) is not newly owed.
+    assert(!Chime.newTodoAppeared(old: loaded, new: loaded + [todo("d", done: true)]),
+           "an item arriving already done must not chime")
+
+    // A genuine batch of five: this only answers yes/no, so the caller (Chime.sync) plays
+    // exactly one sound no matter how many arrived, same as Notify.batch.
+    let five = (0..<5).map { todo("new\($0)") }
+    assert(Chime.newTodoAppeared(old: loaded, new: loaded + five), "five genuinely new todos must chime")
+
+    print("demoChime: PASS")
 }
 
 /// Checks the one rule that matters here: a refresh is one notification, or none.

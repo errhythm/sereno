@@ -83,6 +83,16 @@ final class Store {
     /// shows the current reason (the framework can flip this at any time).
     var unavailableReason: String? { Triage.unavailableReason() }
 
+    private var debugCaptureURL: URL { Self.debugCaptureFileURL(stateFileURL: fileURL) }
+
+    /// Bytes on disk, or nil when nothing has been captured (including when the feature
+    /// is off, since then the file was never created). For the Settings row.
+    var debugCaptureFileSizeBytes: Int? { DebugCapture.fileSizeBytes(at: debugCaptureURL) }
+
+    /// The Settings "delete what has been captured" button, and part of resetAll()'s
+    /// cleanup below. Safe to call whether or not anything was ever captured.
+    func deleteDebugCapture() { DebugCapture.delete(at: debugCaptureURL) }
+
     private struct State: Codable {
         var schemaVersion: Int
         var todos: [TodoItem]
@@ -129,6 +139,14 @@ final class Store {
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
         return base.appendingPathComponent("Sereno", isDirectory: true)
+    }
+
+    /// Debug capture's own file, a sibling of state.json rather than inside it, so it can
+    /// be deleted (Settings' button, or a reset) without touching the todo list. Pure and
+    /// derived from the state file's own directory, so a demo pointed at a throwaway
+    /// state.json path gets a throwaway debug path for free, and never the real one.
+    nonisolated static func debugCaptureFileURL(stateFileURL: URL) -> URL {
+        stateFileURL.deletingLastPathComponent().appendingPathComponent(DebugCapture.fileName())
     }
 
     // fileURL override lets tests point at a throwaway path instead of the real
@@ -318,6 +336,7 @@ final class Store {
                     date: item.date,
                     permalink: current.permalink,
                     conversationID: current.conversationID,
+                    isCommitment: current.isCommitment || item.isCommitment,
                     done: false,
                     userPriority: nil,
                     snoozedUntil: nil,
@@ -341,7 +360,8 @@ final class Store {
     }
 
     /// Drops conversations whose only non-context reasons for consideration were explicitly
-    /// switched off by the user, per `Set<Addressing>.deservesTask`.
+    /// switched off by the user, per `Set<Addressing>.deservesTask`. Commitments carry an
+    /// empty addressing set by design: they are authored by the user, not aimed at them.
     ///
     /// Deliberately conversation-level, not message-level: Triage judges the exchange as a
     /// whole, so a conversation survives as soon as ONE non-context message deserves a task.
@@ -473,6 +493,15 @@ final class Store {
             log.info("already-accounted filter dropped conversations=\(Set(addressed.map(Self.conversationKey)).count - Set(unaccounted.map(Self.conversationKey)).count, privacy: .public)")
             let newItems = try await Triage.items(from: unaccounted)
             guard refreshGeneration == resetGeneration else { return }
+            // Default OFF: a user who never opens Settings must never have a byte of
+            // message text written. Only the exact input Triage received and the to-dos
+            // it produced go to disk, never the wider `messages` or the merged `todos`.
+            if Preferences.shared.debugCaptureEnabled {
+                DebugCapture.append(
+                    DebugCapture.records(messages: unaccounted, todos: newItems),
+                    to: debugCaptureURL
+                )
+            }
             todos = Self.merged(existing: todos, new: newItems)
             log.info("refresh scanned messages=\(messages.count, privacy: .public) newItems=\(newItems.count, privacy: .public) fallbacks=\(newItems.filter { $0.reason.hasPrefix("Fallback") }.count, privacy: .public)")
         } catch {
@@ -507,7 +536,11 @@ final class Store {
             let repliedIDs = try await source.repliedIDs(among: openIDs)
             guard refreshGeneration == resetGeneration else { return }
             for index in todos.indices where repliedIDs.contains(todos[index].id) {
-                todos[index].done = true
+                // Stamped here rather than in a setter so the history can tell work the
+                // user finished from work that closed itself because they answered in
+                // Slack. Only on the false -> true edge: re-running detection over an
+                // already-done row must not move its completion date forward.
+                todos[index].setDone(true, byReply: true)
             }
         } catch {
             guard refreshGeneration == resetGeneration else { return }
@@ -550,6 +583,7 @@ final class Store {
         lastDoneID = nil
         lastUndoable = nil
         save()
+        deleteDebugCapture()
     }
 
     func remove(_ item: TodoItem) {
@@ -583,7 +617,7 @@ final class Store {
 
     func toggleDone(_ item: TodoItem) {
         guard let index = todos.firstIndex(where: { $0.id == item.id }) else { return }
-        todos[index].done.toggle()
+        todos[index].setDone(!todos[index].done)
         save()
     }
 
@@ -598,7 +632,7 @@ final class Store {
     /// of scope; this covers only the action the user just took and can see.
     func markDone(_ item: TodoItem) {
         guard let index = todos.firstIndex(where: { $0.id == item.id }) else { return }
-        todos[index].done = true
+        todos[index].setDone(true)
         lastDoneID = item.id
         lastUndoable = .markedDone
         lastRemoved = nil
@@ -613,7 +647,7 @@ final class Store {
             undoRemove()
         case .markedDone:
             if let lastDoneID, let index = todos.firstIndex(where: { $0.id == lastDoneID }) {
-                todos[index].done = false
+                todos[index].setDone(false)
                 save()
             }
             lastDoneID = nil
@@ -700,10 +734,11 @@ func demoStoreMerge() async {
     let newDate = oldDate.addingTimeInterval(60)
     func todo(_ id: String, action: String, priority: Int, reason: String, date: Date = oldDate,
               detail: String = "detail", links: [URL] = [], done: Bool = false,
-              userPriority: Int? = nil, snoozedUntil: Date? = nil, isManual: Bool = false) -> TodoItem {
+              userPriority: Int? = nil, snoozedUntil: Date? = nil, isManual: Bool = false,
+              isCommitment: Bool = false) -> TodoItem {
         TodoItem(id: id, action: action, priority: priority, reason: reason, detail: detail,
                  links: links, sender: "sender", channel: nil, date: date, permalink: nil,
-                 conversationID: "conversation", done: done, userPriority: userPriority,
+                 conversationID: "conversation", isCommitment: isCommitment, done: done, userPriority: userPriority,
                  snoozedUntil: snoozedUntil, isManual: isManual)
     }
 
@@ -717,6 +752,17 @@ func demoStoreMerge() async {
            reopened.reason == followUp.reason && reopened.detail == followUp.detail &&
            reopened.date == followUp.date && !reopened.done && reopened.userPriority == nil &&
            reopened.snoozedUntil == nil)
+
+    let existingPromise = todo("paul", action: "Send report", priority: 2,
+                               reason: "Promised.", date: newDate, isCommitment: true)
+    let transformedPromise = Store.merged(existing: [before], new: [existingPromise])[0]
+    assert(transformedPromise.isCommitment && !transformedPromise.supportsReplyDetection,
+           "a promise merged into an inbound task must become user-completed only")
+    let afterPromise = todo("paul", action: "Review follow-up", priority: 1,
+                            reason: "New reply.", date: newDate.addingTimeInterval(60))
+    let stillPromised = Store.merged(existing: [transformedPromise], new: [afterPromise])[0]
+    assert(stillPromised.isCommitment && !stillPromised.supportsReplyDetection,
+           "later Slack activity must not make a promise auto-completable")
     print("follow-up before: action=\(before.action), priority=\(before.priority), done=\(before.done), userPriority=\(String(describing: before.userPriority))")
     print("follow-up after: action=\(reopened.action), priority=\(reopened.priority), done=\(reopened.done), userPriority=\(String(describing: reopened.userPriority)), snoozedUntil=\(String(describing: reopened.snoozedUntil))")
 
@@ -901,9 +947,11 @@ func demoStoreMerge() async {
 func demoAddressingFilter() {
     let now = Date(timeIntervalSinceReferenceDate: 0)
     func message(_ id: String, conversation: String = "", _ addressing: Set<Addressing>,
-                 offset: TimeInterval = 0, isContext: Bool = false) -> SlackMessage {
+                 offset: TimeInterval = 0, isContext: Bool = false,
+                 isCommitment: Bool = false) -> SlackMessage {
         SlackMessage(id: id, conversationID: conversation, sender: "sender", channel: "#channel",
-                     text: "text", isContext: isContext, date: now.addingTimeInterval(offset),
+                     text: "text", isContext: isContext, isFromUser: isCommitment,
+                     isCommitment: isCommitment, date: now.addingTimeInterval(offset),
                      directlyAddressed: false, addressing: addressing, permalink: nil)
     }
     func kept(_ messages: [SlackMessage], ignoring ignored: Set<Addressing> = []) -> [String] {
@@ -917,6 +965,9 @@ func demoAddressingFilter() {
     // Empty means "nothing explicit points at me", not "not mine". "Team, please complete
     // the deployment doc" has no signal at all and must reach the model.
     assert(kept([message("unaddressed", [])]) == ["unaddressed"])
+    assert(kept([message("commitment", [], isCommitment: true)],
+                ignoring: Set(Addressing.allCases)) == ["commitment"],
+           "a promise is not an addressing preference and cannot be switched off")
 
     // A source that never populates addressing at all still gets everything through,
     // which is the safe direction: a silently empty list is the worst failure here.

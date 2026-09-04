@@ -36,6 +36,8 @@ final class Preferences {
         modelProvider = RemoteModelProvider(rawValue: store.string(forKey: Key.modelProvider) ?? "") ?? .onDevice
         remoteModelID = store.string(forKey: Key.remoteModelID) ?? ""
         customBaseURLString = store.string(forKey: Key.customBaseURLString) ?? ""
+        chimeSoundName = store.string(forKey: Key.chimeSoundName) ?? "Tink"
+        debugCaptureEnabled = store.object(forKey: Key.debugCaptureEnabled) as? Bool ?? false
     }
 
     /// What the user does, in their own words. Passed to the model so it can judge whether
@@ -159,6 +161,21 @@ final class Preferences {
     /// fixed constant, not a preference. Empty and unread while `.custom` is not selected.
     var customBaseURLString: String { didSet { store.set(customBaseURLString, forKey: Key.customBaseURLString) } }
 
+    /// The system sound (see Chime in App.swift) played when a to-do is genuinely new.
+    /// Empty string means off. A plain string preference like `remoteModelID`, not the
+    /// explicit-setter shape `refreshMinutes` uses: there is nothing to clamp, any name
+    /// that fails `NSSound(named:)` just plays nothing (Chime.play already guards that).
+    /// Defaults to "Tink", the shortest, least attention-grabbing sound macOS ships --
+    /// notification-adjacent, not alarm-adjacent.
+    var chimeSoundName: String { didSet { store.set(chimeSoundName, forKey: Key.chimeSoundName) } }
+
+    /// Off by default: a user who never opens Settings must never have a byte of Slack
+    /// message text written to disk. When on, Store writes each triaged conversation's
+    /// messages and resulting to-do to a JSON Lines file under Application Support, in
+    /// plain text, for replay — see DebugCapture.swift. Never uploaded, no network code
+    /// touches it. Settings states this plainly in its footer, not a tooltip.
+    var debugCaptureEnabled: Bool { didSet { store.set(debugCaptureEnabled, forKey: Key.debugCaptureEnabled) } }
+
     /// Addressing signals the user has switched off. Detection still records every signal,
     /// this only decides which ones are allowed to create a task.
     var ignoredSignals: Set<Addressing> {
@@ -191,6 +208,8 @@ final class Preferences {
         modelProvider = .onDevice
         remoteModelID = ""
         customBaseURLString = ""
+        chimeSoundName = "Tink"
+        debugCaptureEnabled = false
         // The assignments above run didSet and write defaults back, so this second sweep
         // is what leaves the UserDefaults domain clean after a reset. The API key is not
         // touched here: it lives in the Keychain, not UserDefaults, and RemoteModelKeychain
@@ -218,12 +237,15 @@ final class Preferences {
         static let modelProvider = "modelProvider"
         static let remoteModelID = "remoteModelID"
         static let customBaseURLString = "customBaseURLString"
+        static let chimeSoundName = "chimeSoundName"
+        static let debugCaptureEnabled = "debugCaptureEnabled"
 
         static let all = [
             role, refreshMinutes, notifyNewItems, notifySnoozeWake, countBroadcast,
             countNameMentions, snoozeHours, morningHour, windowAlwaysOnTop, weatherEnabled,
             weatherCity, weatherLatitude, weatherLongitude, roleHintDismissed, hasCompletedOnboarding,
-            popoverHeight, modelProvider, remoteModelID, customBaseURLString
+            popoverHeight, modelProvider, remoteModelID, customBaseURLString, chimeSoundName,
+            debugCaptureEnabled
         ]
     }
 }
@@ -247,6 +269,8 @@ func demoPreferences() {
     assert(prefs.modelProvider == .onDevice, "a user who never opens Settings must stay on-device")
     assert(prefs.remoteModelID.isEmpty)
     assert(prefs.customBaseURLString.isEmpty)
+    assert(prefs.chimeSoundName == "Tink", "default chime must be a quiet, unobtrusive sound, not off")
+    assert(!prefs.debugCaptureEnabled, "a user who never opens Settings must never write message text to disk")
 
     // Clamping, so a bad value cannot wedge the refresh timer.
     prefs.refreshMinutes = 0
@@ -276,6 +300,18 @@ func demoPreferences() {
     prefs.modelProvider = .custom
     prefs.customBaseURLString = "http://localhost:1234/v1/chat/completions"
     assert(Preferences(store: suite).customBaseURLString == "http://localhost:1234/v1/chat/completions")
+
+    // The chime choice round-trips, and "off" is a real, persisted choice, not just the
+    // absence of a value.
+    prefs.chimeSoundName = "Glass"
+    assert(Preferences(store: suite).chimeSoundName == "Glass")
+    prefs.chimeSoundName = ""
+    assert(Preferences(store: suite).chimeSoundName.isEmpty, "off must persist as off, not fall back to a sound")
+
+    prefs.debugCaptureEnabled = true
+    assert(Preferences(store: suite).debugCaptureEnabled, "the opt-in must persist")
+    prefs.debugCaptureEnabled = false
+
     // An old UserDefaults domain with no modelProvider key must default to on-device, not
     // decode a garbage rawValue into some arbitrary case.
     suite.removeObject(forKey: "modelProvider")
@@ -309,6 +345,7 @@ func demoPreferences() {
     prefs.snoozeHours = 99
     prefs.morningHour = 30
     prefs.popoverHeight = 500
+    prefs.debugCaptureEnabled = true
     prefs.resetAll()
     assert(prefs.role.isEmpty && prefs.refreshMinutes == 5 && prefs.notifyNewItems && prefs.notifySnoozeWake)
     assert(!prefs.countBroadcast && prefs.countNameMentions && prefs.snoozeHours == 3 && prefs.morningHour == 9)
@@ -318,6 +355,8 @@ func demoPreferences() {
     assert(prefs.popoverHeight == nil)
     assert(prefs.modelProvider == .onDevice && prefs.remoteModelID.isEmpty && prefs.customBaseURLString.isEmpty,
            "reset must fall back to on-device, never leave a remote provider selected")
+    assert(prefs.chimeSoundName == "Tink", "reset must fall back to the default chime, never leave it off")
+    assert(!prefs.debugCaptureEnabled, "reset must turn debug capture back off")
     let reset = Preferences(store: suite)
     assert(reset.role.isEmpty && reset.refreshMinutes == 5 && reset.notifyNewItems && reset.notifySnoozeWake)
     assert(!reset.countBroadcast && reset.countNameMentions && reset.snoozeHours == 3 && reset.morningHour == 9)
@@ -326,6 +365,8 @@ func demoPreferences() {
     assert(!reset.hasCompletedOnboarding && reset.ignoredSignals == [.broadcast])
     assert(reset.popoverHeight == nil)
     assert(reset.modelProvider == .onDevice && reset.remoteModelID.isEmpty && reset.customBaseURLString.isEmpty)
+    assert(reset.chimeSoundName == "Tink")
+    assert(!reset.debugCaptureEnabled)
 
     print("demoPreferences: PASS")
 }
