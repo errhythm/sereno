@@ -640,6 +640,24 @@ final class Store {
         save()
     }
 
+    /// Pull a finished row back into the list, from the History window.
+    ///
+    /// Separate from `undoLast`'s reopen on purpose, because the two mean different things.
+    /// Undo reverses a Done the user pressed seconds ago and leaves detection alone. This is
+    /// the user overruling the app days later, so it also stops reply detection touching the
+    /// row: the conversation is still settled in Slack, and without the flag the very next
+    /// refresh would close it again and look like the reopen simply did not work.
+    ///
+    /// A genuinely new message in that conversation resets it, because `Store.merged` builds
+    /// a fresh row on a follow-up, which is the behaviour we want and costs nothing here.
+    func reopen(_ item: TodoItem) {
+        guard let index = todos.firstIndex(where: { $0.id == item.id }), todos[index].done else { return }
+        todos[index].setDone(false)
+        todos[index].reopenedByUser = true
+        log.info("reopened a completed item id=\(item.id, privacy: .public)")
+        save()
+    }
+
     /// Reverses whatever the undo bar is currently offering, then disarms it.
     func undoLast() {
         switch lastUndoable {

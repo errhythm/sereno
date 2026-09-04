@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Charts
 import Carbon.HIToolbox
 import Observation
 import UserNotifications
@@ -28,6 +29,11 @@ let serenoWindowID = "sereno-panel"
 /// the panel is a popover most of the time and a popover that closes when the browser
 /// takes focus would drop the user halfway through signing in.
 let onboardingWindowID = "sereno-onboarding"
+
+/// The completion-history scene id. Its own window for the same reason onboarding has one:
+/// a chart inside a 360pt popover that closes on focus loss is not something anyone can
+/// read, and this is the one view in the app people will want to sit and look at.
+let historyWindowID = "sereno-history"
 
 /// The wordmark's font, shipped in the app rather than assumed to be installed.
 ///
@@ -124,9 +130,243 @@ struct SerenoApp: App {
         .windowResizability(.contentSize)
         .defaultPosition(.center)
 
+        // Completed work. An ordinary titled window, resizable, unlike the panel: a chart
+        // is something people widen, and its own scene keeps it out of the popover, which
+        // closes the moment focus moves.
+        Window("History", id: historyWindowID) {
+            HistoryPane(store: store)
+                .windowFullScreenBehavior(.disabled)
+        }
+        .defaultSize(width: 620, height: 460)
+        .defaultPosition(.center)
+
         // A real Preferences window, and Cmd+, comes with it.
         Settings {
             SettingsView(store: store)
+        }
+    }
+}
+
+/// Completed work, day by day. Reads the same `store.todos` the list reads, through
+/// `CompletionStats`, so a figure here can never disagree with the rows: there is no second
+/// store to fall out of step.
+///
+/// Every number is derived on demand rather than accumulated, which is what makes the
+/// honesty below possible — a to-do completed before `completedAt` existed carries no date,
+/// and is COUNTED SEPARATELY rather than dated by guesswork or silently dropped. A history
+/// that quietly omits work reads as a week where nothing happened.
+private struct HistoryPane: View {
+    let store: Store
+    /// Which rows are showing their original message. Ids, not indexes, so the set survives
+    /// the list reordering under it when something is reopened.
+    @State private var expanded: Set<String> = []
+
+    /// Recomputed on each body pass, deliberately: the list is dozens of items, not
+    /// thousands, and caching it would be a second source of truth for no measurable gain.
+    private var stats: CompletionStats {
+        CompletionStats.from(store.todos, now: Date())
+    }
+
+    var body: some View {
+        let stats = stats
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if stats.total == 0 {
+                    empty(stats)
+                } else {
+                    tiles(stats)
+                    chart(stats)
+                    bands(stats)
+                }
+                completedList()
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(minWidth: 460, minHeight: 380)
+    }
+
+    private func empty(_ stats: CompletionStats) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Nothing completed yet")
+                .font(.headline)
+            Text("Sereno started recording completion dates in this version, so this fills in from here. Finish something and it shows up the same day.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func tiles(_ stats: CompletionStats) -> some View {
+        HStack(alignment: .top, spacing: 22) {
+            tile("\(stats.today)", "today")
+            tile("\(stats.last7)", "last 7 days")
+            tile("\(stats.total)", "all time")
+            tile(stats.streak > 0 ? "\(stats.streak)" : "—",
+                 stats.streak == 1 ? "day streak" : "day streak")
+            if let hours = stats.medianHoursToClose {
+                tile(CompletionStats.closeTimeLabel(hours), "typical time to close")
+            }
+        }
+    }
+
+    private func tile(_ value: String, _ label: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value).font(.system(size: 26, weight: .semibold)).monospacedDigit()
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// One bar per day, split by who closed it. Bars rather than a line: a completion count
+    /// belongs to a whole day, and a line between days would imply values at times nobody
+    /// finished anything.
+    private func chart(_ stats: CompletionStats) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Completed per day").font(.subheadline).foregroundStyle(.secondary)
+            Chart {
+                ForEach(stats.days) { day in
+                    BarMark(x: .value("Day", day.date, unit: .day),
+                            y: .value("Closed", day.byHand))
+                        .foregroundStyle(by: .value("How", "by you"))
+                    BarMark(x: .value("Day", day.date, unit: .day),
+                            y: .value("Closed", day.byReply))
+                        .foregroundStyle(by: .value("How", "you replied in Slack"))
+                }
+            }
+            .chartForegroundStyleScale([
+                "by you": Brand.deepGreen,
+                "you replied in Slack": Brand.link,
+            ])
+            // Every fifth day: a 30-bar axis labelled daily is unreadable at this width.
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .day, count: 5)) { _ in
+                    AxisGridLine()
+                    AxisTick()
+                    AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                }
+            }
+            .chartYAxis { AxisMarks(position: .leading) }
+            .frame(height: 190)
+        }
+    }
+
+    private func bands(_ stats: CompletionStats) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("By urgency when you closed it")
+                .font(.subheadline).foregroundStyle(.secondary)
+            HStack(spacing: 22) {
+                ForEach(Band.allCases, id: \.self) { band in
+                    let count = stats.byPriority
+                        .filter { band.contains($0.key) }
+                        .values.reduce(0, +)
+                    HStack(spacing: 6) {
+                        Circle().fill(band.color).frame(width: 7, height: 7)
+                        Text("\(count)").monospacedDigit()
+                        Text(band.title.lowercased()).foregroundStyle(.secondary)
+                    }
+                    .font(.callout)
+                }
+            }
+        }
+    }
+
+    /// The finished work itself, grouped by the day it was finished. A count tells you the
+    /// week was busy; this tells you what the week was.
+    @ViewBuilder private func completedList() -> some View {
+        let groups = CompletionStats.completedGroups(store.todos)
+        let undated = CompletionStats.undatedCompleted(store.todos)
+        if !groups.isEmpty || !undated.isEmpty {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Completed").font(.subheadline).foregroundStyle(.secondary)
+                ForEach(groups) { group in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(dayHeading(group.day))
+                            .font(.caption).foregroundStyle(.tertiary)
+                        ForEach(group.items) { item in row(item, at: item.completedAt) }
+                    }
+                }
+                if !undated.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Before Sereno recorded dates")
+                            .font(.caption).foregroundStyle(.tertiary)
+                        ForEach(undated) { item in row(item, at: nil) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// "Today" and "Yesterday" rather than a date for the two headings a person reads most,
+    /// since those are the ones they are checking against their own memory of the day.
+    private func dayHeading(_ day: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(day) { return "Today" }
+        if calendar.isDateInYesterday(day) { return "Yesterday" }
+        return day.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
+    }
+
+    /// One finished item. Clickable straight through to the Slack message when there is one,
+    /// which is the whole product rule: Sereno puts you one click from the conversation and
+    /// never tries to be the conversation.
+    private func row(_ item: TodoItem, at completed: Date?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            rowLine(item, at: completed)
+            if expanded.contains(item.id), !item.detail.isEmpty {
+                // The message as it was sent, verbatim. This is what a person is actually
+                // asking when they click a finished row: what was this?
+                Text(item.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 20)
+            }
+        }
+    }
+
+    private func rowLine(_ item: TodoItem, at completed: Date?) -> some View {
+        // Clicking READS, it does not navigate. The main list opens Slack on a row tap
+        // because that list exists to get you to the message; this one exists to be looked
+        // at, everything in it is already dealt with, and an accidental jump out of a review
+        // into Slack is a context switch nobody asked for. Slack is still one right-click
+        // away, which is the right weight for a rare action.
+        Button {
+            withAnimation(.snappy(duration: 0.18)) {
+                if expanded.contains(item.id) { expanded.remove(item.id) } else { expanded.insert(item.id) }
+            }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: item.completedByReply ? "arrowshape.turn.up.left" : "checkmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(item.completedByReply ? Brand.link : Brand.deepGreen)
+                    .help(item.completedByReply
+                          ? "Closed because you replied in Slack"
+                          : "You marked this done")
+                    .frame(width: 12)
+                Text(item.action).lineLimit(1)
+                Text(item.isManual ? "You" : item.sender)
+                    .foregroundStyle(.secondary)
+                if let channel = item.channel {
+                    Text(channel).foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 8)
+                if let completed {
+                    Text(completed.formatted(date: .omitted, time: .shortened))
+                        .foregroundStyle(.tertiary).monospacedDigit()
+                }
+            }
+            .font(.callout)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+        // A context menu rather than a visible button per row: reopening is the rare case,
+        // and a list of finished work should read as a record, not as a control panel.
+        .contextMenu {
+            Button("Reopen") { store.reopen(item) }
+            if let url = item.permalink {
+                Button("Open in Slack") { NSWorkspace.shared.open(url) }
+            }
         }
     }
 }
@@ -261,12 +501,55 @@ enum Foreground {
     /// most room there could be. Off by the window's chrome, since it bounds a content
     /// height with a window measurement; that is a point or two of slack in a clamp, not a
     /// size anything is set to.
+    /// Where the panel's TOP edge belongs: under the status item, where the popover was
+    /// first put. Captured once per presentation, because it is the one thing about the
+    /// window's geometry that must not move.
+    ///
+    /// An AppKit window's origin is its BOTTOM-left, so making it taller extends it UPWARD.
+    /// That is the whole of the reported bug: the framework grows the window from the
+    /// content, nothing moves the origin down to compensate, and the header climbs off the
+    /// top of the screen out of reach. Measured from the field: window= tracked request=
+    /// exactly (480, 482, 483…) while the panel's header disappeared above the menu bar.
+    private static var popoverTopAnchor: CGFloat?
+
+    /// Room BELOW the anchor, not below the window's current top. Using `frame.maxY` here
+    /// was a feedback loop: every upward drift raised maxY, which raised the room, which
+    /// permitted more height, which drifted further. The field log shows room=1037 on a
+    /// screen whose usable height is exactly that, so the clamp had stopped clamping.
     static func popoverRoom() -> CGFloat {
         guard let window = popover,
               let visible = (window.screen ?? NSScreen.main)?.visibleFrame
         else { return NSScreen.main?.visibleFrame.height ?? 0 }
-        return window.frame.maxY - visible.minY
+        return (popoverTopAnchor ?? window.frame.maxY) - visible.minY
     }
+
+    /// Hold the top edge still while the framework changes the height underneath us.
+    ///
+    /// `setFrameOrigin`, never `setFrame`: the size belongs to MenuBarExtra, which was
+    /// measured re-asserting it within one event when we tried to own it. The POSITION is
+    /// not contested, so moving the window is the one lever that sticks. Called from the
+    /// same window reader that reports the height, which already runs on every content
+    /// change.
+    static func pinPopoverTop(_ window: NSWindow?) {
+        guard let window, window.isVisible else { return }
+        guard let anchor = popoverTopAnchor else {
+            popoverTopAnchor = window.frame.maxY
+            return
+        }
+        // A point of slack: setFrameOrigin triggers another layout pass, and an exact
+        // comparison here would ping-pong on sub-pixel differences.
+        guard abs(window.frame.maxY - anchor) > 1 else { return }
+        window.setFrameOrigin(NSPoint(x: window.frame.origin.x, y: anchor - window.frame.height))
+        popoverLog.info("""
+            popover pinned top=\(anchor, privacy: .public) \
+            height=\(window.frame.height, privacy: .public) \
+            newY=\(anchor - window.frame.height, privacy: .public)
+            """)
+    }
+
+    /// A fresh presentation gets a fresh anchor: MenuBarExtra builds a new window each time
+    /// it opens, and the status item can have moved since.
+    static func forgetPopoverAnchor() { popoverTopAnchor = nil }
 
     /// The smallest the panel may be dragged to: the popover's chrome plus one whole row.
     /// 161 is measured, not chosen — the content's own ideal height at one row under
@@ -287,6 +570,28 @@ enum Foreground {
                                        minimum: popoverMinimumHeight) else { return }
         guard Preferences.shared.popoverHeight != Double(height) else { return }
         Preferences.shared.popoverHeight = Double(height)
+
+        // Move the window to its final frame NOW, in one call, rather than letting SwiftUI
+        // resize it and correcting afterwards.
+        //
+        // Correcting afterwards is what produced the reported flicker: the framework grew
+        // the window upward from its bottom-left origin, that frame was presented, and only
+        // then did the pin drag the top back down — two visible positions per mouse move,
+        // which reads as the panel jumping to the top and snapping back over and over.
+        //
+        // Setting both origin and size together lands on exactly the frame SwiftUI is about
+        // to compute from the same stored height, so its own resize is a no-op and there is
+        // nothing left to correct. This is not a fight over the size: it is agreeing with
+        // the framework one step early. `pinPopoverTop` stays as the safety net for growth
+        // this path does not cause, such as a to-do arriving while the panel is open.
+        if let window = popover, window.isVisible, let anchor = popoverTopAnchor {
+            let frame = NSRect(x: window.frame.origin.x, y: anchor - height,
+                               width: window.frame.width, height: height)
+            if abs(frame.origin.y - window.frame.origin.y) > 0.5
+                || abs(frame.height - window.frame.height) > 0.5 {
+                window.setFrame(frame, display: true)
+            }
+        }
         // .info, not .debug: debug is not persisted on the machine this has to be
         // diagnosed on — eight hours of unified log held zero debug lines. All .public,
         // because every value here is geometry and never message content.
@@ -348,6 +653,11 @@ enum Foreground {
     /// the button just opened.
     static func capture(_ window: NSWindow?) {
         guard let window, window.identifier == nil else { return }
+        // A different window object means MenuBarExtra rebuilt the popover, so the top
+        // anchor belongs to a presentation that is gone. Keeping it would pin the new
+        // popover to where the old one hung, which is wrong the moment the status item
+        // moves or the panel opens on another screen.
+        if popover !== window { forgetPopoverAnchor() }
         popover = window
     }
 
@@ -2138,6 +2448,8 @@ private struct MenuContent: View {
                 // used to fall back to 321 is now expected to follow request=.
                 .background(WindowReader { window in
                     Foreground.capture(window)
+                    // Pin BEFORE logging, so the logged frame is the one the user sees.
+                    Foreground.pinPopoverTop(window)
                     Foreground.logPanelHeight(window, request: panelHeight)
                 })
         }
@@ -2642,6 +2954,15 @@ private struct MenuContent: View {
         HStack {
             Text(updated)
             Spacer()
+            // Same present+openWindow pairing every other window in this file uses: an
+            // LSUIElement app cannot own the foreground, so the window would otherwise
+            // open behind whatever was frontmost.
+            Button("History") {
+                Foreground.present(historyWindowID) { openWindow(id: historyWindowID) }
+            }
+                .buttonStyle(.plain)
+                .pointerCursor()
+                .help("Completed to-dos, day by day")
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .buttonStyle(.plain)
                 .pointerCursor()
@@ -2657,6 +2978,7 @@ private struct MenuContent: View {
             ? "Not scanned yet"
             : "Updated \(store.lastScan.formatted(.relative(presentation: .named)))"
     }
+
 
     /// Six seconds of second thoughts, then the bar goes away on its own. Held as a
     /// task so a second undoable action restarts the window instead of stacking two.

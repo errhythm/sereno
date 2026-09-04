@@ -174,6 +174,16 @@ struct TodoItem: Codable, Identifiable, Sendable, Hashable {
     /// and "twelve resolved because I answered in Slack" are different facts about a week,
     /// and the distinction is free to record here and impossible to recover later.
     var completedByReply: Bool = false
+    /// The user pulled this back out of the completed list, so reply detection must stop
+    /// closing it. Without this the reopen undoes itself: the conversation is still settled
+    /// in Slack, so the very next refresh would mark it done again within minutes and the
+    /// user would be told, silently, that they were wrong. Same principle as `userPriority`
+    /// outranking the model's ranking — a person's explicit judgment beats a derived one.
+    ///
+    /// Deliberately NOT cleared by anything but a genuinely new message: the follow-up path
+    /// in `Store.merged` builds a fresh row, so a real new ask resets this for free and
+    /// automatic detection applies again, which is what should happen.
+    var reopenedByUser: Bool = false
 }
 
 extension TodoItem {
@@ -187,8 +197,10 @@ extension TodoItem {
     }
 
     /// A manual task has no Slack thread, and a commitment cannot be proven complete from
-    /// later Slack activity. Neither may enter automatic reply detection.
-    var supportsReplyDetection: Bool { !isManual && !isCommitment }
+    /// later Slack activity. Neither may enter automatic reply detection, and neither may a
+    /// row the user has explicitly reopened: re-closing it would overrule the person who
+    /// just said it is not finished.
+    var supportsReplyDetection: Bool { !isManual && !isCommitment && !reopenedByUser }
 
     /// The one place `done` changes, so a completion date cannot be forgotten at one of the
     /// four call sites that set it.
@@ -229,6 +241,7 @@ extension TodoItem {
         avatarURL = try c.decodeIfPresent(URL.self, forKey: .avatarURL)
         completedAt = try c.decodeIfPresent(Date.self, forKey: .completedAt)
         completedByReply = try c.decodeIfPresent(Bool.self, forKey: .completedByReply) ?? false
+        reopenedByUser = try c.decodeIfPresent(Bool.self, forKey: .reopenedByUser) ?? false
     }
 }
 
@@ -346,6 +359,48 @@ struct CompletionStats: Sendable, Equatable {
                 : hours[mid]
         }
         return stats
+    }
+
+    /// One day's finished work, for the list under the chart. A count answers "how many",
+    /// which is not the same question as "what did I actually get done", and the second is
+    /// the one people open a history for.
+    struct CompletedDay: Sendable, Identifiable {
+        let day: Date
+        /// Newest completion first, so the most recent thing is at the top of its day.
+        let items: [TodoItem]
+        var id: Date { day }
+    }
+
+    /// Dated completions grouped by day, newest day first. Pure, so the grouping and the
+    /// ordering can be asserted without a window: an off-by-one here would put yesterday's
+    /// work under today's heading, which is the kind of wrong nobody notices immediately.
+    static func completedGroups(_ items: [TodoItem], calendar: Calendar = .current) -> [CompletedDay] {
+        let dated = items.filter { $0.done && $0.completedAt != nil }
+        return Dictionary(grouping: dated) { calendar.startOfDay(for: $0.completedAt!) }
+            .map { day, rows in
+                CompletedDay(day: day, items: rows.sorted {
+                    ($0.completedAt ?? .distantPast, $0.id) > ($1.completedAt ?? .distantPast, $1.id)
+                })
+            }
+            .sorted { $0.day > $1.day }
+    }
+
+    /// Completed before this version recorded dates. Shown, never hidden: a finished to-do
+    /// missing from a list of finished to-dos is a bug to the person reading it, whatever
+    /// the reason.
+    static func undatedCompleted(_ items: [TodoItem]) -> [TodoItem] {
+        items.filter { $0.done && $0.completedAt == nil }
+            .sorted { ($0.date, $0.id) > ($1.date, $1.id) }
+    }
+
+    /// "37.4 hours" is a figure nobody converts in their head, and this one exists to be
+    /// read at a glance. Minutes below an hour, hours up to two days, days after that.
+    /// Here rather than in the view so the boundaries can be asserted: a formatter living
+    /// inside a SwiftUI body is a formatter nothing can test.
+    static func closeTimeLabel(_ hours: Double) -> String {
+        if hours < 1 { return "\(Int((hours * 60).rounded()))m" }
+        if hours < 48 { return "\(Int(hours.rounded()))h" }
+        return "\(Int((hours / 24).rounded()))d"
     }
 
     /// Counted back from today, or from yesterday when today is still empty. A gap of a
@@ -490,6 +545,55 @@ func demoModels() {
     assert(empty.total == 0 && empty.days.isEmpty && empty.streak == 0
            && empty.medianHoursToClose == nil,
            "no dated completions means no history, not a zero-filled month of nothing")
+
+    // The completed LIST, which answers "what did I get done" rather than "how many".
+    let listed = [
+        closed("t1", day(0, hour: 9)), closed("t2", day(0, hour: 16)),
+        closed("y1", day(-1)),
+        closed("undated", nil, done: true),
+        closed("open", nil),
+    ]
+    let groups = CompletionStats.completedGroups(listed, calendar: cal)
+    assert(groups.count == 2, "two days with finished work, got \(groups.count)")
+    assert(groups[0].day > groups[1].day, "newest day first")
+    assert(groups[0].items.map(\.id) == ["t2", "t1"],
+           "within a day the most recent completion leads, got \(groups[0].items.map(\.id))")
+    assert(!groups.flatMap(\.items).contains { $0.id == "open" },
+           "an unfinished row must never appear in a list of finished work")
+    assert(!groups.flatMap(\.items).contains { $0.id == "undated" },
+           "an undated row is not filed under a day it cannot be proven to belong to")
+    assert(CompletionStats.undatedCompleted(listed).map(\.id) == ["undated"],
+           "but it IS listed separately, because hiding finished work reads as a bug")
+
+    // Reopening. The trap here is that the conversation stays settled in Slack, so a
+    // reopened row is still a candidate for reply detection and would be closed again on
+    // the next refresh, telling the user their reopen did not work.
+    var autoClosed = closed("auto", day(-1), byReply: true)
+    assert(autoClosed.supportsReplyDetection,
+           "an ordinary Slack-backed row is detectable while it is open or closed")
+    autoClosed.setDone(false)
+    autoClosed.reopenedByUser = true
+    assert(!autoClosed.done && autoClosed.completedAt == nil && !autoClosed.completedByReply,
+           "reopening clears the completion and how it closed")
+    assert(!autoClosed.supportsReplyDetection,
+           "a reopened row must be invisible to reply detection, or the next refresh undoes the user")
+
+    // Manual tasks and commitments were already excluded, and must stay so.
+    var manual = closed("m", nil); manual.isManual = true
+    var promise = closed("p", nil); promise.isCommitment = true
+    assert(!manual.supportsReplyDetection && !promise.supportsReplyDetection,
+           "the existing exclusions must survive the new one")
+
+    // A pre-reopen state file must still load.
+    assert(!decoded.reopenedByUser, "a row written before reopening existed decodes as not reopened")
+
+    // The label's boundaries, which are the only place it can be wrong.
+    assert(CompletionStats.closeTimeLabel(0.5) == "30m")
+    assert(CompletionStats.closeTimeLabel(0.99) == "59m", "just under an hour stays minutes")
+    assert(CompletionStats.closeTimeLabel(1) == "1h")
+    assert(CompletionStats.closeTimeLabel(47.6) == "48h", "under two days stays hours")
+    assert(CompletionStats.closeTimeLabel(48) == "2d")
+    assert(CompletionStats.closeTimeLabel(168) == "7d")
 
     print("demoModels: PASS \(history.total) closed, streak \(history.streak)")
 }

@@ -993,11 +993,22 @@ enum Triage {
             of: deadlineDay
         )!
 
-        let absoluteDeadlineFixtures: [(text: String, isToday: Bool)] = [
-            ("before 5pm today", true),
-            ("by next Friday", false),
-            ("deploy is at 14:00 today", true),
-        ]
+        // The today-phrases are BUILT from the real clock, not written as literals.
+        //
+        // `statedDeadline` takes an injected `now`, but NSDataDetector resolves "today"
+        // against the SYSTEM clock and offers no way to override that, so the two disagree
+        // whenever they differ. A literal "before 5pm today" therefore passed all morning
+        // and started failing at 17:00, when 5pm became the past and the past-filter
+        // correctly discarded it. A test that depends on the hour it runs at is a test that
+        // will fail on someone else's afternoon.
+        let laterToday = deadlineCalendar.component(.hour, from: Date()) + 2
+        let absoluteDeadlineFixtures: [(text: String, isToday: Bool)] = laterToday < 24
+            ? [("before \(laterToday):00 today", true),
+               ("by next Friday", false),
+               ("deploy is at \(laterToday):00 today", true)]
+            // Within two hours of midnight there is no "later today" left to name, so the
+            // today-cases are skipped rather than asserted against a time already gone.
+            : [("by next Friday", false)]
         for fixture in absoluteDeadlineFixtures {
             let deadline = statedDeadline(
                 in: fixture.text,
