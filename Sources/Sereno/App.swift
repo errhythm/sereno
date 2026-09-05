@@ -176,6 +176,7 @@ private struct HistoryPane: View {
     /// Which rows are showing their original message. Ids, not indexes, so the set survives
     /// the list reordering under it when something is reopened.
     @State private var expanded: Set<String> = []
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Recomputed on each body pass, deliberately: the list is dozens of items, not
     /// thousands, and caching it would be a second source of truth for no measurable gain.
@@ -186,59 +187,110 @@ private struct HistoryPane: View {
     var body: some View {
         let stats = stats
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 20) {
+                paneHeading("History", "A record of what you cleared, and how quickly the list moved.")
                 if stats.total == 0 {
                     empty(stats)
                 } else {
                     tiles(stats)
                     chart(stats)
-                    bands(stats)
                 }
                 completedList()
             }
-            .padding(20)
+            .padding(24)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(minWidth: 460, minHeight: 380)
     }
 
-    private func empty(_ stats: CompletionStats) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Nothing completed yet")
-                .font(.headline)
-            Text("Sereno started recording completion dates in this version, so this fills in from here. Finish something and it shows up the same day.")
+    private func paneHeading(_ title: String, _ subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.title2.weight(.semibold))
+            Text(subtitle)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    private func empty(_ stats: CompletionStats) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 30, weight: .light))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text("Your dated history starts here").font(.headline)
+            Text("Sereno started recording completion dates in this version. New completions will fill the totals above; older completed items remain listed below.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 38)
+        .padding(.horizontal, 24)
+        .background(Brand.surface, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Brand.hairline.opacity(0.65), lineWidth: 1)
         }
     }
 
     private func tiles(_ stats: CompletionStats) -> some View {
-        HStack(alignment: .top, spacing: 22) {
-            tile("\(stats.today)", "today")
-            tile("\(stats.last7)", "last 7 days")
-            tile("\(stats.total)", "all time")
-            tile(stats.streak > 0 ? "\(stats.streak)" : "—",
-                 stats.streak == 1 ? "day streak" : "day streak")
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 116, maximum: 180), spacing: 10)],
+                  alignment: .leading, spacing: 10) {
+            tile("\(stats.today)", "Today", "sun.max")
+            tile("\(stats.last7)", "Last 7 days", "calendar")
+            tile("\(stats.total)", "All time", "checkmark.circle")
+            tile(stats.streak > 0 ? "\(stats.streak)" : "—", "Day streak", "flame")
             if let hours = stats.medianHoursToClose {
-                tile(CompletionStats.closeTimeLabel(hours), "typical time to close")
+                tile(CompletionStats.closeTimeLabel(hours), "Typical close", "clock")
             }
         }
     }
 
-    private func tile(_ value: String, _ label: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(value).font(.system(size: 26, weight: .semibold)).monospacedDigit()
-            Text(label).font(.caption).foregroundStyle(.secondary)
+    private func tile(_ value: String, _ label: String, _ icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Brand.deepGreen)
+                .accessibilityHidden(true)
+            Text(value)
+                .font(.system(size: 24, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, minHeight: 92, alignment: .leading)
+        .padding(14)
+        .background(Brand.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Brand.hairline.opacity(0.55), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     /// One bar per day, split by who closed it. Bars rather than a line: a completion count
     /// belongs to a whole day, and a line between days would imply values at times nobody
     /// finished anything.
     private func chart(_ stats: CompletionStats) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Completed per day").font(.subheadline).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Last 30 days").font(.headline)
+                    Spacer()
+                    legend(Brand.deepGreen, "Marked done")
+                    legend(Brand.link, "Replied in Slack")
+                }
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Last 30 days").font(.headline)
+                    HStack(spacing: 12) {
+                        legend(Brand.deepGreen, "Marked done")
+                        legend(Brand.link, "Replied in Slack")
+                    }
+                }
+            }
             Chart {
                 ForEach(stats.days) { day in
                     BarMark(x: .value("Day", day.date, unit: .day),
@@ -253,6 +305,7 @@ private struct HistoryPane: View {
                 "by you": Brand.deepGreen,
                 "you replied in Slack": Brand.link,
             ])
+            .chartLegend(.hidden)
             // Every fifth day: a 30-bar axis labelled daily is unreadable at this width.
             .chartXAxis {
                 AxisMarks(values: .stride(by: .day, count: 5)) { _ in
@@ -263,24 +316,57 @@ private struct HistoryPane: View {
             }
             .chartYAxis { AxisMarks(position: .leading) }
             .frame(height: 190)
+            bands(stats)
         }
+        .padding(16)
+        .background(Brand.surface, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Brand.hairline.opacity(0.55), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Completions over the last 30 days")
+    }
+
+    private func legend(_ color: Color, _ label: String) -> some View {
+        HStack(spacing: 5) {
+            RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 9, height: 9)
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private func bands(_ stats: CompletionStats) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("By urgency when you closed it")
-                .font(.subheadline).foregroundStyle(.secondary)
-            HStack(spacing: 22) {
-                ForEach(Band.allCases, id: \.self) { band in
-                    let count = stats.byPriority
-                        .filter { band.contains($0.key) }
-                        .values.reduce(0, +)
-                    HStack(spacing: 6) {
-                        Circle().fill(band.color).frame(width: 7, height: 7)
-                        Text("\(count)").monospacedDigit()
-                        Text(band.title.lowercased()).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Urgency at close")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 18) {
+                    ForEach(Band.allCases, id: \.self) { band in
+                        let count = stats.byPriority
+                            .filter { band.contains($0.key) }
+                            .values.reduce(0, +)
+                        HStack(spacing: 6) {
+                            Circle().fill(band.color).frame(width: 7, height: 7)
+                            Text("\(count)").monospacedDigit()
+                            Text(band.title.lowercased()).foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
                     }
-                    .font(.callout)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Band.allCases, id: \.self) { band in
+                        let count = stats.byPriority
+                            .filter { band.contains($0.key) }
+                            .values.reduce(0, +)
+                        HStack(spacing: 6) {
+                            Circle().fill(band.color).frame(width: 7, height: 7)
+                            Text("\(count)").monospacedDigit()
+                            Text(band.title.lowercased()).foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
+                    }
                 }
             }
         }
@@ -292,20 +378,34 @@ private struct HistoryPane: View {
         let groups = CompletionStats.completedGroups(store.todos)
         let undated = CompletionStats.undatedCompleted(store.todos)
         if !groups.isEmpty || !undated.isEmpty {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Completed").font(.subheadline).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Completed").font(.headline)
                 ForEach(groups) { group in
-                    VStack(alignment: .leading, spacing: 5) {
+                    VStack(alignment: .leading, spacing: 0) {
                         Text(dayHeading(group.day))
-                            .font(.caption).foregroundStyle(.tertiary)
+                            .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
                         ForEach(group.items) { item in row(item, at: item.completedAt) }
+                    }
+                    .background(Brand.surface, in: RoundedRectangle(cornerRadius: 10))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Brand.hairline.opacity(0.5), lineWidth: 1)
                     }
                 }
                 if !undated.isEmpty {
-                    VStack(alignment: .leading, spacing: 5) {
+                    VStack(alignment: .leading, spacing: 0) {
                         Text("Before Sereno recorded dates")
-                            .font(.caption).foregroundStyle(.tertiary)
+                            .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
                         ForEach(undated) { item in row(item, at: nil) }
+                    }
+                    .background(Brand.surface, in: RoundedRectangle(cornerRadius: 10))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Brand.hairline.opacity(0.5), lineWidth: 1)
                     }
                 }
             }
@@ -335,9 +435,11 @@ private struct HistoryPane: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 20)
+                    .padding(.horizontal, 34)
+                    .padding(.bottom, 10)
             }
         }
+        .overlay(alignment: .top) { Divider() }
     }
 
     private func rowLine(_ item: TodoItem, at completed: Date?) -> some View {
@@ -347,7 +449,7 @@ private struct HistoryPane: View {
         // into Slack is a context switch nobody asked for. Slack is still one right-click
         // away, which is the right weight for a rare action.
         Button {
-            withAnimation(.snappy(duration: 0.18)) {
+            withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) {
                 if expanded.contains(item.id) { expanded.remove(item.id) } else { expanded.insert(item.id) }
             }
         } label: {
@@ -359,23 +461,39 @@ private struct HistoryPane: View {
                           ? "Closed because you replied in Slack"
                           : "You marked this done")
                     .frame(width: 12)
-                Text(item.action).lineLimit(1)
-                Text(item.isManual ? "You" : item.sender)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.action).lineLimit(2)
+                    HStack(spacing: 5) {
+                        Text(item.isManual ? "You" : item.sender)
+                        if let channel = item.channel {
+                            Text("·")
+                            Text(channel)
+                        }
+                    }
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                if let channel = item.channel {
-                    Text(channel).foregroundStyle(.tertiary)
+                    .lineLimit(1)
                 }
-                Spacer(minLength: 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 if let completed {
                     Text(completed.formatted(date: .omitted, time: .shortened))
                         .foregroundStyle(.tertiary).monospacedDigit()
                 }
+                Image(systemName: expanded.contains(item.id) ? "chevron.up" : "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
             }
             .font(.callout)
             .contentShape(.rect)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
         }
         .buttonStyle(.plain)
         .pointerCursor()
+        .accessibilityLabel(item.action)
+        .accessibilityValue(expanded.contains(item.id) ? "Expanded" : "Collapsed")
+        .accessibilityHint("Shows the original message")
         // A context menu rather than a visible button per row: reopening is the rare case,
         // and a list of finished work should read as a record, not as a control panel.
         .contextMenu {
@@ -628,14 +746,35 @@ private enum SettingsTab: String {
 /// selection moves; the height is left to the content, which is the whole point of
 /// splitting the form up.
 private struct Pane<Content: View>: View {
+    private let title: String
+    private let subtitle: String
     private let content: Content
 
-    init(@ViewBuilder content: () -> Content) { self.content = content() }
+    init(_ title: String, _ subtitle: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.subtitle = subtitle
+        self.content = content()
+    }
 
     var body: some View {
-        Form { content }
-            .formStyle(.grouped)
-            .frame(width: 460)
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.title2.weight(.semibold))
+                Text(subtitle)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 8)
+
+            Form { content }
+                .formStyle(.grouped)
+                .scrollContentBackground(.hidden)
+        }
+        .frame(width: 500)
+        .frame(minHeight: 430)
     }
 }
 
@@ -707,7 +846,7 @@ private struct GeneralPane: View {
     }
 
     var body: some View {
-        Pane {
+        Pane("General", "Choose how Sereno understands your work and behaves on this Mac.") {
             Section {
                 TextField("Your role", text: $prefs.role,
                           prompt: Text("backend engineer, I own deployments and the public API"),
@@ -766,13 +905,17 @@ private struct SlackPane: View {
     private let slack = SlackAuth.shared
 
     var body: some View {
-        Pane {
+        Pane("Slack", "Connect your workspace and choose which addressing signals count.") {
             Section {
                 slackControls
             } header: {
                 Text("Slack")
             } footer: {
-                Text("Connecting grants Sereno read-only access to the messages you can already see, and nothing is sent anywhere except Slack itself. The token is kept unencrypted, in plain text, in ~/Library/Application Support/Sereno/credentials.json, in a file only your account can read. It is deliberately not in your Keychain: Sereno is signed ad-hoc, so every rebuild looks like a different app to the Keychain and asks permission all over again. A file is the weaker place — anything running as you can read it, and it rides along in a Time Machine backup — and that trade was made on purpose.")
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Sereno receives read-only access to messages you can already see. It cannot post messages or replies to Slack.")
+                    Text("Your token is stored unencrypted, in plain text, at ~/Library/Application Support/Sereno/credentials.json in a file only your account can read. It is deliberately outside Keychain because Sereno’s ad-hoc signature changes on every rebuild and would trigger repeated permission prompts. A file is weaker: anything running as you can read it, and it can be included in Time Machine backups.")
+                        .foregroundStyle(.tertiary)
+                }
             }
 
             Section {
@@ -842,7 +985,7 @@ private struct ModelPane: View {
     @State private var keyStatus: String?
 
     var body: some View {
-        Pane {
+        Pane("Model", "Choose where message triage runs and manage its credentials.") {
             Section {
                 Picker("Model", selection: $prefs.modelProvider) {
                     ForEach(RemoteModelProvider.allCases, id: \.self) { Text($0.label).tag($0) }
@@ -896,7 +1039,11 @@ private struct ModelPane: View {
                 } header: {
                     Text("API key")
                 } footer: {
-                    Text("Kept beside the Slack token, unencrypted, in plain text, in ~/Library/Application Support/Sereno/credentials.json, in a file only your account can read. Never in Settings' own storage. Clear key removes it from that file straight away.")
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Save writes the key immediately; Clear key removes it immediately.")
+                        Text("It is kept beside the Slack token, unencrypted, in plain text, at ~/Library/Application Support/Sereno/credentials.json in a file only your account can read. It never enters Settings’ own storage.")
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
         }
@@ -933,7 +1080,7 @@ private struct NotificationsPane: View {
     private var morningChoices: [Int] { Array(Set(Array(5...11) + [prefs.morningHour])).sorted() }
 
     var body: some View {
-        Pane {
+        Pane("Notifications", "Decide when Sereno gets your attention and how snoozing behaves.") {
             Section {
                 Toggle("New to-dos", isOn: $prefs.notifyNewItems)
                 Toggle("Snooze running out", isOn: $prefs.notifySnoozeWake)
@@ -986,7 +1133,7 @@ private struct AppearancePane: View {
     @State private var resolveNote: String?
 
     var body: some View {
-        Pane {
+        Pane("Appearance", "Let the panel sky follow local weather as well as the time of day.") {
             Section {
                 Toggle("Sky follows the weather", isOn: $prefs.weatherEnabled)
                 HStack {
@@ -1046,12 +1193,49 @@ private struct AboutPane: View {
     @Environment(\.openWindow) private var openWindow
     @State private var confirmingReset = false
     @State private var captureDeleted = false
+    private let phase = SkyPhase.at(Date())
 
     var body: some View {
-        Pane {
+        Pane("About Sereno", "Shortcuts, support, and the data Sereno keeps on this Mac.") {
+            Section {
+                HStack(spacing: 14) {
+                    ZStack {
+                        phase.gradient
+                        Sky(phase: phase)
+                        SerenoMark(phase: phase)
+                            .padding(10)
+                    }
+                    .frame(width: 54, height: 54)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Sereno")
+                            .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 20))
+                        Text(versionLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("A quiet watch for the messages waiting on you.")
+                            .font(.callout)
+                    }
+                }
+                Text("Named after the serenos, the night watchmen who called out the hour and the weather in Spanish cities. “Las dos y sereno” — two o’clock and clear.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Keyboard shortcuts") {
                 KeyboardShortcuts.Recorder("Open the panel from anywhere:", name: .togglePanel)
                 LabeledContent("Open Sereno in its own window", value: "⌘⇧O")
+            }
+
+            Section("Help and history") {
+                Button("Open completed history") {
+                    Foreground.present(historyWindowID) { openWindow(id: historyWindowID) }
+                }
+                .pointerCursor()
+                Button("Show onboarding again", action: showOnboarding)
+                    .pointerCursor()
             }
 
             Section {
@@ -1066,7 +1250,7 @@ private struct AboutPane: View {
                         .foregroundStyle(.secondary)
                 }
             } header: {
-                Text("Debug capture")
+                Text("Diagnostic data")
             } footer: {
                 // Not softened and not a tooltip, per this app's rule that a network- or
                 // disk-write disclosure has to be said plainly, the same as ModelPane's.
@@ -1074,14 +1258,12 @@ private struct AboutPane: View {
             }
 
             Section {
-                Button("Show onboarding again", action: showOnboarding)
-                    .pointerCursor()
                 Button("Reset Sereno", role: .destructive) { confirmingReset = true }
                     .pointerCursor()
             } header: {
-                Text("Reset")
+                Text("App data")
             } footer: {
-                Text("Showing onboarding again costs nothing, it only reopens the first-run window. Resetting is the other thing entirely, so it asks first, and it also deletes any captured debug data and the credentials file.")
+                Text("Reset asks first, then deletes every to-do, returns settings to their defaults, and removes captured debug data and the credentials file.")
             }
         }
         .confirmationDialog("Reset Sereno?", isPresented: $confirmingReset) {
@@ -1090,6 +1272,16 @@ private struct AboutPane: View {
         } message: {
             Text("Every to-do Sereno has collected is deleted, every setting goes back to its default, and ~/Library/Application Support/Sereno/credentials.json is deleted outright, taking the Slack token and any remote model API key with it. Nothing in Slack itself changes. This cannot be undone.")
         }
+    }
+
+    private var versionLabel: String {
+        let info = Bundle.main.infoDictionary
+        guard let version = info?["CFBundleShortVersionString"] as? String else {
+            return "Development build"
+        }
+        guard let build = info?["CFBundleVersion"] as? String,
+              build != version else { return "Version \(version)" }
+        return "Version \(version) (\(build))"
     }
 
     private var captureStatus: String {
@@ -1142,6 +1334,7 @@ private struct Onboarding: View {
     private let slack = SlackAuth.shared
     @State private var step: Step = .what
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The sky at the hour the window opened, fixed rather than driven by a timeline. The
     /// header that follows the clock is the panel's, and this window is up for a minute.
@@ -1157,26 +1350,32 @@ private struct Onboarding: View {
             stepContent
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 24)
-                .padding(.top, 20)
+                .padding(.horizontal, 28)
+                .padding(.top, 24)
             Spacer(minLength: 12)
             Divider()
             controls
         }
         // Fixed, and sized for the longest step, so the window does not resize under the
         // pointer every time Continue is pressed.
-        .frame(width: 480, height: 462)
+        .frame(width: 500, height: 500)
     }
 
     private var banner: some View {
         ZStack {
             phase.gradient
             Sky(phase: phase)
-            Text("Sereno")
-                .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 21))
-                .foregroundStyle(phase.ink)
+            VStack(spacing: 4) {
+                Text("Sereno")
+                    .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 25))
+                Text("A quiet watch for the messages waiting on you")
+                    .font(.callout.weight(.medium))
+                    .opacity(0.78)
+            }
+            .foregroundStyle(phase.ink)
         }
-        .frame(height: 92)
+        .frame(height: 112)
+        .accessibilityElement(children: .combine)
     }
 
     /// Each step is a heading, prose, and at most one control. Anything more would be
@@ -1190,11 +1389,11 @@ private struct Onboarding: View {
     }
 
     private var whatStep: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            Text("What Sereno does").font(.headline)
-            Text("It reads the conversations you are already in, works out which messages are actually waiting on a reply from you, and ranks them. The list lives in your menu bar.")
+        VStack(alignment: .leading, spacing: 12) {
+            stepHeading("What Sereno does", icon: "sparkles")
+            Text("Sereno reads the conversations you are already in, finds messages that are waiting on you, and ranks them in a focused menu bar list.")
             Text("Sereno is a Slack helper, not a Slack alternative. Clicking a to-do opens that message in Slack. There is no replying from here and no drafted replies. Slack keeps the conversation.")
-            Text("The ranking runs on Apple's on-device model. There is no Sereno server, and nothing about your messages leaves this Mac.")
+            Text("Apple’s on-device model is the default. There is no Sereno server, and with the default model nothing about your messages leaves this Mac.")
             Text("Named after the serenos, the night watchmen of Spanish cities from 1715 to the 1970s, who called out the hour and the weather. Las dos y sereno. Two o'clock and clear.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1202,9 +1401,9 @@ private struct Onboarding: View {
     }
 
     private var connectStep: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            Text("Connect Slack").font(.headline)
-            Text("Sereno has nothing to show until an account is attached. It asks for read-only permission to the messages you can already see, and it cannot post anything. The token is kept unencrypted, in a file on this Mac only your account can read; Settings names the exact path.")
+        VStack(alignment: .leading, spacing: 12) {
+            stepHeading("Connect Slack", icon: "link")
+            Text("Sereno asks for read-only access to messages you can already see and cannot post anything. Your token is kept unencrypted at ~/Library/Application Support/Sereno/credentials.json in a file only your account can read. Anything running as you can read it, and it can be included in backups.")
             slackControls
         }
     }
@@ -1250,9 +1449,9 @@ private struct Onboarding: View {
     }
 
     private var roleStep: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            Text("What you do").font(.headline)
-            Text("A message like \"Team, please complete the deployment doc\" names nobody, and this line is what lets the model decide whether it is yours. Measured on a real one: saying the role owned the API moved \"please read the rollout notes\" from the bottom of the list to the top.")
+        VStack(alignment: .leading, spacing: 12) {
+            stepHeading("Describe your role", icon: "person.text.rectangle")
+            Text("Your role helps the model recognize unaddressed work. For example, owning deployments can make a channel-wide deployment request yours even when nobody names you.")
             TextField("Your role", text: $prefs.role,
                       prompt: Text("backend engineer, I own deployments and the public API"),
                       axis: .vertical)
@@ -1264,11 +1463,28 @@ private struct Onboarding: View {
         }
     }
 
+    private func stepHeading(_ title: String, icon: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Brand.aubergine)
+                .frame(width: 30, height: 30)
+                .background(Brand.aubergine.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("STEP \(step.rawValue + 1) OF \(Step.allCases.count)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(title).font(.title3.weight(.semibold))
+            }
+        }
+    }
+
     private var controls: some View {
         HStack(spacing: 10) {
             if step != .what {
                 Button("Back") {
-                    withAnimation(.snappy(duration: 0.2)) { step = previous }
+                    withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { step = previous }
                 }
                 .pointerCursor()
             }
@@ -1303,6 +1519,8 @@ private struct Onboarding: View {
                     .frame(width: 5, height: 5)
             }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Step \(step.rawValue + 1) of \(Step.allCases.count)")
     }
 
     private var previous: Step { Step(rawValue: step.rawValue - 1) ?? .what }
@@ -1312,7 +1530,7 @@ private struct Onboarding: View {
             finish()
             return
         }
-        withAnimation(.snappy(duration: 0.2)) { step = next }
+        withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { step = next }
     }
 
     /// Closing the window with its close button deliberately does not do this. Setup counts
@@ -1678,6 +1896,14 @@ private enum Brand {
     static let link = Color(red: 0.11, green: 0.61, blue: 0.82)      // #1D9BD1
     static let deepGreen = Color(red: 0.00, green: 0.48, blue: 0.35) // #007A5A
 
+    // Adaptive workspace surfaces. Brand colours carry meaning; these carry structure,
+    // so they follow the system appearance and contrast settings automatically.
+    static let canvas = Color(nsColor: .textBackgroundColor)
+    static let surface = Color(nsColor: .controlBackgroundColor)
+    static let raisedSurface = Color(nsColor: .windowBackgroundColor)
+    static let hairline = Color(nsColor: .separatorColor)
+    static let corner: CGFloat = 10
+
     /// Avatar fills paired with an initials color that stays legible on them.
     static let avatars: [(fill: Color, ink: Color)] = [
         (aubergine, .white), (red, .white), (deepGreen, .white),
@@ -1988,9 +2214,9 @@ private enum Band: CaseIterable {
 
     var title: String {
         switch self {
-        case .now: "NOW"
-        case .today: "TODAY"
-        case .later: "LATER"
+        case .now: "Now"
+        case .today: "Today"
+        case .later: "Later"
         }
     }
 
@@ -2070,6 +2296,7 @@ private struct MenuContent: View {
     @State private var selectedID: String?
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Not @Bindable and not @State, for the reason SlackPane gives: an @Observable
     /// read during body is tracked either way, and this is the shared controller the
     /// whole app signs in through. Reading `state` here is what makes a sign-in that
@@ -2160,7 +2387,14 @@ private struct MenuContent: View {
                 .fixedSize(horizontal: false, vertical: true)
             Divider()
             if composing {
-                ComposeArea(store: store) { composing = false }
+                // A user can keep a short manual panel height. Let the form absorb that
+                // constraint and scroll, instead of clipping its Add button below the
+                // panel or stealing the list's one-row visibility floor.
+                ScrollView {
+                    ComposeArea(store: store) { composing = false }
+                }
+                .frame(minHeight: 68, idealHeight: 150, maxHeight: 180)
+                .scrollIndicators(.visible)
                 Divider()
             }
             content
@@ -2198,7 +2432,7 @@ private struct MenuContent: View {
                 // Tray.panelHeight and nothing here competes for it. This is the line that
                 // used to fight MenuBarExtra for the height and lose.
                 .frame(width: 360, alignment: .top)
-                .background(Color(nsColor: .textBackgroundColor))
+                .background(Brand.canvas)
                 // The bottom edge, made draggable. Overlaid rather than stacked so it
                 // costs no layout height and cannot change the height asked for above.
                 .overlay(alignment: .bottom) { PopoverResizeGrip() }
@@ -2225,7 +2459,7 @@ private struct MenuContent: View {
             // The title, the count and the gap after them, grouped so the drag gesture
             // can own exactly that region. The buttons sit outside this group and so are
             // never inside the gesture's view, which is what keeps them clickable.
-            HStack(spacing: 7) {
+            HStack(spacing: 8) {
                 // Measured, not guessed: Schibsted Grotesk SemiBold at 14.5pt is the
                 // compact band's wordmark, matched to the 36pt header down from 44pt.
                 // fixedSize, not size: a wordmark must not grow with Dynamic Type.
@@ -2235,14 +2469,20 @@ private struct MenuContent: View {
                     .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 14.5))
                     .foregroundStyle(phase.ink)
 
-                Text(!connected ? "not connected"
-                     : items.isEmpty ? "all clear" : "\(items.count) to reply")
-                    .font(.caption2)
-                    .foregroundStyle(phase.inkSoft)
-                    // One line, no stacking: the compact band has no room to wrap.
+                Text(!connected ? "Not connected"
+                     : items.isEmpty ? "All clear" : "\(items.count) to reply")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(phase.ink.opacity(0.88))
                     .lineLimit(1)
                     .contentTransition(.numericText())
                     .animation(.snappy(duration: 0.22), value: items.count)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(phase.ink.opacity(0.11),
+                                in: Capsule(style: .continuous))
+                    .accessibilityLabel(!connected ? "Slack not connected"
+                                        : items.isEmpty ? "No replies waiting"
+                                        : "\(items.count) replies waiting")
 
                 Spacer(minLength: 0)
             }
@@ -2261,6 +2501,7 @@ private struct MenuContent: View {
             .buttonStyle(.glass)
             .keyboardShortcut("n", modifiers: .command)
             .help("New task")
+            .accessibilityLabel(composing ? "Close new task" : "New task")
             .pointerCursor()
 
             Button {
@@ -2275,6 +2516,7 @@ private struct MenuContent: View {
             .buttonStyle(.glass)
             .keyboardShortcut("r", modifiers: .command)
             .help("Refresh")
+            .accessibilityLabel("Refresh messages")
             .pointerCursor()
 
             // The overflow: everything that is a command rather than a state lives here
@@ -2317,6 +2559,7 @@ private struct MenuContent: View {
             .buttonStyle(.glass)
             .menuIndicator(.hidden)
             .help("More")
+            .accessibilityLabel("More options")
             .pointerCursor()
 
             // A chromeless window has no title bar, so this is the missing one, not a
@@ -2335,11 +2578,12 @@ private struct MenuContent: View {
                 }
                 .buttonStyle(.glass)
                 .help("Close this window")
+                .accessibilityLabel("Close window")
                 .pointerCursor()
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.vertical, 8)
         // The header's ground is a sky, not a system surface, so every foreground above
         // comes from the phase rather than from `.primary` or `.secondary`. A semantic
         // colour would resolve to near-black in light mode and disappear at night.
@@ -2348,7 +2592,7 @@ private struct MenuContent: View {
     }
 
     @ViewBuilder private var content: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             if !connected {
                 // Alone, with no banner and no role hint above it. A refresh that could
                 // not run leaves an error in the store, and the role hint asks for
@@ -2378,8 +2622,8 @@ private struct MenuContent: View {
             // window.
             if windowed && (!connected || items.isEmpty) { Spacer(minLength: 0) }
         }
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
     }
 
     /// Only when the role is genuinely blank, the user has not waved the hint away, and
@@ -2424,8 +2668,13 @@ private struct MenuContent: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Brand.link.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .padding(.horizontal, 14)
+        .background(Brand.link.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: Brand.corner, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Brand.corner, style: .continuous)
+                .strokeBorder(Brand.link.opacity(0.14), lineWidth: 0.5)
+        }
+        .padding(.horizontal, 12)
     }
 
     /// Quiet by design: tertiary, 10pt, collapsed. Snoozed work is work the user
@@ -2452,6 +2701,8 @@ private struct MenuContent: View {
                 .buttonStyle(.plain)
                 .help(showSnoozed ? "Hide snoozed" : "Show snoozed")
                 .pointerCursor()
+                .accessibilityLabel("Snoozed tasks")
+                .accessibilityValue(showSnoozed ? "Expanded" : "Collapsed")
 
                 if showSnoozed {
                     ForEach(snoozed) { item in
@@ -2460,8 +2711,14 @@ private struct MenuContent: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 2)
+            .padding(10)
+            .background(Brand.surface,
+                        in: RoundedRectangle(cornerRadius: Brand.corner, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: Brand.corner, style: .continuous)
+                    .strokeBorder(Brand.hairline.opacity(0.55), lineWidth: 0.5)
+            }
+            .padding(.horizontal, 8)
             .animation(.snappy(duration: 0.22), value: snoozed.count)
         }
     }
@@ -2473,9 +2730,7 @@ private struct MenuContent: View {
         // entire list (the per-row accent wash is the only selection cue we want).
         ScrollViewReader { proxy in
             ScrollView {
-                // No spacing between rows: the tinted top band then reads as one
-                // block instead of stripes.
-                LazyVStack(alignment: .leading, spacing: 0) {
+                LazyVStack(alignment: .leading, spacing: 4) {
                     ForEach(Band.allCases, id: \.self) { band in
                         let banded = items.filter { band.contains($0.effectivePriority) }
                         if !banded.isEmpty {
@@ -2493,7 +2748,7 @@ private struct MenuContent: View {
                         }
                     }
                 }
-                .padding(.bottom, 4)
+                .padding(.bottom, 6)
             }
             .scrollContentBackground(.hidden)
             // The popover caps its own height, the window is resizable and the list is what
@@ -2657,6 +2912,13 @@ private struct MenuContent: View {
         }
         .padding(.vertical, 24)
         .frame(maxWidth: .infinity)
+        .background(Brand.surface,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Brand.hairline.opacity(0.5), lineWidth: 0.5)
+        }
+        .padding(.horizontal, 8)
     }
 
     /// Sereno cannot see anything until Slack is connected, so this stands in for the
@@ -2720,17 +2982,32 @@ private struct MenuContent: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 30)
         .frame(maxWidth: .infinity)
+        .background(Brand.surface,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Brand.hairline.opacity(0.5), lineWidth: 0.5)
+        }
+        .padding(.horizontal, 8)
     }
 
     // History and Quit moved into the header's overflow menu: two caption2 text links
     // with tiny hit areas were the footer's half of the inconsistency this rebuild fixes.
     private var footer: some View {
-        Text(updated)
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+        HStack(spacing: 5) {
+            Image(systemName: store.isRefreshing ? "arrow.clockwise" : "clock")
+                .font(.system(size: 9, weight: .semibold))
+                .symbolEffect(.rotate, options: .repeating,
+                              isActive: store.isRefreshing && !reduceMotion)
+                .accessibilityHidden(true)
+            Text(store.isRefreshing ? "Checking for replies…" : updated)
+            Spacer(minLength: 0)
+        }
+        .font(.caption2)
+        .foregroundStyle(.tertiary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .accessibilityElement(children: .combine)
     }
 
     private var updated: String {
@@ -2843,23 +3120,34 @@ private struct UndoBar: View {
     let undo: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "arrow.uturn.backward")
-                .font(.system(size: 9, weight: .bold))
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.uturn.backward.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(Brand.link)
+                .accessibilityHidden(true)
             Text(label)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
             Spacer(minLength: 4)
             Button("Undo", action: undo)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(Brand.link)
-                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 .help("Put it back")
                 .pointerCursor()
         }
         .font(.system(size: 11))
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-        .background(Brand.aubergine.opacity(0.10))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Brand.raisedSurface,
+                    in: RoundedRectangle(cornerRadius: Brand.corner, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Brand.corner, style: .continuous)
+                .strokeBorder(Brand.link.opacity(0.28), lineWidth: 0.7)
+        }
+        .shadow(color: .black.opacity(0.08), radius: 5, y: 2)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 }
 
@@ -2877,43 +3165,105 @@ private struct ComposeArea: View {
     private var trimmed: String { task.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            TextField("What do you need to do?", text: $task)
-                .font(.system(size: 13, weight: .semibold))
-                .focused($taskFocused)
-                .onSubmit(add)
-            TextField("Note, optional", text: $note)
-                .font(.system(size: 12))
-                .onSubmit(add)
-
-            HStack(spacing: 8) {
-                Picker("", selection: $priority) {
-                    Text("Now").tag(1)
-                    Text("Today").tag(3)
-                    Text("Later").tag(5)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 170)
-                .pointerCursor()
-
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("New task", systemImage: "square.and.pencil")
+                    .font(.system(size: 13, weight: .semibold))
                 Spacer(minLength: 0)
-
-                Button("Cancel", action: onClose)
-                    .keyboardShortcut(.cancelAction)
-                    .pointerCursor()
-                Button("Add", action: add)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(trimmed.isEmpty)
-                    .pointerCursor()
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Close new task")
+                .pointerCursor()
             }
-            .font(.caption)
-            .buttonStyle(.glass)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Task")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("What do you need to do?", text: $task)
+                    .font(.system(size: 13, weight: .medium))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($taskFocused)
+                    .onSubmit(add)
+                    .accessibilityHint("Required")
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Note")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Add a useful detail (optional)", text: $note)
+                    .font(.system(size: 12))
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(add)
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .bottom, spacing: 8) {
+                    urgencyPicker
+                    Spacer(minLength: 0)
+                    composeButtons
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    urgencyPicker
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack {
+                        Spacer(minLength: 0)
+                        composeButtons
+                    }
+                }
+            }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Brand.aubergine.opacity(0.07))
+        .padding(12)
+        .background(Brand.surface,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Brand.hairline.opacity(0.6), lineWidth: 0.5)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
         .onAppear { taskFocused = true }
+    }
+
+    private var urgencyPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Urgency")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("Urgency", selection: $priority) {
+                Text("Now").tag(1)
+                Text("Today").tag(3)
+                Text("Later").tag(5)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 156)
+            .pointerCursor()
+        }
+    }
+
+    private var composeButtons: some View {
+        HStack(spacing: 6) {
+            Button("Cancel", action: onClose)
+                .keyboardShortcut(.cancelAction)
+                .pointerCursor()
+            Button(action: add) {
+                Label("Add", systemImage: "plus")
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(trimmed.isEmpty)
+            .pointerCursor()
+            .buttonStyle(.borderedProminent)
+            .tint(Brand.aubergine)
+        }
+        .font(.caption)
+        .controlSize(.small)
     }
 
     private func add() {
@@ -2932,7 +3282,11 @@ private struct SnoozedRow: View {
     let store: Store
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
+            Image(systemName: "clock")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
             Text(item.action)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
@@ -2949,12 +3303,12 @@ private struct SnoozedRow: View {
                 withAnimation(.spring(duration: 0.25)) { store.unsnooze(item) }
             }
             .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(Brand.link)
-            .buttonStyle(.plain)
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
             .help("Put this back in the list")
             .pointerCursor()
         }
-        .padding(.vertical, 3)
+        .padding(.top, 7)
     }
 }
 
@@ -3241,29 +3595,33 @@ private struct Sky: View {
     }
 }
 
-/// Slack-sidebar style section label: small, loud, all caps.
+/// A compact section marker with enough weight to separate urgency bands without
+/// competing with the tasks themselves.
 private struct SectionHeader: View {
     let band: Band
     let count: Int
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle().fill(band.color).frame(width: 6, height: 6)
+        HStack(spacing: 7) {
+            Circle().fill(band.color).frame(width: 7, height: 7)
             Text(band.title)
-                .font(.system(size: 10, weight: .heavy))
-                .kerning(0.7)
+                .font(.system(size: 11, weight: .semibold))
             Text("\(count)")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 9, weight: .semibold))
                 .monospacedDigit()
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.10), in: Capsule())
                 .contentTransition(.numericText())
                 .animation(.snappy(duration: 0.22), value: count)
             Spacer()
         }
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 12)
-        .padding(.top, 16)
-        .padding(.bottom, 3)
+        .padding(.horizontal, 10)
+        .padding(.top, 12)
+        .padding(.bottom, 2)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -3291,11 +3649,9 @@ private struct TodoRow: View {
     @State private var copied = false
     @State private var doneTaps = 0
     @State private var doneHovering = false
-    @State private var removeHovering = false
     @State private var chevronHovering = false
     @State private var exported = false
     @FocusState private var doneFocused: Bool
-    @FocusState private var removeFocused: Bool
 
     private var prefs: Preferences { .shared }
 
@@ -3328,14 +3684,21 @@ private struct TodoRow: View {
 
             if expanded {
                 expansion
-                    .padding(.leading, 30) // avatar width (22) plus its gap (8), so text lines up
                     .padding(.top, 8)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .background(rowBackground)
+        .clipShape(RoundedRectangle(cornerRadius: Brand.corner, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Brand.corner, style: .continuous)
+                .strokeBorder(selected ? Color.accentColor.opacity(0.42)
+                                      : Brand.hairline.opacity(0.45),
+                              lineWidth: selected ? 1 : 0.5)
+        }
+        .padding(.horizontal, 8)
         .contentShape(.rect)
         .onHover { hovering = $0 }
         // Return from the keyboard toggles this row's expansion, matching the chevron.
@@ -3374,35 +3737,40 @@ private struct TodoRow: View {
     /// two) — inverted from the old sender-first layout, which buried the one
     /// thing a to-do list is for underneath the byline.
     @ViewBuilder private var rowBody: some View {
-        let content = HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
+            if item.permalink != nil {
+                Button(action: open) { taskSummary }
+                    .buttonStyle(.plain)
+                    .pointerCursor()
+            } else {
+                taskSummary
+            }
+            Spacer(minLength: 6)
+            trailingActions
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(.rect)
+    }
+
+    private var taskSummary: some View {
+        HStack(alignment: .top, spacing: 8) {
             if item.isManual { ManualMark() } else { Avatar(name: item.sender, avatarURL: item.avatarURL) }
             VStack(alignment: .leading, spacing: 2) {
                 taskLine
                 metadataLine
             }
-            Spacer(minLength: 8)
-            trailingActions
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(.rect)
-
-        if item.permalink != nil {
-            Button(action: open) { content }
-                .buttonStyle(.plain)
-                .pointerCursor()
-        } else {
-            content
-        }
     }
 
     private var taskLine: some View {
-        // Always one line. Equal row heights read as a list, ragged ones read
-        // as a mess. The full message is one click away in the expansion.
         Text(item.action)
             .font(.system(size: 13, weight: .medium))
             .foregroundStyle(.primary)
-            .lineLimit(1)
+            .lineLimit(2)
             .truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     /// Sender, channel, relative time and the pin, in that order, joined by "·" as one
@@ -3425,14 +3793,19 @@ private struct TodoRow: View {
             line += dot + run(channel, Brand.link)
         }
         line += dot + run(timeLabel, tertiary)
-        if current.userPriority != nil {
-            // A literal pin, not the SF Symbol: an emoji is a character, so it drops
-            // straight into the string instead of needing a text-attachment image.
-            line += dot + run("📌", tertiary)
+        return HStack(spacing: 4) {
+            Text(line)
+                .font(.caption2)
+                .lineLimit(1)
+            if current.userPriority != nil {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .help("Priority set by you")
+                    .accessibilityLabel("Priority set manually")
+            }
         }
-        return Text(line)
-            .font(.caption2)
-            .lineLimit(1)
+        .lineLimit(1)
     }
 
     /// A task typed a second ago formats as "in 0s", which reads like a bug. Under
@@ -3443,18 +3816,14 @@ private struct TodoRow: View {
             : item.date.formatted(.relative(presentation: .numeric, unitsStyle: .narrow))
     }
 
-    /// The trailing slot, fixed-width so nothing ever appears where something else just
-    /// vanished: chevron, done and remove are ALWAYS visible now, tinted quaternary at
-    /// rest and brightening on hover, rather than faded in only on hover/focus. That was
-    /// both the fix for the jump (one less moving part than a cross-fade) and an
-    /// accessibility hole closed (a keyboard user could never see an invisible button).
+    /// Keep the two frequent, non-destructive controls visible. Remove lives in the
+    /// expanded actions and context menu, leaving the task enough room at compact widths.
     private var trailingActions: some View {
         HStack(spacing: 4) {
             chevronButton
             doneButton
-            removeButton
         }
-        .frame(width: 82, alignment: .trailing) // 22 + 4 + 26 + 4 + 26
+        .frame(width: 52, alignment: .trailing)
     }
 
     /// The chevron's own hit target, separate from the row body button. contentShape's
@@ -3473,6 +3842,8 @@ private struct TodoRow: View {
         .buttonStyle(.plain)
         .pointerCursor()
         .help(expanded ? "Collapse" : "Expand")
+        .accessibilityLabel(expanded ? "Collapse task details" : "Expand task details")
+        .accessibilityValue(expanded ? "Expanded" : "Collapsed")
         .onHover { chevronHovering = $0 }
         .animation(.easeOut(duration: 0.12), value: chevronHovering)
     }
@@ -3491,32 +3862,20 @@ private struct TodoRow: View {
         .focused($doneFocused)
         .buttonStyle(.plain)
         .help("Mark done")
+        .accessibilityLabel("Mark \(item.action) done")
         .pointerCursor()
         .onHover { doneHovering = $0 }
         .animation(.easeOut(duration: 0.12), value: doneHovering)
     }
 
-    private var removeButton: some View {
-        Button(action: remove) {
-            Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 15))
-                .foregroundStyle(removeHovering ? AnyShapeStyle(Brand.red) : AnyShapeStyle(.quaternary))
-                .frame(width: 26, height: 26)
-                .contentShape(.rect)
-        }
-        .focused($removeFocused)
-        .buttonStyle(.plain)
-        .help("Remove")
-        .pointerCursor()
-        .onHover { removeHovering = $0 }
-        .animation(.easeOut(duration: 0.12), value: removeHovering)
-    }
-
     /// The original message, its links, why it was ranked, and the two actions
     /// that need more than an icon.
     private var expansion: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             if !item.detail.isEmpty {
+                Label("Original message", systemImage: "text.bubble")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
                 Text(item.detail)
                     .font(.system(size: 12))
                     .textSelection(.enabled)
@@ -3525,9 +3884,12 @@ private struct TodoRow: View {
             }
             ForEach(item.links, id: \.self) { ExpandedLink(url: $0) }
             if !item.reason.isEmpty {
+                Label("Why this priority", systemImage: "sparkles")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
                 Text(item.reason)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -3535,41 +3897,93 @@ private struct TodoRow: View {
             priorityRow
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.primary.opacity(0.035),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Brand.hairline.opacity(0.4), lineWidth: 0.5)
+        }
     }
 
-    /// One row, one style: small buttons with an icon and a word each.
+    /// Keep labels while they fit, then fall back to the same accessible icon controls in
+    /// the narrow window. Remove is here as a deliberate action, rather than consuming the
+    /// task line's permanently visible trailing space.
     private var actionRow: some View {
-        HStack(spacing: 6) {
-            Button(action: copyDetail) {
-                Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                    .symbolEffect(.bounce, value: copied)
-            }
-            .help("Copy the original message")
-            .pointerCursor()
+        ViewThatFits(in: .horizontal) {
+            actionControls(compact: false)
+            wrappedActionControls
+        }
+        .padding(.top, 2)
+    }
 
-            Button(action: sendToReminders) {
-                Label(exported ? "Sent" : "Reminders", systemImage: exported ? "checkmark" : "list.bullet")
-                    .symbolEffect(.bounce, value: exported)
+    private var wrappedActionControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                utilityButton(copied ? "Copied" : "Copy",
+                              symbol: copied ? "checkmark" : "doc.on.doc",
+                              help: "Copy the original message", compact: false,
+                              action: copyDetail)
+                utilityButton(exported ? "Sent" : "Reminders",
+                              symbol: exported ? "checkmark" : "list.bullet",
+                              help: "Send to Reminders", compact: false,
+                              action: sendToReminders)
+                Spacer(minLength: 0)
             }
-            .help("Send to Reminders")
-            .pointerCursor()
-
-            // Kept even though the row click now does the same thing: the row's
-            // click-to-open has no visible affordance beyond the cursor, so this
-            // stays as the discoverable, explicit way in.
-            if item.permalink != nil {
-                Button(action: open) {
-                    Label("Open in Slack", systemImage: "arrow.up.forward.app")
+            HStack(spacing: 6) {
+                if item.permalink != nil {
+                    utilityButton("Open in Slack", symbol: "arrow.up.forward.app",
+                                  help: "Open this message in Slack", compact: false,
+                                  action: open)
                 }
-                .help("Open this message in Slack")
-                .pointerCursor()
+                utilityButton("Remove", symbol: "trash", help: "Remove this task",
+                              compact: false, destructive: true, action: remove)
+                Spacer(minLength: 0)
             }
+        }
+        .font(.caption)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+    }
+
+    private func actionControls(compact: Bool) -> some View {
+        HStack(spacing: 6) {
+            utilityButton(copied ? "Copied" : "Copy",
+                          symbol: copied ? "checkmark" : "doc.on.doc",
+                          help: "Copy the original message", compact: compact,
+                          action: copyDetail)
+            utilityButton(exported ? "Sent" : "Reminders",
+                          symbol: exported ? "checkmark" : "list.bullet",
+                          help: "Send to Reminders", compact: compact,
+                          action: sendToReminders)
+            if item.permalink != nil {
+                utilityButton("Open in Slack", symbol: "arrow.up.forward.app",
+                              help: "Open this message in Slack", compact: compact,
+                              action: open)
+            }
+            utilityButton("Remove", symbol: "trash", help: "Remove this task",
+                          compact: compact, destructive: true, action: remove)
             Spacer(minLength: 0)
         }
         .font(.caption)
-        .buttonStyle(.glass)
+        .buttonStyle(.bordered)
         .controlSize(.small)
-        .padding(.top, 1)
+    }
+
+    private func utilityButton(_ title: String, symbol: String, help: String,
+                               compact: Bool, destructive: Bool = false,
+                               action: @escaping () -> Void) -> some View {
+        Button(role: destructive ? .destructive : nil, action: action) {
+            if compact {
+                Image(systemName: symbol)
+                    .frame(width: 14, height: 14)
+            } else {
+                Label(title, systemImage: symbol)
+            }
+        }
+        .help(help)
+        .accessibilityLabel(title)
+        .pointerCursor()
     }
 
     /// Priority is one exclusive choice out of three, so it is a segmented control
@@ -3577,42 +3991,65 @@ private struct TodoRow: View {
     /// named the way the list is named. Snooze is one menu, which keeps the row to
     /// two controls and stays the same size when more durations get added.
     private var priorityRow: some View {
-        HStack(spacing: 6) {
-            Picker("Priority", selection: bandSelection) {
-                Text("Now").tag(1)
-                Text("Today").tag(3)
-                Text("Later").tag(5)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6) {
+                priorityPicker
+                if current.userPriority != nil { suggestedPriorityButton(compact: true) }
+                Spacer(minLength: 0)
+                snoozeMenu
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 150)
-            .help("Move this to Now, Today or Later")
-            .pointerCursor()
 
-            if current.userPriority != nil {
-                Button { setPriority(nil) } label: {
-                    Image(systemName: "xmark")
+            VStack(alignment: .leading, spacing: 6) {
+                priorityPicker
+                HStack(spacing: 6) {
+                    if current.userPriority != nil { suggestedPriorityButton(compact: false) }
+                    Spacer(minLength: 0)
+                    snoozeMenu
                 }
-                .help("Back to the suggested priority")
-                .pointerCursor()
             }
-
-            Spacer(minLength: 0)
-
-            Menu {
-                Button("For \(plural(prefs.snoozeHours, "hour"))") { snooze(hoursFromNow: prefs.snoozeHours) }
-                Button("Until tomorrow \(hourLabel(prefs.morningHour))") { snoozeTomorrowMorning() }
-            } label: {
-                Label("Snooze", systemImage: "clock")
-            }
-            .menuStyle(.button)
-            .fixedSize()
-            .help("Hide this until later")
-            .pointerCursor()
         }
         .font(.caption)
-        .buttonStyle(.glass)
+        .buttonStyle(.bordered)
         .controlSize(.small)
+    }
+
+    private var priorityPicker: some View {
+        Picker("Priority", selection: bandSelection) {
+            Text("Now").tag(1)
+            Text("Today").tag(3)
+            Text("Later").tag(5)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 150)
+        .help("Move this to Now, Today or Later")
+        .pointerCursor()
+    }
+
+    private func suggestedPriorityButton(compact: Bool) -> some View {
+        Button { setPriority(nil) } label: {
+            if compact {
+                Image(systemName: "arrow.uturn.backward")
+            } else {
+                Label("Use suggestion", systemImage: "arrow.uturn.backward")
+            }
+        }
+        .help("Back to the suggested priority")
+        .accessibilityLabel("Use suggested priority")
+        .pointerCursor()
+    }
+
+    private var snoozeMenu: some View {
+        Menu {
+            Button("For \(plural(prefs.snoozeHours, "hour"))") { snooze(hoursFromNow: prefs.snoozeHours) }
+            Button("Until tomorrow \(hourLabel(prefs.morningHour))") { snoozeTomorrowMorning() }
+        } label: {
+            Label("Snooze", systemImage: "clock")
+        }
+        .menuStyle(.button)
+        .fixedSize()
+        .help("Hide this until later")
+        .pointerCursor()
     }
 
     /// The segmented control speaks in bands, the store in 1...5. Reading maps the
@@ -3720,17 +4157,29 @@ private struct ExpandedLink: View {
 
     var body: some View {
         Button { NSWorkspace.shared.open(url) } label: {
-            Text(url.absoluteString)
-                .font(.caption)
-                .foregroundStyle(Brand.link)
-                .underline(hovering)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            HStack(spacing: 5) {
+                Image(systemName: "link")
+                    .font(.system(size: 9, weight: .semibold))
+                    .accessibilityHidden(true)
+                Text(url.absoluteString)
+                    .font(.caption)
+                    .underline(hovering)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .foregroundStyle(Brand.link)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(Brand.link.opacity(hovering ? 0.12 : 0.07),
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
         .help(url.absoluteString)
+        .accessibilityLabel("Open link")
+        .accessibilityValue(url.absoluteString)
         .pointerCursor()
         .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
 
@@ -3739,14 +4188,15 @@ private struct ExpandedLink: View {
 /// as self-authored. Initials of a made-up name would be a lie.
 private struct ManualMark: View {
     var body: some View {
-        RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .fill(Color.secondary.opacity(0.16))
-            .frame(width: 22, height: 22)
+        RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .fill(Brand.aubergine.opacity(0.12))
+            .frame(width: 24, height: 24)
             .overlay {
                 Image(systemName: "checklist")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Brand.aubergine)
             }
+            .accessibilityHidden(true)
     }
 }
 
@@ -3759,29 +4209,32 @@ private struct Avatar: View {
     var avatarURL: URL? = nil
 
     var body: some View {
-        if let avatarURL {
-            AsyncImage(url: avatarURL) { phase in
-                if case .success(let image) = phase {
-                    image.resizable()
-                        .scaledToFill()
-                        .frame(width: 22, height: 22)
-                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                } else {
-                    // .empty (still loading) and .failure both read as "no photo yet".
-                    initialsBody
+        Group {
+            if let avatarURL {
+                AsyncImage(url: avatarURL) { phase in
+                    if case .success(let image) = phase {
+                        image.resizable()
+                            .scaledToFill()
+                            .frame(width: 24, height: 24)
+                            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    } else {
+                        // .empty (still loading) and .failure both read as "no photo yet".
+                        initialsBody
+                    }
                 }
+                .frame(width: 24, height: 24)
+            } else {
+                initialsBody
             }
-            .frame(width: 22, height: 22)
-        } else {
-            initialsBody
         }
+        .accessibilityHidden(true)
     }
 
     private var initialsBody: some View {
         let palette = Brand.avatars[colorIndex]
-        return RoundedRectangle(cornerRadius: 6, style: .continuous)
+        return RoundedRectangle(cornerRadius: 7, style: .continuous)
             .fill(palette.fill)
-            .frame(width: 22, height: 22)
+            .frame(width: 24, height: 24)
             .overlay {
                 Text(initials)
                     .font(.system(size: 10, weight: .bold))
@@ -3815,16 +4268,26 @@ private struct Banner: View {
     let tint: Color
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 9) {
             Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(tint)
+                .frame(width: 18, height: 18)
+                .accessibilityHidden(true)
             Text(text)
-                .font(.callout)
+                .font(.system(size: 12))
+                .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
         .padding(10)
-        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .padding(.horizontal, 14)
+        .background(tint.opacity(0.09),
+                    in: RoundedRectangle(cornerRadius: Brand.corner, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Brand.corner, style: .continuous)
+                .strokeBorder(tint.opacity(0.28), lineWidth: 0.7)
+        }
+        .padding(.horizontal, 8)
+        .accessibilityElement(children: .combine)
     }
 }
