@@ -1832,20 +1832,22 @@ private enum SkyPhase: CaseIterable {
         }
     }
 
-    /// A soft glow: height in unit coordinates, radius as a fraction of the width. No
-    /// rays. This is a 40pt utility bar the user opens twenty times a day.
-    var sun: (y: Double, radius: Double, color: Color)? {
+    /// A small, flat celestial glyph rather than a realistic glow. Its height tracks the
+    /// phase while its fixed radius stays legible in the compact 36pt band.
+    var orb: (kind: SkyOrb, y: Double, color: Color)? {
         switch self {
-        case .dawn: (0.95, 0.34, Color(red: 1.00, green: 0.86, blue: 0.74))
-        case .day: (0.28, 0.30, Color(red: 1.00, green: 0.97, blue: 0.86))
-        case .afternoon: (0.78, 0.32, Color(red: 1.00, green: 0.91, blue: 0.72))
-        // Dusk's orange lower stop is the sun already down. Night has none.
-        case .dusk, .night: nil
+        case .dawn: (.sun, 0.88, Color(red: 1.00, green: 0.83, blue: 0.58))
+        case .day: (.sun, 0.34, Color(red: 1.00, green: 0.86, blue: 0.36))
+        case .afternoon: (.sun, 0.76, Color(red: 1.00, green: 0.72, blue: 0.30))
+        case .dusk: (.moon, 0.34, Color(red: 1.00, green: 0.89, blue: 0.68))
+        case .night: (.moon, 0.38, Color(red: 1.00, green: 0.94, blue: 0.78))
         }
     }
 
     var streaks: Bool { self == .night }
 }
+
+private enum SkyOrb { case sun, moon }
 
 /// What falls out of the sky, if anything.
 private enum Falling { case rain, snow }
@@ -1879,23 +1881,24 @@ private struct DragHandle: ViewModifier {
 /// paler overcast grey and never darkened, because mid-grey is the one ground that dark
 /// ink fails on. A rainy day is still a pale day.
 private extension WeatherCondition {
-    /// A wash over the phase gradient, drawn as the first thing in the Canvas.
+    /// A light tint over the phase gradient. The shapes carry the weather now, so this
+    /// only nudges the palette instead of trying to simulate a photographic overcast.
     func scrim(lightGround: Bool) -> (color: Color, opacity: Double) {
         let color = lightGround
-            ? Color(red: 0.58, green: 0.60, blue: 0.63)   // overcast grey, lighter than the ink
-            : Color(red: 0.05, green: 0.06, blue: 0.10)   // the night going out
+            ? Color(red: 0.70, green: 0.76, blue: 0.82)
+            : Color(red: 0.10, green: 0.10, blue: 0.19)
         switch self {
         case .clear: return (color, 0)
-        case .cloudy: return (color, lightGround ? 0.50 : 0.30)
-        case .fog: return (color, lightGround ? 0.42 : 0.28)
-        case .rain: return (color, lightGround ? 0.55 : 0.35)
-        case .snow: return (color, lightGround ? 0.48 : 0.28)
-        case .storm: return (color, lightGround ? 0.62 : 0.45)
+        case .cloudy: return (color, lightGround ? 0.28 : 0.22)
+        case .fog: return (color, lightGround ? 0.24 : 0.20)
+        case .rain: return (color, lightGround ? 0.34 : 0.28)
+        case .snow: return (color, lightGround ? 0.20 : 0.16)
+        case .storm: return (color, lightGround ? 0.42 : 0.34)
         }
     }
 
     /// Cloud cover as the starfield sees it: a floor added to the phase's own, and a scale
-    /// on whatever survives it. Star alphas run 0.14 to 0.46, so a floor of 0.4 leaves the
+    /// on whatever survives it. Star alphas run 0.22 to 0.56, so a floor of 0.4 leaves the
     /// brightest handful and hides the rest.
     var starCover: (floor: Double, scale: Double) {
         switch self {
@@ -1915,13 +1918,13 @@ private extension WeatherCondition {
         }
     }
 
-    /// Only a clear sky keeps the sun glow. Anything else has cloud in the way, and a sun
-    /// shining through a rain scrim reads as a rendering mistake.
-    var showsSun: Bool { self == .clear }
+    /// Only a clear sky keeps the sun or moon. Weather gets one strong visual idea at this
+    /// size, and the cloud silhouette reads more cleanly without an orb behind it.
+    var showsOrb: Bool { self == .clear }
 
     /// Whether anything in this condition moves, which is what decides if the timeline runs
     /// at all. Reduce motion overrides it either way.
-    var moves: Bool { self != .clear && self != .cloudy }
+    var moves: Bool { self != .clear }
 }
 
 /// The one rule that would break the app if it went wrong: the wrong phase means the
@@ -2969,21 +2972,77 @@ private struct Sky: View {
     /// stops the starfield animating while the panel is hidden.
     @State private var onScreen = false
 
-    private struct Star { let x, y, r, alpha: Double; let twinkles: Bool }
+    private struct Particle { let x, y, r, alpha: Double; let sparkles: Bool }
 
     /// Seeded once, at type level: the draw is a pure function of the timeline date, so
-    /// picking positions inside it would reshuffle the whole sky on every frame.
-    private static let stars: [Star] = {
+    /// picking positions inside it would reshuffle the whole sky on every frame. Eighteen
+    /// deliberate marks read as a pattern; the previous 44 read as texture at this height.
+    private static let particles: [Particle] = {
         var seed: UInt64 = 0x5E7E_11A5
         func unit() -> Double {
             seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17
             return Double(seed % 100_000) / 100_000
         }
-        return (0..<44).map { _ in
-            Star(x: unit(), y: unit(), r: 0.45 + unit() * 0.7,
-                 alpha: 0.14 + unit() * 0.32, twinkles: unit() < 0.25)
+        return (0..<18).map { _ in
+            Particle(x: unit(), y: 0.10 + unit() * 0.78, r: 0.55 + unit() * 0.75,
+                     alpha: 0.22 + unit() * 0.34, sparkles: unit() < 0.28)
         }
     }()
+
+    /// Three overlapping ovals make a tiny, friendly cloud without asking a 36pt canvas
+    /// to carry realistic shading. A second offset fill supplies one consistent paper-cut
+    /// shadow, matching the flat celestial glyphs and precipitation.
+    private static func cloudPath(center: CGPoint, width: CGFloat) -> Path {
+        let height = width * 0.38
+        var path = Path()
+        path.addEllipse(in: CGRect(x: center.x - width * 0.50, y: center.y - height * 0.10,
+                                   width: width, height: height * 0.70))
+        path.addEllipse(in: CGRect(x: center.x - width * 0.34, y: center.y - height * 0.46,
+                                   width: width * 0.46, height: height * 0.82))
+        path.addEllipse(in: CGRect(x: center.x - width * 0.05, y: center.y - height * 0.34,
+                                   width: width * 0.39, height: height * 0.69))
+        return path
+    }
+
+    private static func sparklePath(at center: CGPoint, radius: CGFloat) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: center.x, y: center.y - radius))
+        path.addLine(to: CGPoint(x: center.x + radius * 0.25, y: center.y - radius * 0.25))
+        path.addLine(to: CGPoint(x: center.x + radius, y: center.y))
+        path.addLine(to: CGPoint(x: center.x + radius * 0.25, y: center.y + radius * 0.25))
+        path.addLine(to: CGPoint(x: center.x, y: center.y + radius))
+        path.addLine(to: CGPoint(x: center.x - radius * 0.25, y: center.y + radius * 0.25))
+        path.addLine(to: CGPoint(x: center.x - radius, y: center.y))
+        path.addLine(to: CGPoint(x: center.x - radius * 0.25, y: center.y - radius * 0.25))
+        path.closeSubpath()
+        return path
+    }
+
+    private static func crescentPath(at center: CGPoint, radius: CGFloat) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: center.x + radius * 0.10, y: center.y - radius))
+        path.addCurve(to: CGPoint(x: center.x + radius * 0.10, y: center.y + radius),
+                      control1: CGPoint(x: center.x - radius * 1.05, y: center.y - radius * 0.82),
+                      control2: CGPoint(x: center.x - radius * 1.05, y: center.y + radius * 0.82))
+        path.addCurve(to: CGPoint(x: center.x + radius * 0.10, y: center.y - radius),
+                      control1: CGPoint(x: center.x - radius * 0.28, y: center.y + radius * 0.58),
+                      control2: CGPoint(x: center.x - radius * 0.28, y: center.y - radius * 0.58))
+        path.closeSubpath()
+        return path
+    }
+
+    private static func lightningPath(at origin: CGPoint) -> Path {
+        var path = Path()
+        path.move(to: origin)
+        path.addLine(to: CGPoint(x: origin.x + 7, y: origin.y))
+        path.addLine(to: CGPoint(x: origin.x + 3.5, y: origin.y + 6))
+        path.addLine(to: CGPoint(x: origin.x + 8.5, y: origin.y + 6))
+        path.addLine(to: CGPoint(x: origin.x - 1, y: origin.y + 16))
+        path.addLine(to: CGPoint(x: origin.x + 1.5, y: origin.y + 8.5))
+        path.addLine(to: CGPoint(x: origin.x - 2.5, y: origin.y + 8.5))
+        path.closeSubpath()
+        return path
+    }
 
     /// One streak per six second slot, offset by up to two seconds inside its slot, so
     /// consecutive streaks land four to eight seconds apart. Derived from `t` only.
@@ -3004,9 +3063,8 @@ private struct Sky: View {
         return (tail, head, sin(p * .pi))
     }
 
-    /// One restrained flash per nine second slot, placed anywhere in the first six seconds
-    /// of it, so most slots look empty and none of it reads as a strobe. Derived from `t`
-    /// only, like the streaks.
+    /// One soft pulse per nine second slot. It brightens only the little lightning glyph,
+    /// avoiding a whole-header flash while keeping the storm alive.
     private static func flash(at t: Double) -> Double? {
         let slot = (t / 9).rounded(.down)
         var h = UInt64(bitPattern: Int64(slot)) &* 0x9E37_79B9_7F4A_7C15 | 1
@@ -3032,88 +3090,136 @@ private struct Sky: View {
                 if let scrim = weather?.scrim(lightGround: phase.lightGround), scrim.opacity > 0 {
                     ctx.fill(full, with: .color(scrim.color.opacity(scrim.opacity)))
                 }
-                if let sun = phase.sun, weather?.showsSun != false {
-                    let r = sun.radius * size.width
-                    let c = CGPoint(x: 0.56 * size.width, y: sun.y * size.height)
-                    // Between the count and the buttons, so no text sits in the glow.
-                    ctx.fill(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r,
-                                                    width: r * 2, height: r * 2)),
-                             with: .radialGradient(
-                                Gradient(stops: [
-                                    .init(color: sun.color.opacity(0.72), location: 0),
-                                    .init(color: sun.color.opacity(0.22), location: 0.38),
-                                    .init(color: sun.color.opacity(0), location: 1),
-                                ]),
-                                center: c, startRadius: 0, endRadius: r))
+                if let orb = phase.orb, weather?.showsOrb != false {
+                    let radius = min(size.height * 0.18, 7)
+                    let center = CGPoint(x: size.width * 0.56, y: size.height * orb.y)
+                    switch orb.kind {
+                    case .sun:
+                        // Four short rays are enough to say "sun" at actual size, and keep
+                        // the glyph out of the title and command buttons on either side.
+                        for angle in stride(from: 0.0, to: Double.pi * 2, by: Double.pi / 2) {
+                            var ray = Path()
+                            ray.move(to: CGPoint(x: center.x + cos(angle) * (radius + 2.5),
+                                                 y: center.y + sin(angle) * (radius + 2.5)))
+                            ray.addLine(to: CGPoint(x: center.x + cos(angle) * (radius + 5),
+                                                    y: center.y + sin(angle) * (radius + 5)))
+                            ctx.stroke(ray, with: .color(orb.color.opacity(0.82)),
+                                       style: StrokeStyle(lineWidth: 1.4, lineCap: .round))
+                        }
+                        ctx.fill(Path(ellipseIn: CGRect(x: center.x - radius, y: center.y - radius,
+                                                        width: radius * 2, height: radius * 2)),
+                                 with: .color(orb.color.opacity(0.94)))
+                    case .moon:
+                        ctx.fill(Self.crescentPath(at: center, radius: radius + 0.5),
+                                 with: .color(orb.color.opacity(0.92)))
+                    }
                 }
-                // Fog is a haze layer, not a scrim: a soft band that drifts, sitting over
-                // the sky and under the stars so it dims them the way real haze does.
+
+                // Fog is two round-ended ribbons. Their different lengths and tiny drift
+                // make the condition obvious without washing out the wordmark.
                 if weather == .fog {
-                    let mid = (0.52 + 0.06 * sin(t * 0.11)) * size.height
-                    let band = CGRect(x: 0, y: mid - size.height * 0.5,
-                                      width: size.width, height: size.height)
-                    ctx.fill(Path(band), with: .linearGradient(
-                        Gradient(colors: [.white.opacity(0), .white.opacity(0.22),
-                                          .white.opacity(0)]),
-                        startPoint: CGPoint(x: 0, y: band.minY),
-                        endPoint: CGPoint(x: 0, y: band.maxY)))
+                    let drift = CGFloat(sin(t * 0.20)) * 5
+                    let fogInk = phase.lightGround ? phase.ink.opacity(0.17) : .white.opacity(0.30)
+                    let ribbons: [(y: Double, start: Double, end: Double)] = [
+                        (0.35, 0.35, 0.57), (0.35, 0.62, 0.76),
+                        (0.61, 0.42, 0.64), (0.61, 0.69, 0.79),
+                    ]
+                    for (index, ribbon) in ribbons.enumerated() {
+                        let y = size.height * ribbon.y
+                        let direction = index.isMultiple(of: 2) ? 1.0 : -0.7
+                        var path = Path()
+                        path.move(to: CGPoint(x: size.width * ribbon.start + drift * direction, y: y))
+                        path.addLine(to: CGPoint(x: size.width * ribbon.end + drift * direction, y: y))
+                        ctx.stroke(path, with: .color(fogInk),
+                                   style: StrokeStyle(lineWidth: index < 2 ? 3.8 : 2.8,
+                                                      lineCap: .round))
+                    }
                 }
                 if let field = phase.starfield {
                     let cover = weather?.starCover ?? (floor: 0, scale: 1)
                     let field = (floor: max(field.floor, cover.floor),
                                  scale: field.scale * cover.scale)
-                    // 44 stars suit the panel's old 44pt band; the compact 36pt one reads
-                    // them as noise at full density, so the count scales with the band's
-                    // area instead of a second seeded table. 360x44 is that original
-                    // band's area, so a header at the same width and the new 36pt height
-                    // gets proportionally fewer; a wider window scene gets more back.
-                    let density = (size.width * size.height) / (360 * 44)
-                    let starCount = max(0, min(Self.stars.count,
-                                               Int((Double(Self.stars.count) * density).rounded())))
-                    for star in Self.stars.prefix(starCount) where star.alpha > field.floor {
+                    let density = (size.width * size.height) / (360 * 36)
+                    let starCount = max(0, min(Self.particles.count,
+                                               Int((Double(Self.particles.count) * density).rounded())))
+                    for star in Self.particles.prefix(starCount) where star.alpha > field.floor {
                         var alpha = star.alpha * field.scale
-                        if animated, star.twinkles {
-                            alpha *= 0.6 + 0.4 * sin(t * 0.55 + star.x * 17)
+                        if animated, star.sparkles {
+                            alpha *= 0.72 + 0.28 * sin(t * 0.48 + star.x * 17)
                         }
-                        let box = CGRect(x: star.x * size.width - star.r,
-                                         y: star.y * size.height - star.r,
-                                         width: star.r * 2, height: star.r * 2)
-                        ctx.fill(Path(ellipseIn: box), with: .color(.white.opacity(alpha)))
+                        let center = CGPoint(x: star.x * size.width, y: star.y * size.height)
+                        let path = star.sparkles
+                            ? Self.sparklePath(at: center, radius: star.r * 1.35)
+                            : Path(ellipseIn: CGRect(x: center.x - star.r, y: center.y - star.r,
+                                                     width: star.r * 2, height: star.r * 2))
+                        ctx.fill(path, with: .color(.white.opacity(alpha)))
                     }
                 }
-                // Rain and snow reuse the one seeded table above rather than a second one:
-                // x is the column, y the starting offset, r the per-particle speed. Both
-                // wrap with truncatingRemainder, so position is a pure function of `t`.
+
+                if weather == .cloudy || weather == .rain || weather == .snow || weather == .storm {
+                    let cloudFill = phase.lightGround
+                        ? Color.white.opacity(weather == .storm ? 0.58 : 0.74)
+                        : Color(red: 0.73, green: 0.72, blue: 0.84).opacity(0.52)
+                    let shadow = phase.lightGround
+                        ? Color(red: 0.24, green: 0.34, blue: 0.47).opacity(0.16)
+                        : Color.black.opacity(0.20)
+                    let clouds: [(x: Double, y: Double, width: Double)] = [
+                        (0.47, 0.30, 40), (0.68, 0.72, 50), (0.91, 0.29, 42),
+                    ]
+                    for (index, cloud) in clouds.enumerated() {
+                        let direction = index.isMultiple(of: 2) ? 1.0 : -0.72
+                        let drift = animated ? sin(t * 0.16 + Double(index)) * 1.8 * direction : 0
+                        let bob = animated ? sin(t * 0.12 + Double(index) * 1.7) * 0.6 : 0
+                        let center = CGPoint(x: size.width * cloud.x + drift,
+                                             y: size.height * cloud.y + bob)
+                        let art = Self.cloudPath(center: center, width: cloud.width)
+                        ctx.translateBy(x: 0, y: 1.5)
+                        ctx.fill(art, with: .color(shadow))
+                        ctx.translateBy(x: 0, y: -1.5)
+                        ctx.fill(art, with: .color(cloudFill))
+                    }
+                }
+
+                // Falling marks live on the right 62% of the band, leaving the title and
+                // count quiet. Their wraps happen beyond an edge so the loop never pops.
                 switch weather?.falling {
                 case .rain:
-                    // Slanted like the night streaks, and inked from the phase, so it is
-                    // dark rain on a pale sky and pale rain on a dark one.
-                    let ink = phase.lightGround ? phase.ink : .white
-                    for drop in Self.stars {
-                        let y = (drop.y + t * (1.7 + drop.r)).truncatingRemainder(dividingBy: 1)
-                        let head = CGPoint(x: drop.x * size.width, y: y * size.height)
+                    let ink = phase.lightGround ? Color(red: 0.11, green: 0.36, blue: 0.58) : .white
+                    let travel = size.height + 14
+                    for drop in Self.particles.prefix(15) {
+                        let y = (drop.y * travel + t * (12 + drop.r * 6))
+                            .truncatingRemainder(dividingBy: travel) - 7
+                        let head = CGPoint(x: (0.38 + drop.x * 0.60) * size.width, y: y)
                         var path = Path()
-                        path.move(to: CGPoint(x: head.x - 2.2, y: head.y - size.height * 0.30))
+                        path.move(to: CGPoint(x: head.x - 2.4, y: head.y - 4.5))
                         path.addLine(to: head)
-                        ctx.stroke(path, with: .color(ink.opacity(0.34)), lineWidth: 0.9)
+                        ctx.stroke(path, with: .color(ink.opacity(0.48)),
+                                   style: StrokeStyle(lineWidth: 1.25, lineCap: .round))
                     }
                 case .snow:
-                    // Fewer and slower. 44 flakes in a 46pt bar is a blizzard.
-                    for flake in Self.stars.prefix(26) {
-                        let y = (flake.y + t * 0.10 * (0.6 + flake.r))
-                            .truncatingRemainder(dividingBy: 1)
-                        let x = flake.x + 0.012 * sin(t * 0.5 + flake.x * 21)
-                        let r = 0.8 + flake.r * 0.9
-                        ctx.fill(Path(ellipseIn: CGRect(x: x * size.width - r,
-                                                        y: y * size.height - r,
-                                                        width: r * 2, height: r * 2)),
-                                 with: .color(.white.opacity(0.85)))
+                    let travel = size.height + 8
+                    for flake in Self.particles.prefix(12) {
+                        let y = (flake.y * travel + t * (2.5 + flake.r))
+                            .truncatingRemainder(dividingBy: travel) - 4
+                        let x = (0.38 + flake.x * 0.60) * size.width
+                            + 2.5 * sin(t * 0.42 + flake.x * 21)
+                        let r = 0.9 + flake.r * 0.45
+                        let center = CGPoint(x: x, y: y)
+                        let path = flake.sparkles
+                            ? Self.sparklePath(at: center, radius: r * 1.2)
+                            : Path(ellipseIn: CGRect(x: x - r, y: y - r,
+                                                     width: r * 2, height: r * 2))
+                        ctx.fill(path, with: .color(.white.opacity(0.82)))
                     }
                 case nil:
                     break
                 }
-                if animated, weather == .storm, let flash = Self.flash(at: t) {
-                    ctx.fill(full, with: .color(.white.opacity(0.14 * flash)))
+
+                if weather == .storm {
+                    let pulse = animated ? (Self.flash(at: t) ?? 0) : 0
+                    let bolt = Self.lightningPath(at: CGPoint(x: size.width * 0.56,
+                                                              y: size.height * 0.28))
+                    ctx.fill(bolt, with: .color(Brand.yellow.opacity(0.74 + pulse * 0.26)))
                 }
                 if animated, phase.streaks, weather == nil || weather == .clear,
                    let s = Self.streak(at: t, in: size) {
@@ -3121,8 +3227,11 @@ private struct Sky: View {
                     path.move(to: s.from)
                     path.addLine(to: s.to)
                     ctx.stroke(path, with: .linearGradient(
-                        Gradient(colors: [.white.opacity(0), .white.opacity(0.55 * s.alpha)]),
-                        startPoint: s.from, endPoint: s.to), lineWidth: 1)
+                        Gradient(colors: [.white.opacity(0), .white.opacity(0.62 * s.alpha)]),
+                        startPoint: s.from, endPoint: s.to),
+                               style: StrokeStyle(lineWidth: 1.25, lineCap: .round))
+                    ctx.fill(Self.sparklePath(at: s.to, radius: 1.7),
+                             with: .color(.white.opacity(0.70 * s.alpha)))
                 }
             }
         }
