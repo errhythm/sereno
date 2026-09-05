@@ -2214,30 +2214,29 @@ private struct MenuContent: View {
     /// render harness can shoot every combination without waiting for the day to go round
     /// or for it to rain.
     private func headerBar(_ phase: SkyPhase, weather: WeatherCondition? = nil) -> some View {
-        // 7 rather than the original 9. A fourth button costs about 45pt and the bar was
-        // only about 10pt from full, so the gaps give that back and nothing has to shrink.
-        HStack(spacing: 7) {
+        // One toolbar: every button in this bar is the same size and the same style, so
+        // there is exactly one visual language up here instead of two. State (the gear)
+        // moved out; only commands remain as buttons, plus the overflow menu that reads
+        // as a fourth peer rather than a popup.
+        HStack(spacing: 4) {
             // The title, the count and the gap after them, grouped so the drag gesture
             // can own exactly that region. The buttons sit outside this group and so are
             // never inside the gesture's view, which is what keeps them clickable.
             HStack(spacing: 7) {
-                // Measured, not guessed: Schibsted Grotesk SemiBold at 15pt has an
-                // x-height of 7.91 against the 8.06 of the 15pt bold system font this
-                // replaced, and SemiBold is the lighter weight of the two, so 15.5
-                // brings both the x-height and the stroke back to where they were.
+                // Measured, not guessed: Schibsted Grotesk SemiBold at 14.5pt is the
+                // compact band's wordmark, matched to the 36pt header down from 44pt.
                 // fixedSize, not size: a wordmark must not grow with Dynamic Type.
                 // The only brand-font text in the app; everything else stays on the
                 // system font, which is what a macOS app should do.
                 Text("Sereno")
-                    .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 15.5))
+                    .font(.custom("SchibstedGrotesk-SemiBold", fixedSize: 14.5))
                     .foregroundStyle(phase.ink)
 
                 Text(!connected ? "not connected"
                      : items.isEmpty ? "all clear" : "\(items.count) to reply")
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundStyle(phase.inkSoft)
-                    // A fourth button in the header leaves this narrow enough to wrap,
-                    // which would make the bar two lines tall. It truncates instead.
+                    // One line, no stacking: the compact band has no room to wrap.
                     .lineLimit(1)
                     .contentTransition(.numericText())
                     .animation(.snappy(duration: 0.22), value: items.count)
@@ -2254,6 +2253,7 @@ private struct MenuContent: View {
                 Image(systemName: "plus")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(phase.ink.opacity(0.92))
+                    .frame(width: 22, height: 22)
             }
             .buttonStyle(.glass)
             .keyboardShortcut("n", modifiers: .command)
@@ -2267,58 +2267,76 @@ private struct MenuContent: View {
                     .font(.system(size: 12, weight: .semibold))
                     .symbolEffect(.rotate, options: .repeating, isActive: store.isRefreshing)
                     .foregroundStyle(phase.ink.opacity(0.92))
+                    .frame(width: 22, height: 22)
             }
             .buttonStyle(.glass)
             .keyboardShortcut("r", modifiers: .command)
             .help("Refresh")
             .pointerCursor()
 
-            // One slot, two jobs, so the two scenes never grow separate header layouts.
-            // In the window it closes: `.plain` has no title bar, so there is no other
-            // way out but Cmd+W.
-            Button {
-                if windowed {
-                    // In the window this slot closes it. `\.dismiss` resolves per scene,
-                    // so the same call that shuts the popover below shuts the window here,
-                    // which is exactly what a chromeless window needs.
-                    dismiss()
-                } else {
-                    // Open first, then close the popover. The other order leaves the app
-                    // with nothing visible for a moment, mid activation-policy change.
-                    // openWindow reuses the window for a given id, so a second press
-                    // brings the existing one forward instead of making another.
-                    Foreground.present(serenoWindowID) { openWindow(id: serenoWindowID) }
-                    // `\.dismiss` is a no-op inside the tray's NSHostingView, which has no
-                    // scene of its own, so the tray must be told directly. Kept alongside
-                    // dismiss() because the same view is also the window's content, where
-                    // dismiss() is the thing that closes it.
-                    dismiss()
-                    Tray.shared.hide()
+            // The overflow: everything that is a command rather than a state lives here
+            // now, styled to read as a fourth peer button, not a popup — menuIndicator
+            // hides the chevron that would otherwise mark it as different from the three
+            // beside it.
+            Menu {
+                if !windowed {
+                    // Popover branch only: the window branch's close button below is the
+                    // way out of a window that is already open, not a way into one.
+                    // Carries its own shortcut because the popover has no app menu bar
+                    // for CommandGroup's OpenWindowItem to route a keystroke through.
+                    Button("Open in Window") {
+                        // Open first, then close the popover. The other order leaves the
+                        // app with nothing visible for a moment, mid activation-policy
+                        // change. openWindow reuses the window for a given id, so a
+                        // second press brings the existing one forward instead of making
+                        // another.
+                        Foreground.present(serenoWindowID) { openWindow(id: serenoWindowID) }
+                        dismiss()
+                        Tray.shared.hide()
+                    }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
                 }
+                Button("History") {
+                    Foreground.present(historyWindowID) { openWindow(id: historyWindowID) }
+                }
+                Button("Settings…", action: openSettings)
+                    .keyboardShortcut(",", modifiers: .command)
+                Divider()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+                    .keyboardShortcut("q", modifiers: .command)
             } label: {
-                Image(systemName: windowed ? "xmark" : "macwindow")
+                Image(systemName: "ellipsis")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(phase.ink.opacity(0.92))
+                    .frame(width: 22, height: 22)
             }
+            .menuStyle(.button)
             .buttonStyle(.glass)
-            // Only on the popover's button. In the window, Escape already belongs to the
-            // compose area's Cancel, and Cmd+W comes with the menu the app grows while a
-            // window is up.
-            .keyboardShortcut(windowed ? nil : KeyboardShortcut("o", modifiers: [.command, .shift]))
-            .help(windowed ? "Close this window" : "Open Sereno in its own window")
+            .menuIndicator(.hidden)
+            .help("More")
             .pointerCursor()
 
-            Button(action: openSettings) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(phase.ink.opacity(0.92))
+            // A chromeless window has no title bar, so this is the missing one, not a
+            // secondary action: it stays a visible fourth button instead of folding into
+            // the menu above, and the window has the width for it.
+            if windowed {
+                Button {
+                    // `\.dismiss` resolves per scene, so this is the same call that
+                    // shuts the popover, here shutting the window instead.
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(phase.ink.opacity(0.92))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.glass)
+                .help("Close this window")
+                .pointerCursor()
             }
-            .buttonStyle(.glass)
-            .help("Settings")
-            .pointerCursor()
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
         // The header's ground is a sky, not a system surface, so every foreground above
         // comes from the phase rather than from `.primary` or `.secondary`. A semantic
         // colour would resolve to near-black in light mode and disappear at night.
@@ -2620,7 +2638,7 @@ private struct MenuContent: View {
     @State private var expandToggle = 0
 
     private var empty: some View {
-        VStack(spacing: 7) {
+        VStack(spacing: 8) {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .fill(Brand.deepGreen.opacity(0.14))
                 .frame(width: 46, height: 46)
@@ -2634,7 +2652,7 @@ private struct MenuContent: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 34)
+        .padding(.vertical, 24)
         .frame(maxWidth: .infinity)
     }
 
@@ -2701,27 +2719,15 @@ private struct MenuContent: View {
         .frame(maxWidth: .infinity)
     }
 
+    // History and Quit moved into the header's overflow menu: two caption2 text links
+    // with tiny hit areas were the footer's half of the inconsistency this rebuild fixes.
     private var footer: some View {
-        HStack {
-            Text(updated)
-            Spacer()
-            // Same present+openWindow pairing every other window in this file uses: an
-            // LSUIElement app cannot own the foreground, so the window would otherwise
-            // open behind whatever was frontmost.
-            Button("History") {
-                Foreground.present(historyWindowID) { openWindow(id: historyWindowID) }
-            }
-                .buttonStyle(.plain)
-                .pointerCursor()
-                .help("Completed to-dos, day by day")
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-                .buttonStyle(.plain)
-                .pointerCursor()
-        }
-        .font(.caption2)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
+        Text(updated)
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
     }
 
     private var updated: String {
@@ -3056,7 +3062,15 @@ private struct Sky: View {
                     let cover = weather?.starCover ?? (floor: 0, scale: 1)
                     let field = (floor: max(field.floor, cover.floor),
                                  scale: field.scale * cover.scale)
-                    for star in Self.stars where star.alpha > field.floor {
+                    // 44 stars suit the panel's old 44pt band; the compact 36pt one reads
+                    // them as noise at full density, so the count scales with the band's
+                    // area instead of a second seeded table. 360x44 is that original
+                    // band's area, so a header at the same width and the new 36pt height
+                    // gets proportionally fewer; a wider window scene gets more back.
+                    let density = (size.width * size.height) / (360 * 44)
+                    let starCount = max(0, min(Self.stars.count,
+                                               Int((Double(Self.stars.count) * density).rounded())))
+                    for star in Self.stars.prefix(starCount) where star.alpha > field.floor {
                         var alpha = star.alpha * field.scale
                         if animated, star.twinkles {
                             alpha *= 0.6 + 0.4 * sin(t * 0.55 + star.x * 17)
@@ -3138,8 +3152,8 @@ private struct SectionHeader: View {
             Spacer()
         }
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
-        .padding(.top, 10)
+        .padding(.horizontal, 12)
+        .padding(.top, 16)
         .padding(.bottom, 3)
     }
 }
@@ -3199,21 +3213,19 @@ private struct TodoRow: View {
         _expanded = State(initialValue: expanded)
     }
 
-    private var showActions: Bool { hovering || doneFocused || removeFocused }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             rowBody
 
             if expanded {
                 expansion
-                    .padding(.leading, 39) // avatar width plus its gap, so text lines up
-                    .padding(.top, 7)
+                    .padding(.leading, 30) // avatar width (22) plus its gap (8), so text lines up
+                    .padding(.top, 8)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
         .background(rowBackground)
         .contentShape(.rect)
         .onHover { hovering = $0 }
@@ -3226,23 +3238,21 @@ private struct TodoRow: View {
             withAnimation(.spring(duration: 0.22)) { expanded.toggle() }
         }
         .help(item.reason.isEmpty ? item.action : "\(item.action). \(item.reason)")
+        // State lives in the expansion (the priority picker shows the current value,
+        // which a menu item cannot); only commands live here. Priority's Mark as
+        // Now/Today/Later and Use suggested priority moved out for that reason, and the
+        // two snooze durations collapsed into one submenu.
         .contextMenu {
-            Button("Done") { markDone() }
-            Button("Remove", role: .destructive) { remove() }
             if item.permalink != nil {
                 Button("Open in Slack") { open() }
             }
+            Button("Done") { markDone() }
+            Button("Remove", role: .destructive) { remove() }
             Divider()
-            Button("Mark as Now") { setPriority(1) }
-            Button("Mark as Today") { setPriority(3) }
-            Button("Mark as Later") { setPriority(5) }
-            if current.userPriority != nil {
-                Button("Use suggested priority") { setPriority(nil) }
+            Menu("Snooze") {
+                Button("For \(plural(prefs.snoozeHours, "hour"))") { snooze(hoursFromNow: prefs.snoozeHours) }
+                Button("Until tomorrow \(hourLabel(prefs.morningHour))") { snoozeTomorrowMorning() }
             }
-            Divider()
-            Button("Snooze for \(plural(prefs.snoozeHours, "hour"))") { snooze(hoursFromNow: prefs.snoozeHours) }
-            Button("Snooze until tomorrow \(hourLabel(prefs.morningHour))") { snoozeTomorrowMorning() }
-            Divider()
             Button("Send to Reminders") { sendToReminders() }
         }
     }
@@ -3251,13 +3261,18 @@ private struct TodoRow: View {
     /// separate expand control. Only rows with a real permalink get the
     /// button wrapper and its pointing-hand cursor: the mock data's permalink
     /// is always nil, and a row that goes nowhere should not look clickable.
+    /// The task leads (line one), the who/where/when trails as metadata (line
+    /// two) — inverted from the old sender-first layout, which buried the one
+    /// thing a to-do list is for underneath the byline.
     @ViewBuilder private var rowBody: some View {
-        let content = HStack(alignment: .top, spacing: 9) {
+        let content = HStack(alignment: .top, spacing: 8) {
             if item.isManual { ManualMark() } else { Avatar(name: item.sender, avatarURL: item.avatarURL) }
-            VStack(alignment: .leading, spacing: 1) {
-                identityLine
+            VStack(alignment: .leading, spacing: 2) {
                 taskLine
+                metadataLine
             }
+            Spacer(minLength: 8)
+            trailingActions
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(.rect)
@@ -3271,39 +3286,44 @@ private struct TodoRow: View {
         }
     }
 
-    private var identityLine: some View {
-        HStack(spacing: 6) {
-            // A manual task has no sender. "You" says who wrote it without
-            // inventing a person, and keeps the bold-first-line rhythm.
-            Text(item.isManual ? "You" : item.sender)
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(item.isManual ? .secondary : .primary)
-                .lineLimit(1)
-            if let channel = item.channel {
-                Text(channel)
-                    .font(.caption)
-                    .foregroundStyle(Brand.link)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 4)
-            // The timestamp reserves the trailing slot, and the buttons sit in an
-            // overlay so their 28pt hit targets never change the row's height.
-            HStack(spacing: 3) {
-                if current.userPriority != nil {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.tertiary)
-                        .help("You set this priority")
-                }
-                Text(timeLabel)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            .opacity(showActions ? 0 : 1)
-            .fixedSize()
-            .frame(minWidth: 56, alignment: .trailing)
-            .overlay(alignment: .trailing) { actions }
+    private var taskLine: some View {
+        // Always one line. Equal row heights read as a list, ragged ones read
+        // as a mess. The full message is one click away in the expansion.
+        Text(item.action)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
+    /// Sender, channel, relative time and the pin, in that order, joined by "·" as one
+    /// AttributedString so the whole line truncates as a unit instead of each segment
+    /// truncating on its own — `Text` + `Text` concatenation does the same thing but is
+    /// deprecated on this SDK. NSColor's secondary/tertiary label colors stand in for the
+    /// `.secondary`/`.tertiary` hierarchical styles, which AttributedString has no
+    /// equivalent of; both are dynamic system colors, so dark mode still works.
+    private var metadataLine: some View {
+        let secondary = Color(nsColor: .secondaryLabelColor)
+        let tertiary = Color(nsColor: .tertiaryLabelColor)
+        func run(_ text: String, _ color: Color) -> AttributedString {
+            var run = AttributedString(text)
+            run.foregroundColor = color
+            return run
         }
+        let dot = run(" · ", tertiary)
+        var line = run(item.isManual ? "You" : item.sender, secondary)
+        if let channel = item.channel {
+            line += dot + run(channel, Brand.link)
+        }
+        line += dot + run(timeLabel, tertiary)
+        if current.userPriority != nil {
+            // A literal pin, not the SF Symbol: an emoji is a character, so it drops
+            // straight into the string instead of needing a text-attachment image.
+            line += dot + run("📌", tertiary)
+        }
+        return Text(line)
+            .font(.caption2)
+            .lineLimit(1)
     }
 
     /// A task typed a second ago formats as "in 0s", which reads like a bug. Under
@@ -3314,44 +3334,73 @@ private struct TodoRow: View {
             : item.date.formatted(.relative(presentation: .numeric, unitsStyle: .narrow))
     }
 
-    private var taskLine: some View {
-        HStack(spacing: 5) {
-            // Always one line. Equal row heights read as a list, ragged ones read
-            // as a mess. The full message is one click away in the expansion.
-            Text(item.action)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
+    /// The trailing slot, fixed-width so nothing ever appears where something else just
+    /// vanished: chevron, done and remove are ALWAYS visible now, tinted quaternary at
+    /// rest and brightening on hover, rather than faded in only on hover/focus. That was
+    /// both the fix for the jump (one less moving part than a cross-fade) and an
+    /// accessibility hole closed (a keyboard user could never see an invisible button).
+    private var trailingActions: some View {
+        HStack(spacing: 4) {
             chevronButton
-            Spacer(minLength: 0)
+            doneButton
+            removeButton
         }
+        .frame(width: 82, alignment: .trailing) // 22 + 4 + 26 + 4 + 26
     }
 
-    /// The chevron's own hit target, separate from the row body button below
-    /// it. Its drawn size stays close to the old inline glyph so it does not
-    /// stretch the row; contentShape's inset grows the tappable area to
-    /// roughly 24x24 without touching layout.
+    /// The chevron's own hit target, separate from the row body button. contentShape's
+    /// inset keeps the tappable area comfortable without growing the drawn glyph.
     private var chevronButton: some View {
         Button {
             withAnimation(.spring(duration: 0.22)) { expanded.toggle() }
         } label: {
             Image(systemName: "chevron.right")
                 .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(chevronHovering ? .primary : .tertiary)
+                .foregroundStyle(chevronHovering ? .primary : .quaternary)
                 .rotationEffect(.degrees(expanded ? 90 : 0))
-                .padding(4)
-                .background {
-                    if chevronHovering { Circle().fill(Color.primary.opacity(0.08)) }
-                }
-                .contentShape(Rectangle().inset(by: -6))
+                .frame(width: 22, height: 22)
+                .contentShape(.rect)
         }
         .buttonStyle(.plain)
         .pointerCursor()
         .help(expanded ? "Collapse" : "Expand")
         .onHover { chevronHovering = $0 }
         .animation(.easeOut(duration: 0.12), value: chevronHovering)
-        .opacity(showActions || expanded ? 1 : 0)
+    }
+
+    /// Brightens to Brand.green on hover; AnyShapeStyle unifies that with the idle
+    /// `.quaternary` hierarchical style, which are otherwise different ShapeStyle types.
+    private var doneButton: some View {
+        Button(action: markDone) {
+            Image(systemName: "checkmark.circle.fill")
+                .symbolEffect(.bounce, value: doneTaps)
+                .font(.system(size: 15))
+                .foregroundStyle(doneHovering ? AnyShapeStyle(Brand.green) : AnyShapeStyle(.quaternary))
+                .frame(width: 26, height: 26)
+                .contentShape(.rect)
+        }
+        .focused($doneFocused)
+        .buttonStyle(.plain)
+        .help("Mark done")
+        .pointerCursor()
+        .onHover { doneHovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: doneHovering)
+    }
+
+    private var removeButton: some View {
+        Button(action: remove) {
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 15))
+                .foregroundStyle(removeHovering ? AnyShapeStyle(Brand.red) : AnyShapeStyle(.quaternary))
+                .frame(width: 26, height: 26)
+                .contentShape(.rect)
+        }
+        .focused($removeFocused)
+        .buttonStyle(.plain)
+        .help("Remove")
+        .pointerCursor()
+        .onHover { removeHovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: removeHovering)
     }
 
     /// The original message, its links, why it was ranked, and the two actions
@@ -3486,46 +3535,6 @@ private struct TodoRow: View {
         }
     }
 
-    private var actions: some View {
-        HStack(spacing: 0) {
-            Button(action: markDone) {
-                Image(systemName: "checkmark.circle.fill")
-                    .symbolEffect(.bounce, value: doneTaps)
-                    .foregroundStyle(doneHovering ? Brand.green : Color.secondary)
-                    .frame(width: 28, height: 28)
-                    .background {
-                        if doneHovering { Circle().fill(Brand.green.opacity(0.14)) }
-                    }
-                    .contentShape(.rect)
-            }
-            .focused($doneFocused)
-            .help("Mark done")
-            .pointerCursor()
-            .onHover { doneHovering = $0 }
-            .animation(.easeOut(duration: 0.12), value: doneHovering)
-
-            Button(action: remove) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(removeHovering ? Brand.red : Color.secondary)
-                    .frame(width: 28, height: 28)
-                    .background {
-                        if removeHovering { Circle().fill(Brand.red.opacity(0.14)) }
-                    }
-                    .contentShape(.rect)
-            }
-            .focused($removeFocused)
-            .help("Remove")
-            .pointerCursor()
-            .onHover { removeHovering = $0 }
-            .animation(.easeOut(duration: 0.12), value: removeHovering)
-        }
-        .font(.system(size: 16.5))
-        .buttonStyle(.plain)
-        // Faded, not removed, so tab focus and VoiceOver still reach both buttons.
-        .opacity(showActions ? 1 : 0)
-        .animation(.easeOut(duration: 0.12), value: showActions)
-    }
-
     private func markDone() {
         doneTaps += 1
         // markDone, not toggleDone: this is the user's explicit Done, so it arms the undo
@@ -3621,12 +3630,12 @@ private struct ExpandedLink: View {
 /// as self-authored. Initials of a made-up name would be a lie.
 private struct ManualMark: View {
     var body: some View {
-        RoundedRectangle(cornerRadius: 8, style: .continuous)
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
             .fill(Color.secondary.opacity(0.16))
-            .frame(width: 30, height: 30)
+            .frame(width: 22, height: 22)
             .overlay {
                 Image(systemName: "checklist")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
     }
@@ -3646,14 +3655,14 @@ private struct Avatar: View {
                 if case .success(let image) = phase {
                     image.resizable()
                         .scaledToFill()
-                        .frame(width: 30, height: 30)
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .frame(width: 22, height: 22)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 } else {
                     // .empty (still loading) and .failure both read as "no photo yet".
                     initialsBody
                 }
             }
-            .frame(width: 30, height: 30)
+            .frame(width: 22, height: 22)
         } else {
             initialsBody
         }
@@ -3661,12 +3670,12 @@ private struct Avatar: View {
 
     private var initialsBody: some View {
         let palette = Brand.avatars[colorIndex]
-        return RoundedRectangle(cornerRadius: 8, style: .continuous)
+        return RoundedRectangle(cornerRadius: 6, style: .continuous)
             .fill(palette.fill)
-            .frame(width: 30, height: 30)
+            .frame(width: 22, height: 22)
             .overlay {
                 Text(initials)
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(palette.ink)
             }
     }
